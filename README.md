@@ -53,8 +53,8 @@ JLab/
 1. Complete all steps in **Prerequisites**
 2. Open MATLAB and navigate to the JLab folder
 3. Open the desired script, e.g.:
-first the loader: ```CageTrianingDataLoading```
-then the analyzer: ```BlackRockFileAnalyzer```
+first the loader: ```CageTrianingDataLoading``` to parse the raw data
+then the analyzer: ```BlackRockFileAnalyzer``` for further analysis
 4. For the cage trainer data: the path structure in my laptop is:
 ```matlab
 monkey = 'Monkey Porthos';
