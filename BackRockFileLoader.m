@@ -12,10 +12,10 @@ Monkey = 'Monkey Porthos';
 Location = 'in_lab';
 Task = 'timedelay';
 DataType = 'raw_data';
-Folder = '2026-03-05';
-Filename_nev = 'Hub1-test_for_temporal_discrimination_task_03052026.nev';
+Folder = '2026-03-06';
+Filename_nev = 'Hub1-test_for_temporal_discrimination_task_03062026.nev';
 %Filename_nev = 'Hub1-Porthos_20260206_t1020_dxxxx_vis_saccade.nev';
-Filename_ns = 'NSP-test_for_temporal_discrimination_task_03052026.ns2';%Eye trace data
+Filename_ns = 'NSP-test_for_temporal_discrimination_task_03062026.ns2';%Eye trace data
 
 %Path for export parsed data
 OutputFolder = 'export_data';
