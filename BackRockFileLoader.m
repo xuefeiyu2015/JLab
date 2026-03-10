@@ -12,8 +12,10 @@ Monkey = 'Monkey Porthos';
 Location = 'in_lab';
 Task = 'timedelay';
 DataType = 'raw_data';
-Folder = '2026-03-06';
-Filename_nev = 'Hub1-test_for_temporal_discrimination_task_03062026.nev';
+%Folder = '2026-03-06';
+Folder = '2026-03-09';
+%Filename_nev = 'Hub1-test_for_temporal_discrimination_task_03062026.nev';
+Filename_nev = 'Hub1-test_for_delay_memory_saccade_03092026.nev';
 %Filename_nev = 'Hub1-Porthos_20260206_t1020_dxxxx_vis_saccade.nev';
 Filename_ns = 'NSP-test_for_temporal_discrimination_task_03062026.ns2';%Eye trace data
 
@@ -84,6 +86,9 @@ trial.Requested_target_1_hold_time  = NaN; %in ms
 trial.Requested_target_1_timeout = NaN; %in ms
 trial.Requested_target_1_duration = NaN; %in ms
 
+trial.Requested_target_1_visible_duration = NaN; % in ms
+
+
 trial.Target_2_position = [NaN,NaN];
 trial.Target_2_size = NaN; % in deg
 trial.Target_2_acceptance_window = NaN; % in deg
@@ -95,13 +100,14 @@ trial.Requested_penalty_box_duration = NaN; %in ms
 
 trial.Requested_target_dim_opacity = NaN;% 0 to 1
 
-trial.Fixation_point_on = NaN; %in ms
-trial.Fixation_acquired = NaN; %in ms
-trial.Fixation_point_off = NaN; %in ms
-trial.Broke_fixation = NaN; %in ms
-trial.Target_1_presented =NaN; %in ms
-trial.Target_2_presented =NaN; %in ms
-trial.Targets_off = NaN; %in ms
+trial.Fixation_point_on = NaN; %in s
+trial.Fixation_acquired = NaN; %in s
+trial.Fixation_point_off = NaN; %in s
+trial.Broke_fixation = NaN; %in s
+trial.Target_1_presented =NaN; %in s
+trial.Target_2_presented =NaN; %in s
+trial.Targets_off = NaN; %in s
+trial.Target_1_dimmed = NaN;%in s
 
 
 trial.Choiceoutcome = NaN; 
@@ -127,9 +133,9 @@ exp_events = containers.Map({'git commit','viewing distance','screen size','scre
 
 %For trial map
 time_events = containers.Map( {'Start', 'Fixation point on','Fixation point off','Reward end','Target 1 presented','Target 2 presented','Targets off',...
-    'Fixation acquired','Broke fixation','Target 1 acquired','Target 2 acquired'}, ...
+    'Fixation acquired','Broke fixation','Target 1 acquired','Target 2 acquired','Target 1 dimmed'}, ...
     {'Start','Fixation_point_on','Fixation_point_off','Reward_end','Target_1_presented','Target_2_presented','Targets_off',...
-    'Fixation_acquired','Broke_fixation','Choicetime','Choicetime'} ...
+    'Fixation_acquired','Broke_fixation','Choicetime','Choicetime','Target_1_dimmed'} ...
 );
 
 segment_events = containers.Map( {'Experiment','Fixation color','Target 1 color','Target 2 color'},...
@@ -144,7 +150,7 @@ information_events = containers.Map( ...
        'Target 2 position','Target 2 size','Target 2 acceptance window',...
        'Requested target 1 duration','Requested target 2 time offset',...
        'Requested target 1 timeout','Requested penalty box duration',...
-       'Reward start','Requested target dim opacity'
+       'Reward start','Requested target dim opacity','Requested target 1 visible duration'
        
        },...
     {'Fixation_position','Fixation_size','Fixation_acceptance_window' ...
@@ -155,7 +161,7 @@ information_events = containers.Map( ...
     'Target_2_position','Target_2_size','Target_2_acceptance_window',...
     'Requested_target_1_duration','Requested_target_2_time_offset',...
     'Requested_target_1_timeout','Requested_penalty_box_duration',...
-    'Reward_start','Requested_target_dim_opacity'
+    'Reward_start','Requested_target_dim_opacity','Requested_target_1_visible_duration'
     });
 
     dash_events = {'End','Correct choice','Wrong choice'};
@@ -219,12 +225,13 @@ for i = 1:EventsNumber
         % Define the current trial
         if exist('trials','var') ~= 1 || isempty(trials)
         % if no trials has been defined
-        trials = trial;
-        trials.Trial_number = TrialNum_curr;
         trial_index = 1;  
+        trials = trial;
+        trials(trial_index).Trial_number = TrialNum_curr;
+       
         else
         % if there is already a trial structure
-        idx = find([trials.Trial_number] == TrialNum_curr, 1);
+        idx = find([trials(trial_index).Trial_number] == TrialNum_curr, 1); %Temporally set as this, may need to modify in case there is one trial in one task then imediatel start the other one.
             if isempty(idx)
                 % if not exist, set up a new trial
                 trial_index = trial_index + 1;  
@@ -452,10 +459,12 @@ for i = 1:EventsNumber
            
     
     
-           %keyboard
+          
     
     
        end
+
+       
     
     
     
@@ -472,6 +481,7 @@ for i = 1:EventsNumber
 
 
 end
+
 
 %% Add a few feature for further analysis
 %1. Transform Cartesian into Polar for target postion
