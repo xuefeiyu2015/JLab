@@ -18,7 +18,7 @@ clear;
 
 monkey = 'Monkey Porthos';
 main_path = '/Users/xuefeiyu/Documents/XuefeiFile/WorkRelated/Data';
-data_date = '2026-03-06';  % Session date in yyyy-mm-dd
+data_date = '2026-04-03';  % Session date in yyyy-mm-dd
 task_type = 'in_lab/timedelay';
 folder = 'export_data';
 
@@ -42,7 +42,7 @@ if exist(data_path, 'file')
     complete_saved = [expdata.Save_complete] == 1;
 
     % Keep only trials from the task we want to analyze
-    task_sel = contains({expdata.Task}, analyze_task);
+    task_sel = contains(string({expdata.Task}), analyze_task);
 
     % Keep only trials with a valid choice (Choose_target is not NaN)
     trial_sel = ~isnan([expdata.Choose_target]);
@@ -63,6 +63,13 @@ if exist(data_path, 'file')
 
     stimulus = [task_data.Requested_target_2_time_offset];  % Requested time delay (ms)
     stimulus_real = ([task_data.Target_2_presented] - [task_data.Target_1_presented]) * 1000;  % Actual delay in ms
+    
+    target1_position =vertcat(task_data.Target_1_position);
+    target2_position = vertcat(task_data.Target_2_position);
+    target_position = [target1_position,target2_position];
+
+
+
     direction = [task_data.Stimulus_direction];   % Stimulus order (e.g. left-first vs right-first)
     choice_response = [task_data.Choose_leftright] == 1;  % 0 = left, 1 = right
 
@@ -78,7 +85,7 @@ if exist(data_path, 'file')
     scatter(stimulus, stimulus_real, 'or');
     axis equal;
     hold on
-    plot([0:200], [0:200], '--k');
+    plot([0:250], [0:250], '--k');
     xlabel('Requested delay');
     ylabel('Actual delay');
     xlim([-0.1, max(stimulus_real)+30]);
