@@ -47,8 +47,8 @@ if exist(data_path, 'file')
 
     target1_position = vertcat(task_data.Target_1_position);
     target2_position = vertcat(task_data.Target_2_position);
-    target_position  = [target1_position, target2_position];
-
+   % target_position  = [target1_position, target2_position];
+     target_position  = target1_position;
     % Per-trial difference: actual − requested (ms)
     stim_diff = (stimulus_real - stimulus) ;
 
@@ -76,8 +76,8 @@ if exist(data_path, 'file')
         m_diff = mean(diffs);
         s_diff = std(diffs);
 
-        fprintf('(%.0f,%.0f),(%.0f,%.0f)%*s%-10d %-12.3f %-12.3f\n', ...
-                pos(1), pos(2), pos(3), pos(4), 2, '', n_tri, m_diff, s_diff);
+        fprintf('(%.0f,%.0f)%*s%-10d %-12.3f %-12.3f\n', ...
+                pos(1), pos(2), 2, '', n_tri, m_diff, s_diff);
 
         row_idx = find(unique_t1 == pos(1));
         col_idx = find(unique_t2 == pos(2));
@@ -88,14 +88,14 @@ if exist(data_path, 'file')
     %% 5. HEATMAP: mean difference per position
     %% ---------------------------------------------------------------------
     figure;
-    imagesc(heatmap_data);
+    imagesc(heatmap_data');
     colorbar;
     colormap('jet');
-    xlabel('Target 2 Position');
-    ylabel('Target 1 Position');
+    xlabel('Target 1 X');
+    ylabel('Target 1 Y');
     title('Mean (Stimulus\_real - Stimulus) [ms] by Target Position');
-    set(gca, 'XTick', 1:length(unique_t2), 'XTickLabel', arrayfun(@num2str, unique_t2, 'UniformOutput', false));
-    set(gca, 'YTick', 1:length(unique_t1), 'YTickLabel', arrayfun(@num2str, unique_t1, 'UniformOutput', false));
+    set(gca, 'YTick', 1:length(unique_t2), 'YTickLabel', arrayfun(@num2str, unique_t2, 'UniformOutput', false));
+    set(gca, 'XTick', 1:length(unique_t1), 'XTickLabel', arrayfun(@num2str, unique_t1, 'UniformOutput', false));
     axis square;
 
     %% ---------------------------------------------------------------------
@@ -113,9 +113,7 @@ if exist(data_path, 'file')
         diff_matrix(i, 1:length(idx)) = stim_diff(idx);
     end
 
-    pos_labels = arrayfun(@(i) sprintf('(%.0f,%.0f),(%.0f,%.0f)', ...
-                    unique_positions(i,1), unique_positions(i,2), ...
-                    unique_positions(i,3), unique_positions(i,4)), ...
+    pos_labels = arrayfun(@(i) sprintf('(%.0f,%.0f)',unique_positions(i,1), unique_positions(i,2)), ...                  
                     (1:n_positions)', 'UniformOutput', false);
     trial_cols  = arrayfun(@(k) sprintf('Trial_%d', k), 1:max_trials, 'UniformOutput', false);
     trial_table = array2table(diff_matrix, 'RowNames', pos_labels, 'VariableNames', trial_cols);
