@@ -7,7 +7,7 @@ clear;
 %csv data path
 monkey = 'Monkey Porthos';
 main_path = '/Users/xuefeiyu/Documents/XuefeiFile/WorkRelated/Data';
-data_date = '2026-02-25'; % in yyyy-mm-dd
+data_date = '2026-04-01'; % in yyyy-mm-dd
 task_type = 'cage_training/timedelay';
 
 data_csv = sprintf('all_trials_%s.csv', data_date);
