@@ -18,7 +18,7 @@ task_type = 'cage_training/timedelay';
 %from dropbox to local
 monkey = 'Monkey Porthos';
 main_path = '/Users/xuefeiyu/Documents/XuefeiFile/WorkRelated/Data/';
-data_date = '2026-02-24'; % in yyyy-mm-dd
+data_date = '2026-04-01'; % in yyyy-mm-dd
 task_type = 'cage_training/timedelay';
 local_label = 'raw';
 
@@ -84,9 +84,15 @@ end
 % -----------------------------
 % save into new file
 % -----------------------------
-writetable(allData, output_file);
-disp(['All trials has been combined into ', output_file]);
-disp(head(allData));
+if isempty(allData)
+    error('No data found, check whether the data folder exist!')
+else
+    writetable(allData, output_file);
+    disp(['All trials has been combined into ', output_file]);
+    disp(head(allData));
+end
+
+
 
 
 

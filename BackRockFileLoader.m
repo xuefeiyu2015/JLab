@@ -12,8 +12,9 @@ Monkey = 'Monkey Porthos';
 Location = 'in_lab';
 Task = 'timedelay';
 DataType = 'raw_data';
-Folder = '2026-03-06';
-Filename_nev = 'Hub1-test_for_temporal_discrimination_task_03062026.nev';
+Folder = '2026-04-03';
+%Filename_nev = 'Hub1-test_for_temporal_discrimination_task_03062026.nev';
+Filename_nev = 'Hub1-Test7_20260403_TimeDelay.nev';
 %Filename_nev = 'Hub1-Porthos_20260206_t1020_dxxxx_vis_saccade.nev';
 Filename_ns = 'NSP-test_for_temporal_discrimination_task_03062026.ns2';%Eye trace data
 
@@ -67,6 +68,7 @@ experiment.end        = NaN; % in s
 trial = struct();
 trial.Trial_number = NaN; %Current trial number
 trial.Task = NaN; %TaskType
+trial.Trial_type = NaN;
 trial.Start = NaN; % trial start time, in s
 trial.Fixation_position = [NaN,NaN];%array:1-2: postion;%in deg
 trial.Fixation_size = NaN;% in deg
@@ -83,6 +85,8 @@ trial.Target_1_color = NaN; % in deg
 trial.Requested_target_1_hold_time  = NaN; %in ms
 trial.Requested_target_1_timeout = NaN; %in ms
 trial.Requested_target_1_duration = NaN; %in ms
+
+
 
 trial.Target_2_position = [NaN,NaN];
 trial.Target_2_size = NaN; % in deg
@@ -132,8 +136,8 @@ time_events = containers.Map( {'Start', 'Fixation point on','Fixation point off'
     'Fixation_acquired','Broke_fixation','Choicetime','Choicetime'} ...
 );
 
-segment_events = containers.Map( {'Experiment','Fixation color','Target 1 color','Target 2 color'},...
-    {'Task','Fixation_color','Target_1_color','Target_2_color'});
+segment_events = containers.Map( {'Experiment','Fixation color','Target 1 color','Target 2 color','Trial type'},...
+    {'Task','Fixation_color','Target_1_color','Target_2_color','Trial_type'});
 
 information_events = containers.Map( ...
     {'Fixation position','Fixation size','Fixation acceptance window'...
@@ -364,6 +368,7 @@ for i = 1:EventsNumber
     
        elseif seg_flag
            %segment the text by the last space
+           
            last_space_idx = find(event_text == ' ', 1, 'last');
            event_name = strtrim(event_text(1:last_space_idx-1));  
            value = strtrim(event_text(last_space_idx+1:end)); 
@@ -472,7 +477,13 @@ for i = 1:EventsNumber
 
 
 end
+%{
+diff = [trials.Target_1_presented] - [trials.Target_2_presented];
 
+A = [[trials.Trial_number]', vertcat(trials.Target_1_position),vertcat(trials.Target_2_position),diff'*1000 ];
+B = table(Events);
+B.EventTime = EventTime';
+%}
 %% Add a few feature for further analysis
 %1. Transform Cartesian into Polar for target postion
     Target_1_xy = vertcat(trials.Target_1_position); 
