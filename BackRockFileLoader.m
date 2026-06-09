@@ -1,34 +1,51 @@
 % Script to open and load blackrock data
 % by Xuefei Yu 03-02-2026
 % Currently only for behavior data, --03-02-2026
+% Change the export data from .mat into txt and csv file 
 clear
 close all
 
+%% Check if the path is setup ready
+
+if isempty(which('openNEV'))
+    addpath(genpath('/Users/xuefeiyu/Documents/XuefeiFile/WorkRelated/Program_Matlab_Local/JLab/ToolsAndFunctions/NPMK'));
+end
+    
 LoadAnalogData = false; % Whether to load analog channels
 
 
+%% Set up data path
 Basic_Path  = '/Users/xuefeiyu/Documents/XuefeiFile/WorkRelated/Data';
 Monkey = 'Monkey Porthos';
 Location = 'in_lab';
-Task = 'timedelay';
 DataType = 'raw_data';
-Folder = '2026-04-03';
-%Filename_nev = 'Hub1-test_for_temporal_discrimination_task_03062026.nev';
-Filename_nev = 'Hub1-Test7_20260403_TimeDelay.nev';
+Folder = '2026-03-24';
+Filename_nev = 'Hub1-test_20260324_timedelay.nev';
+%Filename_nev = 'Hub1-Athos_20260528_t1040_dxxxx_xxx_memsacc.nev';
 %Filename_nev = 'Hub1-Porthos_20260206_t1020_dxxxx_vis_saccade.nev';
-Filename_ns = 'NSP-test_for_temporal_discrimination_task_03062026.ns2';%Eye trace data
+Filename_ns = 'NSP-test_20260324_timedelay.ns2';%Eye trace data
+%Filename_ns = 'NSP1-Athos_20260528_t1040_dxxxx_xxx_memsacc.ns2';%Eye trace data
 
 %Path for export parsed data
 OutputFolder = 'export_data';
-OutputPath = fullfile(Basic_Path,Monkey,Location,Task,OutputFolder,Folder);
-OutputFileName = 'Blackrock_'+string(Folder)+'.mat';
-
+OutputPath = fullfile(Basic_Path,Monkey,Location,OutputFolder,Folder);
+%Change it to your own:
+%e.g OutputPath = '/folder/your own path'
+OutputFileName_exp = 'Blackrock_'+string(Folder)+'_expmeta.txt';
+OutputFileName_trials = 'Blackrock_'+string(Folder)+'_trials.csv';
 
 
 %Load events and events timing
-CompleteFilePath_nev = fullfile(Basic_Path,Monkey,Location,Task,DataType ,Folder,Filename_nev);
+CompleteFilePath_nev = fullfile(Basic_Path,Monkey,Location,DataType ,Folder,Filename_nev);
+%Change it to your own:
+%e.g CompleteFilePath_nev = '/folder/your own path'
 
 tmpdata = openNEV(CompleteFilePath_nev,'report','nosave');
+
+if isempty(tmpdata)
+    error('No data found, please check your path: %s', CompleteFilePath_nev);
+end
+
 nevdata = tmpdata.Data;
 
 Events = nevdata.Comments.Text;
@@ -79,6 +96,7 @@ trial.Requested_fixation_duration = NaN; %in ms
 trial.Requested_timeout = NaN; % in ms
 trial.Requested_time_between_trials = NaN; % in ms
 trial.Target_1_position = [NaN,NaN];
+
 trial.Target_1_size = NaN; % in deg
 trial.Target_1_acceptance_window = NaN; % in deg
 trial.Target_1_color = NaN; % in deg
@@ -98,6 +116,7 @@ trial.Requested_target_2_hold_time  = NaN; %in ms
 trial.Requested_penalty_box_duration = NaN; %in ms
 
 trial.Requested_target_dim_opacity = NaN;% 0 to 1
+trial.Requested_target_1_visible_duration = NaN; %in ms
 
 trial.Fixation_point_on = NaN; %in ms
 trial.Fixation_acquired = NaN; %in ms
@@ -106,6 +125,7 @@ trial.Broke_fixation = NaN; %in ms
 trial.Target_1_presented =NaN; %in ms
 trial.Target_2_presented =NaN; %in ms
 trial.Targets_off = NaN; %in ms
+trial.Target_1_off = NaN; %in ms
 
 
 trial.Choiceoutcome = NaN; 
@@ -131,9 +151,9 @@ exp_events = containers.Map({'git commit','viewing distance','screen size','scre
 
 %For trial map
 time_events = containers.Map( {'Start', 'Fixation point on','Fixation point off','Reward end','Target 1 presented','Target 2 presented','Targets off',...
-    'Fixation acquired','Broke fixation','Target 1 acquired','Target 2 acquired'}, ...
+    'Fixation acquired','Broke fixation','Target 1 acquired','Target 2 acquired','Target 1 off'}, ...
     {'Start','Fixation_point_on','Fixation_point_off','Reward_end','Target_1_presented','Target_2_presented','Targets_off',...
-    'Fixation_acquired','Broke_fixation','Choicetime','Choicetime'} ...
+    'Fixation_acquired','Broke_fixation','Choicetime','Choicetime','Target_1_off'} ...
 );
 
 segment_events = containers.Map( {'Experiment','Fixation color','Target 1 color','Target 2 color','Trial type'},...
@@ -148,7 +168,7 @@ information_events = containers.Map( ...
        'Target 2 position','Target 2 size','Target 2 acceptance window',...
        'Requested target 1 duration','Requested target 2 time offset',...
        'Requested target 1 timeout','Requested penalty box duration',...
-       'Reward start','Requested target dim opacity'
+       'Reward start','Requested target dim opacity','Requested target 1 visible duration'
        
        },...
     {'Fixation_position','Fixation_size','Fixation_acceptance_window' ...
@@ -159,7 +179,7 @@ information_events = containers.Map( ...
     'Target_2_position','Target_2_size','Target_2_acceptance_window',...
     'Requested_target_1_duration','Requested_target_2_time_offset',...
     'Requested_target_1_timeout','Requested_penalty_box_duration',...
-    'Reward_start','Requested_target_dim_opacity'
+    'Reward_start','Requested_target_dim_opacity','Requested_target_1_visible_duration'
     });
 
     dash_events = {'End','Correct choice','Wrong choice'};
@@ -168,6 +188,11 @@ information_events = containers.Map( ...
     
 
  EventsNumber = size(Events,1); 
+
+ %{
+ Event_full = table(Events);
+ Event_full.Time = EventTime';
+ %}
 
 
 %% Transform the event into tables for event marker
@@ -213,7 +238,7 @@ for i = 1:EventsNumber
 
        
 
-    else
+    else %Trial data
 
         %Get trial number and event text
          mainTokens = regexp(curr_event, '^Trial\s+(\d+):\s*(.*)$', 'tokens');    
@@ -224,8 +249,9 @@ for i = 1:EventsNumber
         if exist('trials','var') ~= 1 || isempty(trials)
         % if no trials has been defined
         trials = trial;
+        trial_index = 1;
         trials.Trial_number = TrialNum_curr;
-        trial_index = 1;  
+          
         else
         % if there is already a trial structure
         idx = find([trials.Trial_number] == TrialNum_curr, 1);
@@ -393,12 +419,14 @@ for i = 1:EventsNumber
            event   = strtrim(event_text(1:dash_idx-1));
            outcome = strtrim(event_text(dash_idx+1:end));
            if contains(event,'End')
+
+               
     
                if isnan(trials(trial_index).End)
                    trials(trial_index).End = curr_eventtime;
                else
                    trials(trial_index).duplicates(end+1,1) = event;
-                    disp('Duplicate vv  found for dash event:');
+                    disp('Duplicate End  found for dash event:');
                     disp(event);
     
                end
@@ -407,7 +435,7 @@ for i = 1:EventsNumber
                     trials(trial_index).Trialoutcome = outcome;
                else
                    trials(trial_index).duplicates(end+1,1) ='Trialoutcome';
-                    disp('Duplicate found for dash event:');
+                    disp('Duplicate outcome found for dash event:');
                     disp(event);
     
                end
@@ -486,6 +514,7 @@ B.EventTime = EventTime';
 %}
 %% Add a few feature for further analysis
 %1. Transform Cartesian into Polar for target postion
+% -180(left) to 180(right)
     Target_1_xy = vertcat(trials.Target_1_position); 
     [theta, Target_1_ecc] = cart2pol(Target_1_xy(:,1),Target_1_xy(:,2));
     Target_1_angle = mod(90 - rad2deg(theta), 360);
@@ -528,9 +557,44 @@ B.EventTime = EventTime';
 if ~exist(OutputPath, 'dir')
     mkdir(OutputPath);
 end
-save(fullfile(OutputPath, OutputFileName), 'experiment', 'trials');
 
-disp(sprintf('File:%s has been parsed into %s',Filename_nev,OutputFileName));
+
+% Save experiment meta as .txt
+fid = fopen(fullfile(OutputPath, OutputFileName_exp), 'w');
+fields = fieldnames(experiment);
+for i = 1:numel(fields)
+    val = experiment.(fields{i});
+    if isnumeric(val)
+        fprintf(fid, '%s: %s\n', fields{i}, mat2str(val));
+    else
+        fprintf(fid, '%s: %s\n', fields{i}, string(val));
+    end
+end
+fclose(fid);
+
+disp(sprintf('File:%s Experiment meta has been parsed into %s',Filename_nev,OutputFileName_exp));
+
+
+% Save trials as .csv
+% Flatten array/vector fields (e.g. positions) into separate columns
+trials_flat = rmfield(trials, {'undefined', 'duplicates'});
+trials_table = struct2table(trials_flat);
+
+
+% Convert any cell columns to strings for CSV compatibility
+for col = trials_table.Properties.VariableNames
+    c = col{1};
+    if isnumeric(trials_table.(c)) && size(trials_table.(c), 2) == 2
+        trials_table.([c '_x']) = trials_table.(c)(:,1);
+        trials_table.([c '_y']) = trials_table.(c)(:,2);
+        trials_table.(c) = [];
+    end
+end
+
+writetable(trials_table, fullfile(OutputPath, OutputFileName_trials));
+
+
+disp(sprintf('File:%s Trials Data has been parsed into %s',Filename_nev,OutputFileName_trials));
 
 
 

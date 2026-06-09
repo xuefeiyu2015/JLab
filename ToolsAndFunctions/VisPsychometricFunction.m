@@ -30,7 +30,7 @@ function [pse,threshold] = VisPsychometricFunction(psymat,plot_flag);
 
     % Get bias and threshold
     pse = -b0 / b1;
-    threshold = pi/(b1*sqrt(3));
+    threshold = 1/b1;
 
     TotalTrials = size(psymat,1);
     %% Plot Psychometric function  

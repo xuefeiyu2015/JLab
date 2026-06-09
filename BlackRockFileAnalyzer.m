@@ -18,31 +18,31 @@ clear;
 
 monkey = 'Monkey Porthos';
 main_path = '/Users/xuefeiyu/Documents/XuefeiFile/WorkRelated/Data';
-data_date = '2026-04-03';  % Session date in yyyy-mm-dd
-task_type = 'in_lab/timedelay';
+data_date = '2026-03-24';  % Session date in yyyy-mm-dd
+task_type = 'in_lab';
 folder = 'export_data';
 
 % Task name used to filter trials (must match the Task field in expdata)
 analyze_task = 'time_delay_experiment';
 
 % Build full path to the BlackRock export .mat file
-data_mat = sprintf('Blackrock_%s.mat', data_date);
-data_path = fullfile(main_path, monkey, task_type, folder, data_date, data_mat);
+data_trials = sprintf('Blackrock_%s_trials.csv', data_date);
+data_path = fullfile(main_path, monkey, task_type, folder, data_date, data_trials);
 
 %% -------------------------------------------------------------------------
 %% 2. LOAD AND FILTER TRIALS
 %% -------------------------------------------------------------------------
 if exist(data_path, 'file')
     % Load the parsed BlackRock session file
-    data = load(data_path);
-    %mata_data = data.experiment; %Stores  the meta data for the session.
-    expdata = data.trials; %Structure array for all trials
-
+    expdata = readtable(data_path);
+    
+    
     % Keep only trials that were fully saved (no truncation)
     complete_saved = [expdata.Save_complete] == 1;
 
     % Keep only trials from the task we want to analyze
-    task_sel = contains(string({expdata.Task}), analyze_task);
+    task_sel = strcmp([expdata.Task], analyze_task);
+   
 
     % Keep only trials with a valid choice (Choose_target is not NaN)
     trial_sel = ~isnan([expdata.Choose_target]);
@@ -51,7 +51,7 @@ if exist(data_path, 'file')
     selected_data = complete_saved & task_sel & trial_sel;
 
     % Subset of trials used for psychometric analysis
-    task_data = expdata(selected_data);
+    task_data = expdata(selected_data,:);
 
     TotalTrials = sum(selected_data);
 
@@ -62,22 +62,33 @@ if exist(data_path, 'file')
     % VisPsychometricFunction expects columns: [stimulus, direction, choice].
 
     stimulus = [task_data.Requested_target_2_time_offset];  % Requested time delay (ms)
+
+    %{
     stimulus_real = ([task_data.Target_2_presented] - [task_data.Target_1_presented]) * 1000;  % Actual delay in ms
     
-    target1_position =vertcat(task_data.Target_1_position);
-    target2_position = vertcat(task_data.Target_2_position);
-    target_position = [target1_position,target2_position];
+    target1_position_x =[task_data.Target_1_position_x];
+    target1_position_y =[task_data.Target_1_position_y];
+
+    target2_position_x = [task_data.Target_2_position_x];
+    target2_position_y = [task_data.Target_2_position_y];
+
+    %}
+   
 
 
+    %RT
+    reactiont_time = [task_data.Choicetime] - [task_data.Fixation_point_off];
 
     direction = [task_data.Stimulus_direction];   % Stimulus order (e.g. left-first vs right-first)
     choice_response = [task_data.Choose_leftright] == 1;  % 0 = left, 1 = right
 
     % Matrix passed to psychometric visualization: [stimulus, direction, choice]
-    Psymatrix = [stimulus', direction', choice_response'];
+    Psymatrix = [stimulus, direction, choice_response];
 
     % Plot psychometric curve and return point of subjective equality (PSE) and threshold
     [pse, threshold] = VisPsychometricFunction(Psymatrix);
+
+
 
     % Optional: uncomment to plot requested vs actual delay (calibration check)
     %{
