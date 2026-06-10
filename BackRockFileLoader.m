@@ -31,8 +31,8 @@ OutputFolder = 'export_data';
 OutputPath = fullfile(Basic_Path,Monkey,Location,OutputFolder,Folder);
 %Change it to your own:
 %e.g OutputPath = '/folder/your own path'
-OutputFileName_exp = 'Blackrock_'+string(Folder)+'_expmeta.txt';
-OutputFileName_trials = 'Blackrock_'+string(Folder)+'_trials.csv';
+OutputFileName_exp = 'Blackrock_'+string(Folder)+'_expmeta_matlab.txt';
+OutputFileName_trials = 'Blackrock_'+string(Folder)+'_trials_matlab.csv';
 
 
 %Load events and events timing
@@ -49,7 +49,7 @@ end
 nevdata = tmpdata.Data;
 
 Events = nevdata.Comments.Text;
-EventTime = nevdata.Comments.TimeStampStartedSec;
+EventTime = nevdata.Comments.TimeStampSec;
 
 
 if LoadAnalogData
@@ -548,6 +548,12 @@ B.EventTime = EventTime';
     [trials.Choose_target] = deal(ChooseTarget_cell{:});
     ChooseLeftRight_cell = num2cell(ChooseLeftRight);
     [trials.Choose_leftright] = deal(ChooseLeftRight_cell{:});
+
+    Target_1_ecc_cell = num2cell(Target_1_ecc);
+    [trials.Target_1_eccentricity] = deal(Target_1_ecc_cell{:});
+
+    Target_2_ecc_cell = num2cell(Target_2_ecc);
+    [trials.Target_2_eccentricity] = deal(Target_2_ecc_cell{:});
     
 
 
