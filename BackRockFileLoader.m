@@ -189,7 +189,7 @@ information_events = containers.Map( ...
 
  EventsNumber = size(Events,1); 
 
- %{
+ %
  Event_full = table(Events);
  Event_full.Time = EventTime';
  %}
@@ -245,35 +245,26 @@ for i = 1:EventsNumber
          TrialNum_curr = str2double(mainTokens{1}{1}); % Get trial number  
          event_text = strtrim(mainTokens{1}{2}); %Get the remaining events
     
-        % Define the current trial
+        % Define the current trial.
+        % A new trial begins whenever the parsed trial number changes from the
+        % previous trial event. Trials are keyed by POSITION (trial_index), not
+        % by number, so a reset counter (e.g. ...,30,0,1,...) starts new trials
+        % instead of merging into an earlier same-numbered trial.
         if exist('trials','var') ~= 1 || isempty(trials)
-        % if no trials has been defined
-        trials = trial;
-        trial_index = 1;
-        trials.Trial_number = TrialNum_curr;
-          
+            % first trial event
+            trials = trial;
+            trial_index = 1;
+            trials(trial_index).Trial_number = TrialNum_curr;
+            prev_trial_number = TrialNum_curr;
         else
-        % if there is already a trial structure
-        idx = find([trials.Trial_number] == TrialNum_curr, 1);
-            if isempty(idx)
-                % if not exist, set up a new trial
-                trial_index = trial_index + 1;  
+            if TrialNum_curr ~= prev_trial_number
+                % trial number changed -> start a new trial
+                trial_index = trial_index + 1;
                 currTrial = trial;
-                currTrial.Trial_number = TrialNum_curr;  
-               % try
+                currTrial.Trial_number = TrialNum_curr;
                 trials(trial_index) = currTrial;
-                %{
-                catch
-                    disp('Find field mismatch, please debug')
-                     s1 = trials(trial_index-1);
-                     s2 = currTrial;
-                     compare_fields(s1,s2);
-       
-                    keyboard
-                end
-                %}
-      
             end
+            prev_trial_number = TrialNum_curr;
         end
     
        %go through each type of events
@@ -585,6 +576,11 @@ disp(sprintf('File:%s Experiment meta has been parsed into %s',Filename_nev,Outp
 % Flatten array/vector fields (e.g. positions) into separate columns
 trials_flat = rmfield(trials, {'undefined', 'duplicates'});
 trials_table = struct2table(trials_flat);
+
+% Explicit 0-based sequential row index (pandas-friendly: read_csv(index_col='index')).
+% Kept separate from Trial_number, which holds the real (resetting) trial number.
+trials_table = addvars(trials_table, (0:height(trials_table)-1)', ...
+    'Before', 1, 'NewVariableNames', 'index');
 
 
 % Convert any cell columns to strings for CSV compatibility
