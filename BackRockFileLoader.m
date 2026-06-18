@@ -17,7 +17,7 @@ end
 % the year-month-date folder. The loader auto-detects the .nev/.ns2 files.
 Basic_Path  = '/Users/xuefeiyu/Documents/XuefeiFile/WorkRelated/Data';
 Monkey = 'Porthos';        % bare monkey name; folder is "Monkey <name>"
-Folder = '2026-04-03';     % year-month-date folder
+Folder = '2026-06-17';     % year-month-date folder
 Location = 'in_lab';       % editable constant
 DataType = 'raw_data';     % editable constant
 
@@ -33,7 +33,7 @@ OutputFileName_exp = 'Blackrock_'+string(Folder)+'_expmeta_matlab.txt';
 OutputFileName_trials = 'Blackrock_'+string(Folder)+'_trials_matlab.csv';
 
 % Whether load analog data
-LoadAnalogData = true;
+LoadAnalogData = false;
 AnalogIdentifier = '*.ns2';
 
 %Load events and events timing
@@ -115,22 +115,34 @@ end
 fprintf('--------------------------------\n');
 
 
-%% Experimental meta data
-experiment = struct();
-experiment.git_commit        = NaN;
-experiment.viewing_distance  = NaN;          % in cm
-experiment.screen_size       = [NaN, NaN];    % W x H cm
-experiment.screen_resolution = [NaN, NaN];   % pixels
-experiment.FPS               = NaN;         % Hz
-experiment.eyetracker_rate   = NaN;        % Hz
-experiment.eye_tracked       = NaN;     % string
-experiment.start        =NaN; %in s
-experiment.end        = NaN; % in s
+%% Experimental meta data (one entry per session within the recording)
+% A single .nev recording can contain several experiment sessions (the task is
+% started/ended multiple times). Each session writes its own metadata block, so
+% experiment is a struct array indexed by session_index.
+exp_template = struct();
+exp_template.git_commit                   = NaN;
+exp_template.viewing_distance             = NaN;          % in cm
+exp_template.screen_size                  = [NaN, NaN];   % W x H cm
+exp_template.screen_resolution            = [NaN, NaN];   % pixels
+exp_template.FPS                          = NaN;          % Hz
+exp_template.eyetracker_rate              = NaN;          % Hz
+exp_template.eye_tracked                  = NaN;          % string
+exp_template.photodiode_circles           = NaN;          % 'visible'/'hidden'
+exp_template.photodiode_fixation_position = [NaN, NaN];   % deg
+exp_template.photodiode_target_1_position = [NaN, NaN];   % deg
+exp_template.photodiode_target_2_position = [NaN, NaN];   % deg
+exp_template.start                        = NaN;          % in s
+exp_template.end                          = NaN;          % in s
+exp_template.end_by                       = NaN;          % reason the session ended, e.g. 'experimenter closed task'
+
+experiment    = exp_template([]);   % empty struct array, grows one entry per session
+session_index = 0;
 
 
 %% Config a structure to save each trial
 trial = struct();
 trial.Trial_number = NaN; %Current trial number
+trial.Session = NaN; %which experiment session this trial belongs to
 trial.Task = NaN; %TaskType
 trial.Trial_type = NaN;
 trial.Start = NaN; % trial start time, in s
@@ -182,8 +194,22 @@ trial.End = NaN; %in ms
 trial.Trialoutcome = NaN; %Correct or time out or others
 trial.Reward_start = NaN; %in s 
 trial.Reward_amount = NaN; %in s 
-trial.Reward_end =NaN; %in s 
+trial.Reward_end =NaN; %in s
 trial.Save_complete = 0; %true: completely saved(have start marker); otherwise, false
+
+% Newly added trial events  06-17-2026
+trial.Feedback_flash_on              = NaN; %in s (event time)
+trial.Feedback_flash_off             = NaN; %in s (event time)
+trial.Fixation_exited                = NaN; %in s (event time)
+trial.Target_deadline_exceeded       = NaN; %in s (event time)
+trial.Requested_feedback_flash_duration = NaN; %in ms
+trial.Requested_choice_timeout       = NaN; %in ms
+trial.Requested_target_reach_deadline = NaN; %in ms (None -> NaN)
+trial.Target_1_side                  = NaN; %'left' or 'right'
+trial.Requested_time_offset_min      = NaN; %in ms
+trial.Requested_time_offset_max      = NaN; %in ms
+trial.Requested_time_offset_active   = NaN; %string, space-separated active offsets (ms)
+
 
 trial.undefined = strings(0,1);%Duplicates or undefind events
 trial.duplicates = strings(0,1);%Duplicates or undefind events
@@ -198,13 +224,15 @@ exp_events = containers.Map({'git commit','viewing distance','screen size','scre
 
 %For trial map
 time_events = containers.Map( {'Start', 'Fixation point on','Fixation point off','Reward end','Target 1 presented','Target 2 presented','Targets off',...
-    'Fixation acquired','Broke fixation','Target 1 acquired','Target 2 acquired','Target 1 off'}, ...
+    'Fixation acquired','Broke fixation','Target 1 acquired','Target 2 acquired','Target 1 off',...
+    'Feedback flash on','Feedback flash off','Fixation exited','Target deadline exceeded'}, ...
     {'Start','Fixation_point_on','Fixation_point_off','Reward_end','Target_1_presented','Target_2_presented','Targets_off',...
-    'Fixation_acquired','Broke_fixation','Choicetime','Choicetime','Target_1_off'} ...
+    'Fixation_acquired','Broke_fixation','Choicetime','Choicetime','Target_1_off',...
+    'Feedback_flash_on','Feedback_flash_off','Fixation_exited','Target_deadline_exceeded'} ...
 );
 
-segment_events = containers.Map( {'Experiment','Fixation color','Target 1 color','Target 2 color','Trial type'},...
-    {'Task','Fixation_color','Target_1_color','Target_2_color','Trial_type'});
+segment_events = containers.Map( {'Experiment','Fixation color','Target 1 color','Target 2 color','Trial type','Target 1 on the'},...
+    {'Task','Fixation_color','Target_1_color','Target_2_color','Trial_type','Target_1_side'});
 
 information_events = containers.Map( ...
     {'Fixation position','Fixation size','Fixation acceptance window'...
@@ -215,8 +243,9 @@ information_events = containers.Map( ...
        'Target 2 position','Target 2 size','Target 2 acceptance window',...
        'Requested target 1 duration','Requested target 2 time offset',...
        'Requested target 1 timeout','Requested penalty box duration',...
-       'Reward start','Requested target dim opacity','Requested target 1 visible duration'
-       
+       'Reward start','Requested target dim opacity','Requested target 1 visible duration',...
+       'Requested feedback flash duration','Requested choice timeout','Requested target reach deadline'
+
        },...
     {'Fixation_position','Fixation_size','Fixation_acceptance_window' ...
     'Target_1_size','Target_1_acceptance_window','Requested_fixation_hold_time',...
@@ -226,7 +255,8 @@ information_events = containers.Map( ...
     'Target_2_position','Target_2_size','Target_2_acceptance_window',...
     'Requested_target_1_duration','Requested_target_2_time_offset',...
     'Requested_target_1_timeout','Requested_penalty_box_duration',...
-    'Reward_start','Requested_target_dim_opacity','Requested_target_1_visible_duration'
+    'Reward_start','Requested_target_dim_opacity','Requested_target_1_visible_duration',...
+    'Requested_feedback_flash_duration','Requested_choice_timeout','Requested_target_reach_deadline'
     });
 
     dash_events = {'End','Correct choice','Wrong choice'};
@@ -252,38 +282,62 @@ for i = 1:EventsNumber
     if ~isempty(exp_flag)
         %Get the experiment meta data
         exp_marker = exp_flag{1}{1}; %start or end
-        if isnan(experiment.(exp_marker))
-            experiment.(exp_marker) = curr_eventtime;
-            
+        exp_token  = strtrim(exp_flag{1}{2});
+
+        %A new session begins at each "Experiment start: git commit ..." line
+        %(the first line of every metadata block within the recording).
+        if strcmp(exp_marker,'start') && startsWith(exp_token,'git commit')
+            session_index = session_index + 1;
+            experiment(session_index) = exp_template;
+            experiment(session_index).start = curr_eventtime;
         end
 
-        %Saved meta data
-        exp_token = strtrim(exp_flag{1}{2});
-        if startsWith(exp_token,'git commit')
-            experiment.git_commit = strtrim(strrep(exp_token,'git commit',''));
-        elseif startsWith(exp_token,'eyetracker tracking')
-            eye_tokens = strtrim(regexp(exp_token,'eyetracker tracking (\w+)','tokens'));
-            experiment.eye_tracked = eye_tokens{1}{1};
-        else
-            %Numeric data
-           num_tokens = regexp(exp_token, ...
-            '^\s*(.*?)\s+(\d+\.?\d*)\D*(\d+\.?\d*)?', 'tokens');
-           event_exp = strtrim(num_tokens{1}{1});
-           nums =cellfun(@str2double,num_tokens{1}(2:end));
-      
+        if session_index >= 1
+            if strcmp(exp_marker,'end')
+                experiment(session_index).end = curr_eventtime; %last end line wins
+                if ~startsWith(exp_token,'git commit')
+                    %Capture why the session ended (e.g. 'experimenter closed task').
+                    %The git-commit end line is just a commit re-stamp, not a reason.
+                    experiment(session_index).end_by = exp_token;
+                end
+            end
 
-            %nums = str2double(nums_token);  
-            exp_event_keys = keys(exp_events);
-            flag_array = contains(exp_event_keys,event_exp);
-            curr_key = exp_event_keys{flag_array};
-            field = exp_events(curr_key);
-    
-        
-            experiment.(field) = nums(~isnan(nums));
-
+            %Saved meta data into the current session
+            if startsWith(exp_token,'git commit')
+                experiment(session_index).git_commit = strtrim(strrep(exp_token,'git commit',''));
+            elseif startsWith(exp_token,'eyetracker tracking')
+                eye_tokens = regexp(exp_token,'eyetracker tracking (\w+)','tokens');
+                experiment(session_index).eye_tracked = eye_tokens{1}{1};
+            elseif startsWith(exp_token,'photodiode')
+                %Photodiode metadata: 'circles visible/hidden' or a (x, y) deg position
+                coord = regexp(exp_token, '\(\s*([-+]?\d*\.?\d+)\s*,\s*([-+]?\d*\.?\d+)\s*\)', 'tokens');
+                if startsWith(exp_token,'photodiode circles')
+                    experiment(session_index).photodiode_circles = strtrim(strrep(exp_token,'photodiode circles',''));
+                elseif startsWith(exp_token,'photodiode fixation position') && ~isempty(coord)
+                    experiment(session_index).photodiode_fixation_position = cellfun(@str2double, coord{1});
+                elseif startsWith(exp_token,'photodiode target_1 position') && ~isempty(coord)
+                    experiment(session_index).photodiode_target_1_position = cellfun(@str2double, coord{1});
+                elseif startsWith(exp_token,'photodiode target_2 position') && ~isempty(coord)
+                    experiment(session_index).photodiode_target_2_position = cellfun(@str2double, coord{1});
+                end
+            elseif strcmp(exp_token,'experimenter closed task')
+                %end marker text, nothing to store
+            else
+                %Numeric data (viewing distance / screen size / resolution / FPS / rate)
+                num_tokens = regexp(exp_token, ...
+                    '^\s*(.*?)\s+(\d+\.?\d*)\D*(\d+\.?\d*)?', 'tokens');
+                if ~isempty(num_tokens)
+                    event_exp      = strtrim(num_tokens{1}{1});
+                    nums           = cellfun(@str2double,num_tokens{1}(2:end));
+                    exp_event_keys = keys(exp_events);
+                    flag_array     = contains(exp_event_keys,event_exp);
+                    if any(flag_array)
+                        field = exp_events(exp_event_keys{flag_array});
+                        experiment(session_index).(field) = nums(~isnan(nums));
+                    end
+                end
+            end
         end
-
-       
 
     else %Trial data
 
@@ -294,24 +348,31 @@ for i = 1:EventsNumber
     
         % Define the current trial.
         % A new trial begins whenever the parsed trial number changes from the
-        % previous trial event. Trials are keyed by POSITION (trial_index), not
-        % by number, so a reset counter (e.g. ...,30,0,1,...) starts new trials
-        % instead of merging into an earlier same-numbered trial.
+        % previous trial event, OR the session changes. Trials are keyed by
+        % POSITION (trial_index), not by number, so a reset counter
+        % (e.g. ...,30,0,1,...) starts new trials instead of merging into an
+        % earlier same-numbered trial. The session test also splits trials that
+        % share a number across two sessions (e.g. session 1 trial 1 vs session 2
+        % trial 1).
         if exist('trials','var') ~= 1 || isempty(trials)
             % first trial event
             trials = trial;
             trial_index = 1;
             trials(trial_index).Trial_number = TrialNum_curr;
+            trials(trial_index).Session = session_index;
             prev_trial_number = TrialNum_curr;
+            prev_session = session_index;
         else
-            if TrialNum_curr ~= prev_trial_number
-                % trial number changed -> start a new trial
+            if TrialNum_curr ~= prev_trial_number || session_index ~= prev_session
+                % trial number or session changed -> start a new trial
                 trial_index = trial_index + 1;
                 currTrial = trial;
                 currTrial.Trial_number = TrialNum_curr;
+                currTrial.Session = session_index;
                 trials(trial_index) = currTrial;
             end
             prev_trial_number = TrialNum_curr;
+            prev_session = session_index;
         end
     
        %go through each type of events
@@ -320,6 +381,7 @@ for i = 1:EventsNumber
        seg_flag = contains(event_text, keys(segment_events));
        dash_flag = contains(event_text, dash_events) & contains(event_text, '-');
        outcome_flag = contains(event_text, outcome_events);
+       offset_range_flag = contains(event_text, 'Requested time offset range');
     
     
        if time_flag
@@ -347,7 +409,7 @@ for i = 1:EventsNumber
            %Extract values following the event
            coord_pattern = '^(.*?)\s*\(\s*([-+]?\d*\.?\d+)\s*,\s*([-+]?\d*\.?\d+)\s*\)\s*deg$';
            reward_pattern = '^(.*?)\s*\(([\d\.]+)ms';
-           time_pattern = '^(.*?)\s+([-+]?\d*\.?\d+)\s*ms$';
+           time_pattern = '^(.*?)\s+([-+]?\d*\.?\d+|None|none)\s*ms$';
            size_pattern = '^(.*?)\s+([-+]?\d*\.?\d+)\s*(?:deg)?$';
             
            
@@ -513,6 +575,22 @@ for i = 1:EventsNumber
     
            end
            %}
+
+       elseif offset_range_flag
+           % "Requested time offset range [min, max] ms (active: [v1, v2, ...])"
+           % Range -> two numeric fields; active list -> a space-separated string
+           % (CSV columns cannot hold multiple values).
+           range_tok  = regexp(event_text, 'range\s*\[\s*([-+]?\d*\.?\d+)\s*,\s*([-+]?\d*\.?\d+)\s*\]', 'tokens');
+           active_tok = regexp(event_text, 'active:\s*\[([^\]]*)\]', 'tokens');
+           if ~isempty(range_tok)
+               trials(trial_index).Requested_time_offset_min = str2double(range_tok{1}{1});
+               trials(trial_index).Requested_time_offset_max = str2double(range_tok{1}{2});
+           end
+           if ~isempty(active_tok)
+               active_vals = strtrim(strsplit(active_tok{1}{1}, ','));
+               trials(trial_index).Requested_time_offset_active = char(strjoin(active_vals, ' '));
+           end
+
        else
            %Undefined fields
            disp('Undefined event detected:');
@@ -605,15 +683,20 @@ end
 
 
 % Save experiment meta as .txt
+% One section per session, separated by a "Session N:" header and a blank line.
 fid = fopen(fullfile(OutputPath, OutputFileName_exp), 'w');
-fields = fieldnames(experiment);
-for i = 1:numel(fields)
-    val = experiment.(fields{i});
-    if isnumeric(val)
-        fprintf(fid, '%s: %s\n', fields{i}, mat2str(val));
-    else
-        fprintf(fid, '%s: %s\n', fields{i}, string(val));
+for s = 1:numel(experiment)
+    fprintf(fid, 'Session %d:\n', s);
+    fields = fieldnames(experiment(s));
+    for i = 1:numel(fields)
+        val = experiment(s).(fields{i});
+        if isnumeric(val)
+            fprintf(fid, '%s: %s\n', fields{i}, mat2str(val));
+        else
+            fprintf(fid, '%s: %s\n', fields{i}, string(val));
+        end
     end
+    fprintf(fid, '\n');
 end
 fclose(fid);
 
