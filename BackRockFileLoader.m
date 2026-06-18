@@ -2,6 +2,7 @@
 % by Xuefei Yu 03-02-2026
 % Currently only for behavior data, --03-02-2026
 % Change the export data from .mat into txt and csv file 
+% Change the loader into automatically looking for .nev and .ns2 files
 clear
 close all
 
@@ -10,35 +11,40 @@ close all
 if isempty(which('openNEV'))
     addpath(genpath('/Users/xuefeiyu/Documents/XuefeiFile/WorkRelated/Program_Matlab_Local/JLab/ToolsAndFunctions/NPMK'));
 end
-    
-LoadAnalogData = false; % Whether to load analog channels
-
 
 %% Set up data path
+% Per-run inputs: set the basic path once, then supply the monkey name and
+% the year-month-date folder. The loader auto-detects the .nev/.ns2 files.
 Basic_Path  = '/Users/xuefeiyu/Documents/XuefeiFile/WorkRelated/Data';
-Monkey = 'Monkey Porthos';
-Location = 'in_lab';
-DataType = 'raw_data';
-Folder = '2026-03-24';
-Filename_nev = 'Hub1-test_20260324_timedelay.nev';
-%Filename_nev = 'Hub1-Athos_20260528_t1040_dxxxx_xxx_memsacc.nev';
-%Filename_nev = 'Hub1-Porthos_20260206_t1020_dxxxx_vis_saccade.nev';
-Filename_ns = 'NSP-test_20260324_timedelay.ns2';%Eye trace data
-%Filename_ns = 'NSP1-Athos_20260528_t1040_dxxxx_xxx_memsacc.ns2';%Eye trace data
+Monkey = 'Porthos';        % bare monkey name; folder is "Monkey <name>"
+Folder = '2026-04-03';     % year-month-date folder
+Location = 'in_lab';       % editable constant
+DataType = 'raw_data';     % editable constant
+
+MonkeyFolder = ['Monkey ' Monkey];
+DataFolder = fullfile(Basic_Path,MonkeyFolder,Location,DataType,Folder);
 
 %Path for export parsed data
 OutputFolder = 'export_data';
-OutputPath = fullfile(Basic_Path,Monkey,Location,OutputFolder,Folder);
+OutputPath = fullfile(Basic_Path,MonkeyFolder,Location,OutputFolder,Folder);
 %Change it to your own:
 %e.g OutputPath = '/folder/your own path'
 OutputFileName_exp = 'Blackrock_'+string(Folder)+'_expmeta_matlab.txt';
 OutputFileName_trials = 'Blackrock_'+string(Folder)+'_trials_matlab.csv';
 
+% Whether load analog data
+LoadAnalogData = true;
+AnalogIdentifier = '*.ns2';
 
 %Load events and events timing
-CompleteFilePath_nev = fullfile(Basic_Path,Monkey,Location,DataType ,Folder,Filename_nev);
-%Change it to your own:
-%e.g CompleteFilePath_nev = '/folder/your own path'
+% Auto-detect the .nev file; if several exist, pick the largest one.
+nev_list = dir(fullfile(DataFolder, '*.nev'));
+if isempty(nev_list)
+    error('No .nev file found in: %s', DataFolder);
+end
+[~, idx] = max([nev_list.bytes]);     % pick the largest when multiple
+Filename_nev = nev_list(idx).name;
+CompleteFilePath_nev = fullfile(DataFolder, Filename_nev);
 
 tmpdata = openNEV(CompleteFilePath_nev,'report','nosave');
 
@@ -52,20 +58,61 @@ Events = nevdata.Comments.Text;
 EventTime = nevdata.Comments.TimeStampSec;
 
 
+% Detect eye-trace .ns2 file(s); let the user pick which to load, or skip.
 if LoadAnalogData
+    ns_list = dir(fullfile(DataFolder, AnalogIdentifier));
+    Filename_ns = '';
+    if ~isempty(ns_list)
+        ns_names = {ns_list.name};
+
+        if length(ns_names) > 1
+            [sel, ok] = listdlg('PromptString', 'Select eye (.ns2) file to load (Cancel = skip):', ...
+                'SelectionMode', 'single', 'ListString', ns_names, 'ListSize', [400 200]);
+            if ok
+                LoadAnalogData = true;
+                Filename_ns = ns_names{sel};
+            else
+                %cancel
+                LoadAnalogData = false;
+                disp('Skip analog loading this time.')
+            end
+        else
+             Filename_ns =  ns_names{1};
+
+        end
+    else
+        disp('No analog channel found');
+        LoadAnalogData = false;
+       
+
+    end
+end
+
 %Load analog channels--eye data only temporally
 %Will update this part later
+if LoadAnalogData
+    CompleteFilePath_nstmp_ana_data = fullfile(DataFolder, Filename_ns);
+    tmp_ana_data = openNSx(CompleteFilePath_nstmp_ana_data,'read','report', 'uv');
 
-CompleteFilePath_nstmp_ana_data = fullfile(Basic_Path,Monkey,Location,Task,DataType ,Folder,Filename_ns);
-tmp_ana_data = openNSx(CompleteFilePath_nstmp_ana_data,'read','report', 'uv');
-
-nsxdata = tmp_ana_data.Data; % in uV
-nsx_starttime  = tmp_ana_data.MetaTags.Timestamp;
-nsx_samplingrate = tmp_ana_data.MetaTags.SamplingFreq;
-N = length(nsxdata);
-nsx_rel_time = (0:N-1)/nsx_samplingrate; %add-on time seqence from the starttime
+    nsxdata = tmp_ana_data.Data; % in uV
+    nsx_starttime  = tmp_ana_data.MetaTags.Timestamp;
+    nsx_samplingrate = tmp_ana_data.MetaTags.SamplingFreq;
+    N = length(nsxdata);
+    nsx_rel_time = (0:N-1)/nsx_samplingrate; %add-on time seqence from the starttime
+    nsx_abs_time = nsx_starttime + nsx_rel_time;
 
 end %end of load analogdata
+
+
+%% Show the selected files before processing/export
+fprintf('\n--- Selected Blackrock files ---\n');
+fprintf('  NEV (events): %s\n', Filename_nev);
+if LoadAnalogData
+    fprintf('  NS2 (eye):    %s\n', Filename_ns);
+else
+    fprintf('  NS2 (eye):    (none loaded)\n');
+end
+fprintf('--------------------------------\n');
 
 
 %% Experimental meta data
@@ -517,6 +564,7 @@ B.EventTime = EventTime';
     Target_2_angle(Target_2_angle >= 180) = Target_2_angle(Target_2_angle >= 180) - 360;   
 
     stimulus_dir = (Target_1_angle >= 0) * 2 - 1;
+    stimulus_dir(isnan(Target_1_angle)) = NaN; 
  
  %2. Transform choice into target1/target2 and left/right
     ChooseTarget = cellfun(@(s) str2double(s(end)), {trials.Choosen_choice});
