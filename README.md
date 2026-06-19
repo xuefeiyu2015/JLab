@@ -64,21 +64,46 @@ run the script — the `.nev`/`.ns2` files inside the folder are auto-detected.
 
 **BlackRock data** (`BackRockFileLoader.m`): edit the per-run inputs near the top:
 ```matlab
-Basic_Path = '/Users/xuefeiyu/Documents/XuefeiFile/WorkRelated/Data'; % root of all data
-Monkey     = 'Porthos';      % bare monkey name; folder on disk is "Monkey <name>"
-Folder     = '2026-06-17';   % session folder, yyyy-mm-dd
-Location   = 'in_lab';       % editable constant
-DataType   = 'raw_data';     % editable constant
+Basic_Path   = '/Users/xuefeiyu/Documents/XuefeiFile/WorkRelated/Data'; % root of all data
+Monkey       = 'Porthos';      % bare monkey name; folder on disk is "Monkey <name>"
+Location     = 'in_lab';       % editable constant
+DataType     = 'raw_data';     % editable constant
+OutputFolder = 'export_data';  % where parsed data is written
 ```
-The loader builds the input path as:
+The loader builds the input and export roots as:
 ```matlab
-DataFolder = fullfile(Basic_Path, ['Monkey ' Monkey], Location, DataType, Folder);
+DataTypePath = fullfile(Basic_Path, ['Monkey ' Monkey], Location, DataType);
+ExportPath   = fullfile(Basic_Path, ['Monkey ' Monkey], Location, OutputFolder);
 ```
 so the expected folder layout on disk is:
 ```
-<Basic_Path>/Monkey <Monkey>/<Location>/<DataType>/<Folder>/  ← contains the .nev/.ns2 files
-<Basic_Path>/Monkey <Monkey>/<Location>/export_data/<Folder>/ ← parsed .txt/.csv output is written here
+<Basic_Path>/Monkey <Monkey>/<Location>/<DataType>/<YYYY-MM-DD>/    ← contains the .nev/.ns2 files
+<Basic_Path>/Monkey <Monkey>/<Location>/export_data/<YYYY-MM-DD>/   ← parsed .txt/.csv output is written here
 ```
+If your data already lives under a different layout, just overwrite `DataTypePath`
+and `ExportPath` directly with your own absolute paths.
+
+### Batch loading multiple sessions
+
+The loader processes one or more `YYYY-MM-DD` session folders in a single run.
+Set the `Folder` variable to choose which ones:
+```matlab
+Folder = '2026-06-17';                    % a single session folder
+Folder = {'2026-06-17','2026-06-18'};     % several folders, loaded in order
+Folder = {};                              % every YYYY-MM-DD folder under DataTypePath
+```
+For each folder the script **loads → parses → adds features → exports** in turn,
+writing the per-session output files
+(`Blackrock_<date>_expmeta_matlab.txt` and `Blackrock_<date>_trials_matlab.csv`)
+into the matching `export_data/<date>/` subfolder.
+
+If one folder fails (e.g. a missing `.nev` file), it is caught and reported, and
+the batch continues with the remaining folders. A **batch summary** listing the
+`ok`/`failed` status of every folder is printed at the end.
+
+> Note: a single `.nev` recording may contain several experiment sessions
+> (the task started/stopped multiple times). These are tracked per session
+> within each file via the `Session` column, independent of the batch-folder loop.
 
 **Cage trainer data** (`CageTrianingDataLoading.m`): set the corresponding path
 variables at the top of that script the same way.
