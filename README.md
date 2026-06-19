@@ -53,18 +53,37 @@ JLab/
 1. Complete all steps in **Prerequisites**
 2. Open MATLAB and navigate to the JLab folder
 3. Open the desired script, e.g.:
-first the loader: ```CageTrianingDataLoading``` to parse the raw data
+first the loader: ```BackRockFileLoader``` to parse the raw data
 then the analyzer: ```BlackRockFileAnalyzer``` for further analysis
-4. For the cage trainer data: the path structure in my laptop is:
+
+### Setting up the data path
+
+The loaders find your data by assembling a folder path from a few editable
+variables at the top of the script. Set these to point at your own data, then
+run the script — the `.nev`/`.ns2` files inside the folder are auto-detected.
+
+**BlackRock data** (`BackRockFileLoader.m`): edit the per-run inputs near the top:
 ```matlab
-monkey = 'Monkey Porthos';
-main_path = '/Users/xuefeiyu/Documents/XuefeiFile/WorkRelated/Data/';
-data_date = '2026-02-24'; % in yyyy-mm-dd
-task_type = 'cage_training/timedelay';
-local_label = 'raw';
-folder_path = fullfile(main_path, monkey, task_type, local_label, data_date);
+Basic_Path = '/Users/xuefeiyu/Documents/XuefeiFile/WorkRelated/Data'; % root of all data
+Monkey     = 'Porthos';      % bare monkey name; folder on disk is "Monkey <name>"
+Folder     = '2026-06-17';   % session folder, yyyy-mm-dd
+Location   = 'in_lab';       % editable constant
+DataType   = 'raw_data';     % editable constant
 ```
-You are welcome to change into your own path
+The loader builds the input path as:
+```matlab
+DataFolder = fullfile(Basic_Path, ['Monkey ' Monkey], Location, DataType, Folder);
+```
+so the expected folder layout on disk is:
+```
+<Basic_Path>/Monkey <Monkey>/<Location>/<DataType>/<Folder>/  ← contains the .nev/.ns2 files
+<Basic_Path>/Monkey <Monkey>/<Location>/export_data/<Folder>/ ← parsed .txt/.csv output is written here
+```
+
+**Cage trainer data** (`CageTrianingDataLoading.m`): set the corresponding path
+variables at the top of that script the same way.
+
+You are welcome to change these into your own paths.
 
 ## Feel free to push me request, report errors or bugs.
 
