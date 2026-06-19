@@ -1,0 +1,30 @@
+# Data files
+*.mat
+*.csv
+*.dat
+*.nev
+*.ns1
+*.ns2
+*.ns3
+*.ns4
+*.ns5
+*.ns6
+*.nsx
+
+# MATLAB autosave / temp
+*.asv
+*.m~
+slprj/
+*.mex*
+
+# Third-party tools
+/ToolsAndFunctions/
+
+# Editor / IDE
+.claude/
+.vscode/
+.idea/
+
+# OS junk
+.DS_Store
+Thumbs.db

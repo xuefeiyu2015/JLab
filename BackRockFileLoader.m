@@ -3,6 +3,11 @@
 % Currently only for behavior data, --03-02-2026
 % Change the export data from .mat into txt and csv file 
 % Change the loader into automatically looking for .nev and .ns2 files
+% Update the comments, --June 18th, 2026
+% Add batch loading: Folder can be a list of dates, or empty to process all
+% YYYY-MM-DD folders; each is loaded/parsed/exported in turn, --June 19th, 2026
+% Add batch run and export, now  it supports loading and exporting multiple
+% files -- June 19th, 2026
 clear
 close all
 
@@ -12,108 +17,37 @@ if isempty(which('openNEV'))
     addpath(genpath('/Users/xuefeiyu/Documents/XuefeiFile/WorkRelated/Program_Matlab_Local/JLab/ToolsAndFunctions/NPMK'));
 end
 
-%% Set up data path
-% Per-run inputs: set the basic path once, then supply the monkey name and
-% the year-month-date folder. The loader auto-detects the .nev/.ns2 files.
+%% Set up data path (built once for the whole batch)
+% Per-run inputs: set the basic path once, supply the monkey name, and choose
+% which year-month-date folder(s) to process. The loader auto-detects .nev/.ns2.
 Basic_Path  = '/Users/xuefeiyu/Documents/XuefeiFile/WorkRelated/Data';
 Monkey = 'Porthos';        % bare monkey name; folder is "Monkey <name>"
-Folder = '2026-06-17';     % year-month-date folder
 Location = 'in_lab';       % editable constant
 DataType = 'raw_data';     % editable constant
+OutputFolder = 'export_data';   % where parsed data is written
 
 MonkeyFolder = ['Monkey ' Monkey];
-DataFolder = fullfile(Basic_Path,MonkeyFolder,Location,DataType,Folder);
+DataTypePath = fullfile(Basic_Path,MonkeyFolder,Location,DataType);
 
-%Path for export parsed data
-OutputFolder = 'export_data';
-OutputPath = fullfile(Basic_Path,MonkeyFolder,Location,OutputFolder,Folder);
-%Change it to your own:
-%e.g OutputPath = '/folder/your own path'
-OutputFileName_exp = 'Blackrock_'+string(Folder)+'_expmeta_matlab.txt';
-OutputFileName_trials = 'Blackrock_'+string(Folder)+'_trials_matlab.csv';
+%If you have your own path to the 'Year-Month-Date' folder, replace the
+%DataTypePath here.
 
-% Whether load analog data
-LoadAnalogData = false;
+ExportPath = fullfile(Basic_Path,MonkeyFolder,Location,OutputFolder);
+%If you have your own export path, replace it here
+
+
+% Year-month-date folder(s) to process:
+%   '2026-06-17'                   a single folder
+%   {'2026-06-17','2026-06-18'}    several folders, loaded in order
+%   {}  (or '')                    every YYYY-MM-DD folder under DataTypePath
+Folder = {'2026-06-17','2026-06-18'};
+FolderList = resolveFolders(Folder, DataTypePath);
+
+% Whether to load analog data. This is the per-batch default; the .ns2 picker
+% below may switch it off for an individual folder, so it is re-applied each
+% iteration and never leaks between folders.
+LoadAnalogData_default = false;
 AnalogIdentifier = '*.ns2';
-
-%Load events and events timing
-% Auto-detect the .nev file; if several exist, pick the largest one.
-nev_list = dir(fullfile(DataFolder, '*.nev'));
-if isempty(nev_list)
-    error('No .nev file found in: %s', DataFolder);
-end
-[~, idx] = max([nev_list.bytes]);     % pick the largest when multiple
-Filename_nev = nev_list(idx).name;
-CompleteFilePath_nev = fullfile(DataFolder, Filename_nev);
-
-tmpdata = openNEV(CompleteFilePath_nev,'report','nosave');
-
-if isempty(tmpdata)
-    error('No data found, please check your path: %s', CompleteFilePath_nev);
-end
-
-nevdata = tmpdata.Data;
-
-Events = nevdata.Comments.Text;
-EventTime = nevdata.Comments.TimeStampSec;
-
-
-% Detect eye-trace .ns2 file(s); let the user pick which to load, or skip.
-if LoadAnalogData
-    ns_list = dir(fullfile(DataFolder, AnalogIdentifier));
-    Filename_ns = '';
-    if ~isempty(ns_list)
-        ns_names = {ns_list.name};
-
-        if length(ns_names) > 1
-            [sel, ok] = listdlg('PromptString', 'Select eye (.ns2) file to load (Cancel = skip):', ...
-                'SelectionMode', 'single', 'ListString', ns_names, 'ListSize', [400 200]);
-            if ok
-                LoadAnalogData = true;
-                Filename_ns = ns_names{sel};
-            else
-                %cancel
-                LoadAnalogData = false;
-                disp('Skip analog loading this time.')
-            end
-        else
-             Filename_ns =  ns_names{1};
-
-        end
-    else
-        disp('No analog channel found');
-        LoadAnalogData = false;
-       
-
-    end
-end
-
-%Load analog channels--eye data only temporally
-%Will update this part later
-if LoadAnalogData
-    CompleteFilePath_nstmp_ana_data = fullfile(DataFolder, Filename_ns);
-    tmp_ana_data = openNSx(CompleteFilePath_nstmp_ana_data,'read','report', 'uv');
-
-    nsxdata = tmp_ana_data.Data; % in uV
-    nsx_starttime  = tmp_ana_data.MetaTags.Timestamp;
-    nsx_samplingrate = tmp_ana_data.MetaTags.SamplingFreq;
-    N = length(nsxdata);
-    nsx_rel_time = (0:N-1)/nsx_samplingrate; %add-on time seqence from the starttime
-    nsx_abs_time = nsx_starttime + nsx_rel_time;
-
-end %end of load analogdata
-
-
-%% Show the selected files before processing/export
-fprintf('\n--- Selected Blackrock files ---\n');
-fprintf('  NEV (events): %s\n', Filename_nev);
-if LoadAnalogData
-    fprintf('  NS2 (eye):    %s\n', Filename_ns);
-else
-    fprintf('  NS2 (eye):    (none loaded)\n');
-end
-fprintf('--------------------------------\n');
-
 
 %% Experimental meta data (one entry per session within the recording)
 % A single .nev recording can contain several experiment sessions (the task is
@@ -134,9 +68,7 @@ exp_template.photodiode_target_2_position = [NaN, NaN];   % deg
 exp_template.start                        = NaN;          % in s
 exp_template.end                          = NaN;          % in s
 exp_template.end_by                       = NaN;          % reason the session ended, e.g. 'experimenter closed task'
-
-experiment    = exp_template([]);   % empty struct array, grows one entry per session
-session_index = 0;
+% experiment and session_index are reset per folder inside the batch loop below.
 
 
 %% Config a structure to save each trial
@@ -264,7 +196,96 @@ information_events = containers.Map( ...
 
     
 
- EventsNumber = size(Events,1); 
+%% Batch process each date folder
+% load -> parse -> add features -> export, once per folder in FolderList.
+% A failure in one folder is caught and reported; the batch keeps going.
+% (Tip: the parse/feature/export body below keeps its original indentation;
+%  press Ctrl+I in the MATLAB editor to auto-indent the whole file.)
+results = struct('folder', {}, 'status', {}, 'message', {});
+for fi = 1:numel(FolderList)
+    CurrentFolder = FolderList{fi};
+    fprintf('\n===== [%d/%d] %s =====\n', fi, numel(FolderList), CurrentFolder);
+
+  try
+    % --- per-folder paths and output filenames ---
+    DataFolder = fullfile(DataTypePath, CurrentFolder);
+    OutputPath = fullfile(ExportPath, CurrentFolder);
+    OutputFileName_exp    = 'Blackrock_'+string(CurrentFolder)+'_expmeta_matlab.txt';
+    OutputFileName_trials = 'Blackrock_'+string(CurrentFolder)+'_trials_matlab.csv';
+
+    % --- reset per-folder state ---
+    clear trials                          % reset the exist('trials','var') first-event guard
+    experiment    = exp_template([]);     % empty struct array, grows one entry per session
+    session_index = 0;
+    LoadAnalogData = LoadAnalogData_default;  % re-apply default so a skip doesn't leak
+
+    % --- Load events and timing: auto-detect the .nev (largest if several) ---
+    nev_list = dir(fullfile(DataFolder, '*.nev'));
+    if isempty(nev_list)
+        error('No .nev file found in: %s', DataFolder);
+    end
+    [~, idx] = max([nev_list.bytes]);     % pick the largest when multiple
+    Filename_nev = nev_list(idx).name;
+    CompleteFilePath_nev = fullfile(DataFolder, Filename_nev);
+
+    tmpdata = openNEV(CompleteFilePath_nev,'report','nosave');
+    if isempty(tmpdata)
+        error('No data found, please check your path: %s', CompleteFilePath_nev);
+    end
+
+    nevdata = tmpdata.Data;
+    Events = nevdata.Comments.Text;
+    EventTime = nevdata.Comments.TimeStampSec;
+
+    % --- Detect eye-trace .ns2 file(s); let the user pick, or skip ---
+    if LoadAnalogData
+        ns_list = dir(fullfile(DataFolder, AnalogIdentifier));
+        Filename_ns = '';
+        if ~isempty(ns_list)
+            ns_names = {ns_list.name};
+            if length(ns_names) > 1
+                [sel, ok] = listdlg('PromptString', 'Select eye (.ns2) file to load (Cancel = skip):', ...
+                    'SelectionMode', 'single', 'ListString', ns_names, 'ListSize', [400 200]);
+                if ok
+                    LoadAnalogData = true;
+                    Filename_ns = ns_names{sel};
+                else
+                    LoadAnalogData = false;
+                    disp('Skip analog loading this time.')
+                end
+            else
+                Filename_ns = ns_names{1};
+            end
+        else
+            disp('No analog channel found');
+            LoadAnalogData = false;
+        end
+    end
+
+    % --- Load analog channels (eye data only, temporary) ---
+    if LoadAnalogData
+        CompleteFilePath_nstmp_ana_data = fullfile(DataFolder, Filename_ns);
+        tmp_ana_data = openNSx(CompleteFilePath_nstmp_ana_data,'read','report', 'uv');
+
+        nsxdata = tmp_ana_data.Data; % in uV
+        nsx_starttime  = tmp_ana_data.MetaTags.Timestamp;
+        nsx_samplingrate = tmp_ana_data.MetaTags.SamplingFreq;
+        N = length(nsxdata);
+        nsx_rel_time = (0:N-1)/nsx_samplingrate; %add-on time seqence from the starttime
+        nsx_abs_time = nsx_starttime + nsx_rel_time;
+    end
+
+    % --- Show the selected files before processing/export ---
+    fprintf('\n--- Selected Blackrock files ---\n');
+    fprintf('  NEV (events): %s\n', Filename_nev);
+    if LoadAnalogData
+        fprintf('  NS2 (eye):    %s\n', Filename_ns);
+    else
+        fprintf('  NS2 (eye):    (none loaded)\n');
+    end
+    fprintf('--------------------------------\n');
+
+ EventsNumber = size(Events,1);
 
  %
  Event_full = table(Events);
@@ -729,6 +750,43 @@ writetable(trials_table, fullfile(OutputPath, OutputFileName_trials));
 
 disp(sprintf('File:%s Trials Data has been parsed into %s',Filename_nev,OutputFileName_trials));
 
+    results(end+1) = struct('folder', CurrentFolder, 'status', 'ok', 'message', '');
+
+  catch ME
+    warning('Skipping %s: %s', CurrentFolder, ME.message);
+    results(end+1) = struct('folder', CurrentFolder, 'status', 'failed', 'message', ME.message);
+  end %end try
+end %end per-folder loop
+
+
+%% Batch summary
+fprintf('\n===== Batch summary =====\n');
+for k = 1:numel(results)
+    if isempty(results(k).message)
+        fprintf('  [%-6s] %s\n', results(k).status, results(k).folder);
+    else
+        fprintf('  [%-6s] %s - %s\n', results(k).status, results(k).folder, results(k).message);
+    end
+end
+
+
+
+function folders = resolveFolders(Folder, DataTypePath)
+% Normalize Folder into a cellstr list of YYYY-MM-DD folder names.
+% Empty Folder -> auto-discover every date folder under DataTypePath.
+    datePat = '^\d{4}-\d{2}-\d{2}$';
+    if isempty(Folder)
+        d = dir(DataTypePath);
+        names = {d([d.isdir]).name};
+        keep = ~cellfun('isempty', regexp(names, datePat, 'once'));
+        folders = sort(names(keep));
+    else
+        folders = cellstr(Folder);   % char, string array, or cellstr -> cellstr
+    end
+    if isempty(folders)
+        error('No date folders to process under: %s', DataTypePath);
+    end
+end
 
 
 function compare_fields(s1,s2);
