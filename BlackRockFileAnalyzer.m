@@ -18,7 +18,7 @@ clear;
 
 monkey = 'Monkey Porthos';
 main_path = '/Users/xuefeiyu/Documents/XuefeiFile/WorkRelated/Data';
-data_date = '2026-03-24';  % Session date in yyyy-mm-dd
+data_date = '2026-06-18';  % Session date in yyyy-mm-dd
 task_type = 'in_lab';
 folder = 'export_data';
 
