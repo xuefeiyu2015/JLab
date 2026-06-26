@@ -18,7 +18,7 @@ task_type = 'cage_training/timedelay';
 %from dropbox to local
 monkey = 'Monkey Porthos';
 main_path = '/Users/xuefeiyu/Documents/XuefeiFile/WorkRelated/Data/';
-data_date = '2026-04-01'; % in yyyy-mm-dd
+data_date = '2026-06-05'; % in yyyy-mm-dd
 task_type = 'cage_training/timedelay';
 local_label = 'raw';
 

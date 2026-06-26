@@ -14,14 +14,15 @@ close all
 %% Check if the path is setup ready
 
 if isempty(which('openNEV'))
-    addpath(genpath('/Users/xuefeiyu/Documents/XuefeiFile/WorkRelated/Program_Matlab_Local/JLab/ToolsAndFunctions/NPMK'));
+   % addpath(genpath('/Users/xuefeiyu/Documents/XuefeiFile/WorkRelated/Program_Matlab_Local/JLab/ToolsAndFunctions/NPMK'));
+   addpath('/Users/xuefeiyu/Documents/XuefeiFile/WorkRelated/Program_Matlab_Local/JLab/ToolsAndFunctions/NPMK');
 end
 
 %% Set up data path (built once for the whole batch)
 % Per-run inputs: set the basic path once, supply the monkey name, and choose
 % which year-month-date folder(s) to process. The loader auto-detects .nev/.ns2.
 Basic_Path  = '/Users/xuefeiyu/Documents/XuefeiFile/WorkRelated/Data';
-Monkey = 'Porthos';        % bare monkey name; folder is "Monkey <name>"
+Monkey = 'test';        % bare monkey name; folder is "Monkey <name>"
 Location = 'in_lab';       % editable constant
 DataType = 'raw_data';     % editable constant
 OutputFolder = 'export_data';   % where parsed data is written
@@ -40,14 +41,20 @@ ExportPath = fullfile(Basic_Path,MonkeyFolder,Location,OutputFolder);
 %   '2026-06-17'                   a single folder
 %   {'2026-06-17','2026-06-18'}    several folders, loaded in order
 %   {}  (or '')                    every YYYY-MM-DD folder under DataTypePath
-Folder = {'2026-06-17','2026-06-18'};
+Folder = {'2026-06-24'};
 FolderList = resolveFolders(Folder, DataTypePath);
 
+%% Load Analog Data
 % Whether to load analog data. This is the per-batch default; the .ns2 picker
 % below may switch it off for an individual folder, so it is re-applied each
 % iteration and never leaks between folders.
-LoadAnalogData_default = false;
+LoadAnalogData_default = true;
 AnalogIdentifier = '*.ns2';
+Segment_Marker = ['Start','End'];
+Segment_Buffer = [-500,500];%Time buffer to keep before the segment marker and after the segment marker
+
+%% Load Online Spike Data
+LoadOnlineSpikeData_default = false;
 
 %% Experimental meta data (one entry per session within the recording)
 % A single .nev recording can contain several experiment sessions (the task is
@@ -269,10 +276,12 @@ for fi = 1:numel(FolderList)
 
         nsxdata = tmp_ana_data.Data; % in uV
         nsx_starttime  = tmp_ana_data.MetaTags.Timestamp;
+        nsx_timeresolution  = tmp_ana_data.MetaTags.TimeRes;
         nsx_samplingrate = tmp_ana_data.MetaTags.SamplingFreq;
+        nsx_starttimeSec  = nsx_starttime/nsx_timeresolution;
         N = length(nsxdata);
         nsx_rel_time = (0:N-1)/nsx_samplingrate; %add-on time seqence from the starttime
-        nsx_abs_time = nsx_starttime + nsx_rel_time;
+        nsx_abs_time = nsx_starttimeSec + nsx_rel_time;
     end
 
     % --- Show the selected files before processing/export ---
