@@ -8,13 +8,21 @@ MATLAB-based data analysis toolkit for both cage trainer and data recorded using
 
 ### 1. MATLAB Path (handled automatically)
 
-`BackRockFileLoader.m` self-adds the entire JLab folder (its own location plus
-all subfolders) to the MATLAB path on startup, so NPMK, the `BlackrockLoader`
-class, and the analyze tools are all found **without any manual `addpath`** —
-on any clone, wherever you put the repo.
+`BackRockFileLoader.m` sets up its own path on startup, in two steps:
+
+1. **JLab code** — adds the repo root (for the top-level scripts) and the
+   `ToolsAndFunctions` tree (the `BlackrockLoader` class + analyze tools). The
+   repo root is *not* added recursively, so dot-folders at the root (`.git`,
+   `.claude`, …) are never placed on the MATLAB path.
+2. **NPMK** — if `openNEV` is already found (e.g. NPMK lives under
+   `ToolsAndFunctions/NPMK`), nothing more happens. Otherwise the script prompts
+   you to select your NPMK folder and adds it; cancelling aborts with an
+   install hint.
+
+So no manual `addpath` is needed on a fresh clone, wherever you put the repo.
 
 If you prefer to set the path yourself (or run the other scripts directly), you
-can still add the whole folder once:
+can still add the folder once:
 
 ```matlab
 addpath(genpath('/path/to/JLab'))

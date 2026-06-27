@@ -12,12 +12,29 @@ clear
 close all
 
 %% Check if the path is setup ready
-% Self-add the whole JLab repo (this script's own folder + all subfolders) so
-% NPMK, the BlackrockLoader class, and the analyze tools are all found without
-% any manual addpath. Derived from the script location, so it works on any clone.
+% Step 1 - add JLab's own code. The repo root is added non-recursively (for the
+% top-level scripts) and only the ToolsAndFunctions tree is genpath'd (for the
+% BlackrockLoader class + analyze tools). We deliberately do NOT genpath the repo
+% root, so dot-folders at the root (.git, .claude, ...) never end up on the path.
 JLabRoot = fileparts(mfilename('fullpath'));
-if isempty(which('openNEV')) || isempty(which('BlackrockLoader'))
-   addpath(genpath(JLabRoot));
+addpath(JLabRoot);
+addpath(genpath(fullfile(JLabRoot, 'ToolsAndFunctions')));
+
+% Step 2 - NPMK is a third-party dependency you supply yourself. If openNEV is
+% already on the path (e.g. NPMK lives under ToolsAndFunctions/NPMK), we're done.
+% Otherwise ask the user to point at their NPMK folder and add it.
+if isempty(which('openNEV'))
+    disp('BlackRock NPMK not found (openNEV is missing).');
+    disp('Select your NPMK folder to add it (Cancel to abort).');
+    npmk_dir = uigetdir('', 'Select the BlackRock NPMK folder');
+    if isequal(npmk_dir, 0)
+        error(['NPMK not added. Install it from ' ...
+               'https://github.com/BlackrockNeurotech/NPMK and add it to the path.']);
+    end
+    addpath(genpath(npmk_dir));
+    if isempty(which('openNEV'))
+        error('openNEV still not found in: %s. Make sure you selected the NPMK root folder.', npmk_dir);
+    end
 end
 
 %% Set up data path (built once for the whole batch)
