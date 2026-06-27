@@ -22,14 +22,7 @@ MATLAB-based data analysis toolkit for both cage trainer and data recorded using
 So no manual `addpath` is needed on a fresh clone, wherever you put the repo.
 
 If you prefer to set the path yourself (or run the other scripts directly), you
-can still add the folder once:
-
-```matlab
-addpath(genpath('/path/to/JLab'))
-savepath
-```
-
-Or manually in MATLAB:
+can still add the folder manually in MATLAB:
 **Home → Set Path → Add with Subfolders** → select the JLab folder → Save.
 
 ### 2. Install BlackRock NPMK Toolkit
@@ -41,7 +34,7 @@ Download it from the official GitHub repository:
 
 **Installation steps:**
 1. Download or clone the NPMK repository.
-2. Move the downloaded NPMK folder into this repo's `ToolsAndFunctions` folder, so
+2. Move the downloaded NPMK folder into this repo's **`ToolsAndFunctions`** folder, so
    it lives at `JLab/ToolsAndFunctions/NPMK`. The loader's auto-path step (above)
    then picks it up automatically — no manual `addpath` is needed.
 
