@@ -6,9 +6,15 @@ MATLAB-based data analysis toolkit for both cage trainer and data recorded using
 
 ## Prerequisites
 
-### 1. Add All Files to MATLAB Path
+### 1. MATLAB Path (handled automatically)
 
-Before running any scripts, add the entire JLab folder (including subfolders) to your MATLAB path:
+`BackRockFileLoader.m` self-adds the entire JLab folder (its own location plus
+all subfolders) to the MATLAB path on startup, so NPMK, the `BlackrockLoader`
+class, and the analyze tools are all found **without any manual `addpath`** —
+on any clone, wherever you put the repo.
+
+If you prefer to set the path yourself (or run the other scripts directly), you
+can still add the whole folder once:
 
 ```matlab
 addpath(genpath('/path/to/JLab'))
@@ -17,11 +23,6 @@ savepath
 
 Or manually in MATLAB:
 **Home → Set Path → Add with Subfolders** → select the JLab folder → Save.
-
-> ⚠️ Failing to add all subfolders to the path will cause function-not-found errors.
-> In particular, the loader needs `ToolsAndFunctions/LoadingTools` (for the
-> `BlackrockLoader` class) and `ToolsAndFunctions/AnalyzeTools` (for the
-> psychometric fit) on the path.
 
 ### 2. Install BlackRock NPMK Toolkit
 
@@ -32,9 +33,11 @@ Download it from the official GitHub repository:
 
 **Installation steps:**
 1. Download or clone the NPMK repository
-2. Add the NPMK folder to your MATLAB path (recommended in ToolsAndFunctions):
+2. Place it at `JLab/ToolsAndFunctions/NPMK` — the loader's auto-path step (above)
+   then picks it up automatically, so no manual `addpath` is needed. If you keep
+   it elsewhere, add it yourself:
 ```matlab
-addpath(genpath('/path/to/JLab/ToolsAndFunctions/NPMK'))
+addpath(genpath('/path/to/NPMK'))
 savepath
 ```
 

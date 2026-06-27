@@ -12,10 +12,12 @@ clear
 close all
 
 %% Check if the path is setup ready
-
-if isempty(which('openNEV'))
-   % addpath(genpath('/Users/xuefeiyu/Documents/XuefeiFile/WorkRelated/Program_Matlab_Local/JLab/ToolsAndFunctions/NPMK'));
-   addpath('/Users/xuefeiyu/Documents/XuefeiFile/WorkRelated/Program_Matlab_Local/JLab/ToolsAndFunctions/NPMK');
+% Self-add the whole JLab repo (this script's own folder + all subfolders) so
+% NPMK, the BlackrockLoader class, and the analyze tools are all found without
+% any manual addpath. Derived from the script location, so it works on any clone.
+JLabRoot = fileparts(mfilename('fullpath'));
+if isempty(which('openNEV')) || isempty(which('BlackrockLoader'))
+   addpath(genpath(JLabRoot));
 end
 
 %% Set up data path (built once for the whole batch)
