@@ -28,3 +28,9 @@ slprj/
 # OS junk
 .DS_Store
 Thumbs.db
+
+# Test files
+Test_for_Timingalignment.m
+
+#Agent
+CLAUDE.MD
