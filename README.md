@@ -19,10 +19,13 @@ Or manually in MATLAB:
 **Home → Set Path → Add with Subfolders** → select the JLab folder → Save.
 
 > ⚠️ Failing to add all subfolders to the path will cause function-not-found errors.
+> In particular, the loader needs `ToolsAndFunctions/LoadingTools` (for the
+> `BlackrockLoader` class) and `ToolsAndFunctions/AnalyzeTools` (for the
+> psychometric fit) on the path.
 
 ### 2. Install BlackRock NPMK Toolkit
 
-This repository requires the **BlackRock Neurotech NPMK (Neural Processing MATLAB Kit)** toolkit to load `.ns5`, `.nev`, and other BlackRock file formats.
+This repository requires the **BlackRock Neurotech NPMK (Neural Processing MATLAB Kit)** toolkit to load `.ns2`, `.nev`, and other BlackRock file formats.
 
 Download it from the official GitHub repository:
 👉 https://github.com/BlackrockNeurotech/NPMK
@@ -36,33 +39,96 @@ savepath
 ```
 
 > ⚠️ Without NPMK, BlackRock data files cannot be loaded and the scripts will not run.
+> NPMK is third-party and **gitignored** — it is not shipped with this repo. The
+> loader depends on its `openNEV`, `openNSx`, and `ts2sec` functions.
 
 ## File Structure
 
 ```
 JLab/
-├── BackRockFileLoader.m        # Loads BlackRock raw data files
-├── BlackRockFileAnalyzer.m     # Analyzes BlackRock behaviors and recordings
-├── CageTrainingDataAnalyzer.m  # Analyzes cage training behavioral data
-├── CageTrianingDataLoading.m   # Loads cage training data
-└── ToolsAndFunctions/          # Helper functions and utilities
+├── BackRockFileLoader.m         # driver: sets config, runs the batch loop, exports CSV/txt
+├── BlackRockFileAnalyzer.m      # reads trials CSV, fits/plots the psychometric curve
+├── CageTrianingDataLoading.m    # concatenates cage-trainer .json trials into one CSV
+├── CageTrainingDataAnalyzer.m   # reads that CSV, plots the psychometric curve
+└── ToolsAndFunctions/
+    ├── LoadingTools/
+    │   └── BlackrockLoader.m         # class: schema-checked load + comment parsing
+    ├── AnalyzeTools/
+    │   └── VisPsychometricFunction.m # shared logistic-regression psychometric fit
+    └── NPMK/                         # BlackRock NPMK toolkit (third-party, gitignored)
 ```
+
+> Note the filename typo `BackRockFileLoader` (vs. "BlackRock" everywhere else)
+> — run it exactly as named.
 
 ## Usage
 
 1. Complete all steps in **Prerequisites**
 2. Open MATLAB and navigate to the JLab folder
-3. Open the desired script, e.g.:
-first the loader: ```BackRockFileLoader``` to parse the raw data
-then the analyzer: ```BlackRockFileAnalyzer``` for further analysis
+3. Run the loader, then the analyzer:
+   - first the loader: ```BackRockFileLoader``` to parse the raw data into CSV/txt
+   - then the analyzer: ```BlackRockFileAnalyzer``` for the psychometric curve
+
+`BackRockFileLoader.m` is a thin **driver script**: it sets the run config,
+constructs a `BlackrockLoader`, and loops over date folders. All loading and
+parsing logic lives in the class (`ToolsAndFunctions/LoadingTools/BlackrockLoader.m`).
+
+## How the BlackRock loader works
+
+Loading and parsing are handled by the **`BlackrockLoader`** class. It is a
+config-property class: its public properties hold the file schema, the load
+flags, and the parsing schema (templates + event maps). Construct it with
+name/value overrides, then drive it once per date folder:
+
+```matlab
+loader = BlackrockLoader('LoadAnalogData', true, ...   % override any property
+                         'LoadOnlineSpikeData', false);
+S                    = loader.loadSession(DataFolder);     % resolve + load files
+[trials, experiment] = loader.parseEvents(S.Events, S.EventTime);  % comments -> records
+```
+
+### Input file schema (role-aware resolution)
+
+A single recording is split across files **by filename prefix**, and each data
+product is verified present before use:
+
+| File                | Role                                   |
+|---------------------|----------------------------------------|
+| `NSP-*.nev`         | experiment comments + comment timing   |
+| `HUB-*.nev`         | online spike timing                    |
+| `NSP-*.ns2`         | analog / eye data                      |
+
+- **Comments are required.** If `NSP-*.nev` is missing, comments **fall back to
+  `HUB-*.nev`** (legacy recordings wrote comments there). If neither has them,
+  that folder errors and is reported as `failed`.
+- **Spikes and analog are soft.** A missing or unreadable spike/analog file is
+  recorded in a status string and that product is skipped — the folder still
+  succeeds. The prefixes (`NSP`/`HUB`), the `.ns2` identifier, and the
+  `LoadAnalogData` / `LoadOnlineSpikeData` flags are all constructor-overridable
+  properties.
+
+`loadSession` returns a struct `S` with `Events`, `EventTime`,
+`comments_source`, the spike fields (`SpikeTime`, `spike_status`), and the
+analog fields (`nsxdata`, `nsx_samplingrate`, `nsx_abs_time`, `analog_status`).
+
+### Comment parsing schema
+
+`parseEvents` turns BlackRock's free-text comment strings into structured
+`trials` and `experiment` records using the field maps from
+`BlackrockLoader.defaultEventMaps()`. A single `.nev` may contain several
+experiment **sessions** (the task started/stopped repeatedly); each
+`Experiment start: git commit ...` line begins a new session, and trials are
+keyed by position so a reset trial counter starts a new trial rather than
+merging. Derived features (polar target angle/eccentricity,
+`Stimulus_direction`, `Choose_target`, `Choose_leftright`) are added at the end.
 
 ### Setting up the data path
 
-The loaders find your data by assembling a folder path from a few editable
-variables at the top of the script. Set these to point at your own data, then
-run the script — the `.nev`/`.ns2` files inside the folder are auto-detected.
+The driver finds your data by assembling a folder path from a few editable
+variables at the top of `BackRockFileLoader.m`. Set these to point at your own
+data, then run the script — the loader resolves the `.nev`/`.ns2` files inside
+each folder by the prefix schema above.
 
-**BlackRock data** (`BackRockFileLoader.m`): edit the per-run inputs near the top:
 ```matlab
 Basic_Path   = '/Users/xuefeiyu/Documents/XuefeiFile/WorkRelated/Data'; % root of all data
 Monkey       = 'Porthos';      % bare monkey name; folder on disk is "Monkey <name>"
@@ -70,7 +136,8 @@ Location     = 'in_lab';       % editable constant
 DataType     = 'raw_data';     % editable constant
 OutputFolder = 'export_data';  % where parsed data is written
 ```
-The loader builds the input and export roots as:
+
+The driver builds the input and export roots as:
 ```matlab
 DataTypePath = fullfile(Basic_Path, ['Monkey ' Monkey], Location, DataType);
 ExportPath   = fullfile(Basic_Path, ['Monkey ' Monkey], Location, OutputFolder);
@@ -85,14 +152,14 @@ and `ExportPath` directly with your own absolute paths.
 
 ### Batch loading multiple sessions
 
-The loader processes one or more `YYYY-MM-DD` session folders in a single run.
+The driver processes one or more `YYYY-MM-DD` session folders in a single run.
 Set the `Folder` variable to choose which ones:
 ```matlab
 Folder = '2026-06-17';                    % a single session folder
 Folder = {'2026-06-17','2026-06-18'};     % several folders, loaded in order
 Folder = {};                              % every YYYY-MM-DD folder under DataTypePath
 ```
-For each folder the script **loads → parses → adds features → exports** in turn,
+For each folder the driver **loads → parses → adds features → exports** in turn,
 writing the per-session output files
 (`Blackrock_<date>_expmeta_matlab.txt` and `Blackrock_<date>_trials_matlab.csv`)
 into the matching `export_data/<date>/` subfolder.
@@ -105,10 +172,13 @@ the batch continues with the remaining folders. A **batch summary** listing the
 > (the task started/stopped multiple times). These are tracked per session
 > within each file via the `Session` column, independent of the batch-folder loop.
 
-**Cage trainer data** (`CageTrianingDataLoading.m`): set the corresponding path
-variables at the top of that script the same way.
+### Cage trainer data
+
+`CageTrianingDataLoading.m` concatenates the per-trial `.json` files into one
+`all_trials_<date>.csv`; `CageTrainingDataAnalyzer.m` reads that CSV and plots
+the psychometric curve. Set the corresponding path variables at the top of those
+scripts the same way as the BlackRock loader.
 
 You are welcome to change these into your own paths.
 
 ## Feel free to push me request, report errors or bugs.
-
