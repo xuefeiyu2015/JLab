@@ -40,10 +40,12 @@ Download it from the official GitHub repository:
 👉 https://github.com/BlackrockNeurotech/NPMK
 
 **Installation steps:**
-1. Download or clone the NPMK repository
-2. Place it at `JLab/ToolsAndFunctions/NPMK` — the loader's auto-path step (above)
-   then picks it up automatically, so no manual `addpath` is needed. If you keep
-   it elsewhere, add it yourself:
+1. Download or clone the NPMK repository.
+2. Move the downloaded NPMK folder into this repo's `ToolsAndFunctions` folder, so
+   it lives at `JLab/ToolsAndFunctions/NPMK`. The loader's auto-path step (above)
+   then picks it up automatically — no manual `addpath` is needed.
+
+If you would rather keep NPMK somewhere else, add it to the path yourself instead:
 ```matlab
 addpath(genpath('/path/to/NPMK'))
 savepath
