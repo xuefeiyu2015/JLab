@@ -63,6 +63,8 @@ classdef BlackrockLoader
             S.EventTime        = [];
             S.comments_source  = '';
             S.SpikeTimeSec        = [];
+            S.SpikeChannel        = [];
+            S.SpikeUnit           = [];
             S.spike_status     = 'not requested';
             S.nsxdata          = [];
             S.nsx_samplingrate = [];
@@ -153,16 +155,19 @@ classdef BlackrockLoader
                     if ~BlackrockLoader.hasSpikes(hub_data)
                         error('No spike timestamps in %s', hub_nev);
                     end
-                        % Load and trasform spiketime into seconds
+                        % Load and trasform spiketime into seconds. TimeStamp is
+                        % uint64; cast to double FIRST, otherwise the divide stays
+                        % integer-typed and rounds spike times to whole seconds.
                     if isfield(S,'timeresolution') && S.timeresolution >0
-                        S.SpikeTimeSec= hub_data.Data.Spikes.TimeStamp/S.timeresolution;
+                        S.SpikeTimeSec= double(hub_data.Data.Spikes.TimeStamp)/S.timeresolution;
                     else
                         disp('Use empircle time resolution: 10^9')
-                        S.SpikeTimeSec = hub_data.Data.Spikes.TimeStamp/10^9;
+                        S.SpikeTimeSec = double(hub_data.Data.Spikes.TimeStamp)/10^9;
 
                     end
-                    
-                    
+                    % keep channel identity for per-trial rasterization
+                    S.SpikeChannel = hub_data.Data.Spikes.Electrode;
+                    S.SpikeUnit    = hub_data.Data.Spikes.Unit;
 
                     S.spike_status = sprintf('ok (%s)', hub_nev);
                 catch ME_spk
@@ -627,6 +632,17 @@ classdef BlackrockLoader
                 && isfield(s.Data.Comments, 'TimeStampSec') && ~isempty(s.Data.Comments.TimeStampSec);
         end
 
+        function T = commentsWithTime(Events, EventTime)
+        % Pair raw comment strings with their timestamps for inspection/debugging.
+        % Events    : N-by-* char matrix (Data.Comments.Text, as returned in S.Events)
+        % EventTime : N-by-1 timestamps in seconds (S.EventTime)
+        % Returns an N-row table [TimeStampSec, Comment] in recording order, so the
+        % raw, UNPARSED comments can be eyeballed (e.g. when a comment-string format
+        % change is sending events into trials.undefined).
+            T = table(EventTime(:), string(Events), ...
+                'VariableNames', {'TimeStampSec', 'Comment'});
+        end
+
         function tf = hasSpikes(s)
         % True when an openNEV struct carries spike timestamps.
             tf = ~isempty(s) && isfield(s, 'Data') && isfield(s.Data, 'Spikes') ...
@@ -639,7 +655,7 @@ classdef BlackrockLoader
         % matched against nsx_abs_time (seconds, same NSP clock as the event
         % timestamps). Slices are left-aligned (each starts at its own window
         % start) and NaN-padded to the longest trial, so the result is one
-        % chan x maxSamples x nTrials array that lines up 1:1 with trials.
+        % chan x nTrials x maxSamples array that lines up 1:1 with trials.
         % A trial whose Start/End is NaN (or that has no samples in range) gets
         % an all-NaN slice so the 3rd dimension stays index-aligned with trials.
             if nargin < 5 || isempty(preMs);  preMs  = 500; end   % default buffer (ms)
@@ -654,8 +670,6 @@ classdef BlackrockLoader
             % --- first pass: find each trial's sample window ---
             idx          = cell(nTrials, 1);
             n            = zeros(nTrials, 1);
-            t_start      = nan(nTrials, 1);
-            t_end        = nan(nTrials, 1);
             rawstarttime = nan(nTrials, 1);
             for i = 1:nTrials
                 if isnan(trials(i).Start) || isnan(trials(i).End)
@@ -669,12 +683,11 @@ classdef BlackrockLoader
                 end
                 idx{i}          = w;
                 n(i)            = numel(w);
-                t_start(i)      = t0;
-                t_end(i)        = t1;
-                rawstarttime(i) = nsx_abs_time(w(1));   % abs time of the first sample (first time bin)
+                rawstarttime(i) = trials(i).Start;      % abs time of the Start marker (s)
             end
 
             % --- second pass: stack into NaN-padded 3-D array (left-aligned) ---
+            % built chan x maxSamples x nTrials, then permuted to chan x nTrials x maxSamples
             maxSamples = max([n; 0]);
             data = nan(nChan, maxSamples, nTrials);
             for i = 1:nTrials
@@ -682,22 +695,111 @@ classdef BlackrockLoader
                     data(:, 1:n(i), i) = nsxdata(:, idx{i});
                 end
             end
+            data = permute(data, [1 3 2]);   % -> chan x nTrials x maxSamples
 
-            % rel_time: 0 at the Start marker, negative through the pre-buffer
-            rel_time = ((0:maxSamples-1) / nsx_samplingrate) - pre;
+            % reltime: 0 at the Start marker, negative through the pre-buffer
+            reltime = ((0:maxSamples-1) / nsx_samplingrate) - pre;
 
             A = struct();
-            A.data      = data;       % chan x maxSamples x nTrials, NaN-padded
-            A.n_samples = n;          % nTrials x 1, actual samples per trial
-            A.rel_time  = rel_time;   % 1 x maxSamples, seconds from Start marker
-            A.t_start   = t_start;    % nTrials x 1, requested window start = Start-pre (s)
-            A.t_end     = t_end;      % nTrials x 1, requested window end = End+post (s)
-            A.rawstarttime = rawstarttime;  % nTrials x 1, abs time of the first sample (first time bin, s)
-            A.fs        = nsx_samplingrate;
-            A.pre_ms    = preMs;
-            A.post_ms   = postMs;
-            A.nChan     = nChan;
-            A.nTrials   = nTrials;
+            A.data    = data;       % chan x nTrials x maxSamples, NaN-padded
+            A.timeseq.alignedrawtime = rawstarttime;  % nTrials x 1, abs time of the Start marker (s)
+            A.timeseq.aligned_marker = 'Start';        % event that relative_time=0 is aligned to
+            A.timeseq.relative_time  = reltime;        % 1 x maxSamples, seconds from the aligned marker
+            A.info.samplingrate = nsx_samplingrate;
+            A.info.Session      = [trials.Session]';        % nTrials x 1
+            A.info.Trial_number = [trials.Trial_number]';   % nTrials x 1
+        end
+
+        function R = segmentSpikes(trials, spikeTimes, spikeElectrode, spikeUnit, preMs, postMs, binMs)
+        % Rasterize online spikes into one binary slice per trial.
+        % For each trial the window is [Start - preMs, End + postMs] (ms buffers),
+        % matched against spikeTimes (seconds, NSP/HUB clock). Time is binned at
+        % binMs (default 1 ms); a bin is 1 if any spike of that row falls in it,
+        % 0 otherwise. Slices are left-aligned (bin 1 at the window start) and
+        % NaN-padded to the longest trial, giving one NtotalUnit x nTrials x maxBins
+        % array that lines up 1:1 with trials (same layout as segmentAnalog).
+        % Rows are one per (electrode, unit) pair, so NtotalUnit is the total
+        % isolated units summed across channels (a channel with 2 units -> 2 rows);
+        % info.Channel_Number / info.Unit_No record the IDs per row.
+        % A trial whose Start/End is NaN gets an all-NaN slice so the trial
+        % dimension stays index-aligned with trials.
+            if nargin < 5 || isempty(preMs);  preMs  = 500; end   % default buffer (ms)
+            if nargin < 6 || isempty(postMs); postMs = 500; end
+            if nargin < 7 || isempty(binMs);  binMs  = 1;   end   % bin width (ms)
+
+            pre    = preMs  / 1000;   % seconds
+            post   = postMs / 1000;
+            binSec = binMs  / 1000;
+
+            spikeTimes     = double(spikeTimes(:));
+            spikeElectrode = double(spikeElectrode(:));
+            spikeUnit      = double(spikeUnit(:));
+
+            % --- channel list: one row per (electrode, unit), sorted ---
+            chanKeys  = unique([spikeElectrode, spikeUnit], 'rows');  % sorted by col1 then col2
+            electrode = chanKeys(:, 1);
+            unit      = chanKeys(:, 2);
+            nChan     = size(chanKeys, 1);
+            % map each spike to its channel row
+            [~, spikeRow] = ismember([spikeElectrode, spikeUnit], chanKeys, 'rows');
+
+            nTrials = numel(trials);
+
+            % --- first pass: find each trial's bin count and window ---
+            nBins        = zeros(nTrials, 1);
+            t_start      = nan(nTrials, 1);
+            t_end        = nan(nTrials, 1);
+            rawstarttime = nan(nTrials, 1);
+            for i = 1:nTrials
+                if isnan(trials(i).Start) || isnan(trials(i).End)
+                    continue   % missing marker -> all-NaN slice
+                end
+                t0 = trials(i).Start - pre;
+                t1 = trials(i).End   + post;
+                nBins(i)        = max(round((t1 - t0) / binSec), 0);
+                t_start(i)      = t0;
+                t_end(i)        = t1;
+                rawstarttime(i) = trials(i).Start;   % abs time of the Start marker (s)
+            end
+
+            % --- second pass: fill NaN-padded binary raster (left-aligned) ---
+            maxBins = max([nBins; 0]);
+            raster  = nan(nChan, maxBins, nTrials);
+            for i = 1:nTrials
+                if nBins(i) <= 0
+                    continue
+                end
+                t0 = t_start(i);
+                t1 = t_end(i);
+                raster(:, 1:nBins(i), i) = 0;   % within-window bins start at 0
+                sel = spikeTimes >= t0 & spikeTimes < t1;
+                if ~any(sel)
+                    continue
+                end
+                bins = floor((spikeTimes(sel) - t0) / binSec) + 1;
+                bins = min(bins, nBins(i));     % guard the right edge
+                rows = spikeRow(sel);
+                lin  = sub2ind([nChan, nBins(i)], rows, bins);
+                slice = raster(:, 1:nBins(i), i);
+                slice(lin) = 1;                 % binary: spike present (clamped)
+                raster(:, 1:nBins(i), i) = slice;
+            end
+            % NtotalUnit x nTrials x maxBins (one row per channel x unit)
+            raster = permute(raster, [1 3 2]);
+
+            % reltime: 0 at the Start marker, negative through the pre-buffer
+            reltime = ((0:maxBins-1) * binSec) - pre;
+
+            R = struct();
+            R.data    = raster;     % NtotalUnit x nTrials x maxBins, 0/1, NaN-padded
+            R.timeseq.alignedrawtime = rawstarttime;  % nTrials x 1, abs time of the Start marker (s)
+            R.timeseq.aligned_marker = 'Start';        % event that relative_time=0 is aligned to
+            R.timeseq.relative_time  = reltime;        % 1 x maxBins, seconds from the aligned marker
+            R.info.samplingrate   = 1 / binSec;            % bin rate (Hz), 1000 for 1 ms bins
+            R.info.Session        = [trials.Session]';     % nTrials x 1
+            R.info.Trial_number   = [trials.Trial_number]';% nTrials x 1
+            R.info.Channel_Number = electrode;             % NtotalUnit x 1, electrode per row
+            R.info.Unit_No        = unit;                  % NtotalUnit x 1, unit per row
         end
 
         function exp_template = defaultExpTemplate()

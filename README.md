@@ -128,6 +128,23 @@ keyed by position so a reset trial counter starts a new trial rather than
 merging. Derived features (polar target angle/eccentricity,
 `Stimulus_direction`, `Choose_target`, `Choose_leftright`) are added at the end.
 
+### Inspecting the raw comments
+
+When the task's comment-string format changes, parsed events can silently land
+in `trials.undefined` instead of the expected fields. The static helper
+`BlackrockLoader.commentsWithTime` pairs each raw, **unparsed** comment with its
+timestamp so you can eyeball exactly what the recording contains:
+
+```matlab
+S = loader.loadSession(DataFolder);
+T = BlackrockLoader.commentsWithTime(S.Events, S.EventTime);  % N-row table
+disp(T)   % columns: TimeStampSec, Comment  (in recording order)
+```
+
+Use this to spot a new or renamed comment prefix, then add the matching key in
+`BlackrockLoader.defaultEventMaps()` (and, if it is a new field, in
+`defaultTrialTemplate()` / `defaultExpTemplate()`).
+
 ### Setting up the data path
 
 The driver finds your data by assembling a folder path from a few editable
