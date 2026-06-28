@@ -70,7 +70,10 @@ FolderList = resolveFolders(Folder, DataTypePath);
 LoadAnalogData_default = true;
 AnalogIdentifier = '*.ns2';
 Segment_Marker = ['Start','End'];
-Segment_Buffer = [-500,500];%Time buffer to keep before the segment marker and after the segment marker
+% Trial-segmentation buffers (ms). Window per trial = [Start - Pre, End + Post].
+% Defaults are 500 ms; edit here to change how much is kept around each trial.
+Segment_PreBuffer  = 500;   % ms kept before each trial's Start marker
+Segment_PostBuffer = 500;   % ms kept after  each trial's End  marker
 
 %% Load Online Spike Data
 LoadOnlineSpikeData_default = false;
@@ -777,6 +780,17 @@ writetable(trials_table, fullfile(OutputPath, OutputFileName_trials));
 
 
 disp(sprintf('File:%s Trials Data has been parsed into %s',Filename_nev,OutputFileName_trials));
+
+
+% Segment the analog stream into trials and save as .mat (only if loaded)
+if LoadAnalogData
+    analog = BlackrockLoader.segmentAnalog(trials, nsxdata, nsx_abs_time, ...
+                 nsx_samplingrate, Segment_PreBuffer, Segment_PostBuffer);
+    OutputFileName_analog = 'Blackrock_'+string(CurrentFolder)+'_analog_matlab.mat';
+    save(fullfile(OutputPath, char(OutputFileName_analog)), '-struct', 'analog');
+    fprintf('File:%s Analog segmented (%d trials) into %s\n', ...
+        Filename_nev, analog.nTrials, OutputFileName_analog);
+end
 
     results(end+1) = struct('folder', CurrentFolder, 'status', 'ok', 'message', '');
 
