@@ -117,6 +117,61 @@ product is verified present before use:
 `comments_source`, the spike fields (`SpikeTime`, `spike_status`), and the
 analog fields (`nsxdata`, `nsx_samplingrate`, `nsx_abs_time`, `analog_status`).
 
+### Output file schema (what the driver exports)
+
+Each date folder is written into its own `export_data/<date>/` subfolder, with
+filenames prefixed `Blackrock_<date>_`. Up to **four** files are produced; the
+two `.mat` files are written only when the matching load flag is on:
+
+| File                                | When        | Contents                                              |
+|-------------------------------------|-------------|-------------------------------------------------------|
+| `Blackrock_<date>_expmeta_matlab.txt`  | always   | experiment-level metadata, one block per session      |
+| `Blackrock_<date>_trials_matlab.csv`   | always   | one row per trial (the parsed `trials` records)       |
+| `Blackrock_<date>_analog_matlab.mat`   | `LoadAnalogData`      | analog/eye stream cut into per-trial slices  |
+| `Blackrock_<date>_spikes_matlab.mat`   | `LoadOnlineSpikeData` | online spikes rasterized per trial           |
+
+**`*_expmeta_matlab.txt`** — plain text. A single `.nev` may hold several
+experiment sessions, so the file has one `Session N:` header per session
+followed by its `field: value` lines and a blank line. Numeric values are
+written with `mat2str`, everything else as a string.
+
+**`*_trials_matlab.csv`** — the `trials` struct flattened with `struct2table`,
+one row per trial. Key column conventions:
+- `index` — a 0-based sequential row counter prepended for pandas
+  (`read_csv(index_col='index')`). This is **not** the trial number.
+- `Trial_number` — the real, task-reported trial number, which **resets** across
+  sessions; use `Session` + `Trial_number` together to identify a trial.
+- `Session` — which experiment session within the recording the trial belongs to.
+- 2-element vector fields (e.g. target positions) are split into `<field>_x` /
+  `<field>_y` columns; the original combined column is dropped.
+- The `undefined` and `duplicates` bookkeeping fields are dropped before export.
+- Derived features from parsing are included (polar target angle/eccentricity,
+  `Stimulus_direction`, `Choose_target`, `Choose_leftright`).
+
+**`*_analog_matlab.mat`** — one variable `analog`, a struct that lines up 1:1
+with the CSV rows (trial dimension is index-aligned with `trials`):
+- `analog.data` — `nChan × nTrials × maxSamples`, each trial's window
+  `[Start − PreBuffer, End + PostBuffer]`, left-aligned and **NaN-padded** to the
+  longest trial (missing-marker trials are all-NaN).
+- `analog.timeseq` — `alignedrawtime` (abs time of each Start marker, s),
+  `aligned_marker` (`'Start'`, where `relative_time = 0`), and `relative_time`
+  (`1 × maxSamples`, seconds from the marker; negative through the pre-buffer).
+- `analog.info` — `samplingrate`, plus `Session` and `Trial_number` per trial.
+
+**`*_spikes_matlab.mat`** — one variable `online_spike`, same layout as `analog`
+but a binary raster:
+- `online_spike.data` — `NtotalUnit × nTrials × maxBins`, `0/1` (1 if any spike
+  of that row falls in the bin), NaN-padded. Each row is one `(electrode, unit)`
+  pair, so `NtotalUnit` sums isolated units across channels.
+- `online_spike.timeseq` — same fields as the analog `timeseq` (`relative_time`
+  is `1 × maxBins`).
+- `online_spike.info` — `samplingrate` (bin rate, e.g. 1000 Hz for 1 ms bins),
+  `Session`, `Trial_number`, plus `Channel_Number` and `Unit_No` per raster row.
+
+The per-trial window buffers and the spike bin width are set by
+`Segment_PreBuffer` / `Segment_PostBuffer` / `Segment_BinWidth` (ms) near the top
+of `BackRockFileLoader.m`.
+
 ### Comment parsing schema
 
 `parseEvents` turns BlackRock's free-text comment strings into structured
