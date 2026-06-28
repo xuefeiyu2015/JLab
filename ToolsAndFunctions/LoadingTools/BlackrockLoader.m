@@ -155,12 +155,14 @@ classdef BlackrockLoader
                     if ~BlackrockLoader.hasSpikes(hub_data)
                         error('No spike timestamps in %s', hub_nev);
                     end
-                        % Load and trasform spiketime into seconds
+                        % Load and trasform spiketime into seconds. TimeStamp is
+                        % uint64; cast to double FIRST, otherwise the divide stays
+                        % integer-typed and rounds spike times to whole seconds.
                     if isfield(S,'timeresolution') && S.timeresolution >0
-                        S.SpikeTimeSec= hub_data.Data.Spikes.TimeStamp/S.timeresolution;
+                        S.SpikeTimeSec= double(hub_data.Data.Spikes.TimeStamp)/S.timeresolution;
                     else
                         disp('Use empircle time resolution: 10^9')
-                        S.SpikeTimeSec = hub_data.Data.Spikes.TimeStamp/10^9;
+                        S.SpikeTimeSec = double(hub_data.Data.Spikes.TimeStamp)/10^9;
 
                     end
                     % keep channel identity for per-trial rasterization
@@ -628,6 +630,17 @@ classdef BlackrockLoader
             tf = ~isempty(s) && isfield(s, 'Data') && isfield(s.Data, 'Comments') ...
                 && isfield(s.Data.Comments, 'Text') && ~isempty(s.Data.Comments.Text) ...
                 && isfield(s.Data.Comments, 'TimeStampSec') && ~isempty(s.Data.Comments.TimeStampSec);
+        end
+
+        function T = commentsWithTime(Events, EventTime)
+        % Pair raw comment strings with their timestamps for inspection/debugging.
+        % Events    : N-by-* char matrix (Data.Comments.Text, as returned in S.Events)
+        % EventTime : N-by-1 timestamps in seconds (S.EventTime)
+        % Returns an N-row table [TimeStampSec, Comment] in recording order, so the
+        % raw, UNPARSED comments can be eyeballed (e.g. when a comment-string format
+        % change is sending events into trials.undefined).
+            T = table(EventTime(:), string(Events), ...
+                'VariableNames', {'TimeStampSec', 'Comment'});
         end
 
         function tf = hasSpikes(s)
