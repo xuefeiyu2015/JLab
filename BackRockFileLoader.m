@@ -76,7 +76,11 @@ Segment_PreBuffer  = 500;   % ms kept before each trial's Start marker
 Segment_PostBuffer = 500;   % ms kept after  each trial's End  marker
 
 %% Load Online Spike Data
-LoadOnlineSpikeData_default = false;
+% Online spikes live in HUB-*.nev. They are segmented into per-trial binary
+% rasters (1 ms bins) over the same [Start - Pre, End + Post] window as analog.
+LoadOnlineSpikeData_default = true;
+SpikePrefix       = 'HUB';   % HUB-*.nev: online spike timing
+Segment_BinWidth  = 1;       % raster bin width (ms)
 
 %% Experimental meta data (one entry per session within the recording)
 % A single .nev recording can contain several experiment sessions (the task is
@@ -247,6 +251,7 @@ for fi = 1:numel(FolderList)
     experiment    = exp_template([]);     % empty struct array, grows one entry per session
     session_index = 0;
     LoadAnalogData = LoadAnalogData_default;  % re-apply default so a skip doesn't leak
+    LoadOnlineSpikeData = LoadOnlineSpikeData_default;  % re-apply so a skip doesn't leak
 
     % --- Load events and timing: auto-detect the .nev (largest if several) ---
     nev_list = dir(fullfile(DataFolder, '*.nev'));
@@ -306,6 +311,30 @@ for fi = 1:numel(FolderList)
         nsx_abs_time = nsx_starttimeSec + nsx_rel_time;
     end
 
+    % --- Load online spikes (HUB-*.nev; soft failure) ---
+    Filename_hub = '';
+    if LoadOnlineSpikeData
+        try
+            hub_nev = BlackrockLoader.pickByPrefix(nev_list, SpikePrefix);
+            if isempty(hub_nev)
+                error('No %s-*.nev file for online spikes.', SpikePrefix);
+            end
+            hub_data = openNEV(fullfile(DataFolder, hub_nev), 'report', 'nosave');
+            if ~BlackrockLoader.hasSpikes(hub_data)
+                error('No spike timestamps in %s', hub_nev);
+            end
+            % spike times in seconds on the HUB clock (same divisor openNEV uses
+            % for Comments.TimeStampSec on its own file)
+            spikeTimes     = double(hub_data.Data.Spikes.TimeStamp) / hub_data.MetaTags.TimeRes;
+            spikeElectrode = hub_data.Data.Spikes.Electrode;
+            spikeUnit      = hub_data.Data.Spikes.Unit;
+            Filename_hub   = hub_nev;
+        catch ME_spk
+            LoadOnlineSpikeData = false;
+            warning('Spike loading failed: %s', ME_spk.message);
+        end
+    end
+
     % --- Show the selected files before processing/export ---
     fprintf('\n--- Selected Blackrock files ---\n');
     fprintf('  NEV (events): %s\n', Filename_nev);
@@ -313,6 +342,11 @@ for fi = 1:numel(FolderList)
         fprintf('  NS2 (eye):    %s\n', Filename_ns);
     else
         fprintf('  NS2 (eye):    (none loaded)\n');
+    end
+    if LoadOnlineSpikeData
+        fprintf('  NEV (spikes): %s\n', Filename_hub);
+    else
+        fprintf('  NEV (spikes): (none loaded)\n');
     end
     fprintf('--------------------------------\n');
 
@@ -787,9 +821,19 @@ if LoadAnalogData
     analog = BlackrockLoader.segmentAnalog(trials, nsxdata, nsx_abs_time, ...
                  nsx_samplingrate, Segment_PreBuffer, Segment_PostBuffer);
     OutputFileName_analog = 'Blackrock_'+string(CurrentFolder)+'_analog_matlab.mat';
-    save(fullfile(OutputPath, char(OutputFileName_analog)), '-struct', 'analog');
+    save(fullfile(OutputPath, char(OutputFileName_analog)), 'analog');
     fprintf('File:%s Analog segmented (%d trials) into %s\n', ...
-        Filename_nev, analog.nTrials, OutputFileName_analog);
+        Filename_nev, size(analog.data, 2), OutputFileName_analog);
+end
+
+% Rasterize online spikes into per-trial bins and save as .mat (only if loaded)
+if LoadOnlineSpikeData
+    online_spike = BlackrockLoader.segmentSpikes(trials, spikeTimes, spikeElectrode, ...
+                 spikeUnit, Segment_PreBuffer, Segment_PostBuffer, Segment_BinWidth);
+    OutputFileName_spikes = 'Blackrock_'+string(CurrentFolder)+'_spikes_matlab.mat';
+    save(fullfile(OutputPath, char(OutputFileName_spikes)), 'online_spike');
+    fprintf('File:%s Spikes rasterized (%d units x %d trials) into %s\n', ...
+        Filename_nev, size(online_spike.data, 1), size(online_spike.data, 2), OutputFileName_spikes);
 end
 
     results(end+1) = struct('folder', CurrentFolder, 'status', 'ok', 'message', '');
