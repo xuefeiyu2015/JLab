@@ -19,6 +19,7 @@ classdef BlackrockLoader
 %   S = loader.loadSession(DataFolder);
 %   [trials, experiment] = loader.parseEvents(S.Events, S.EventTime);
 %
+% Last updates of the comments --June 18th, 2026
 % by Xuefei Yu
 
     properties
@@ -630,6 +631,73 @@ classdef BlackrockLoader
         % True when an openNEV struct carries spike timestamps.
             tf = ~isempty(s) && isfield(s, 'Data') && isfield(s.Data, 'Spikes') ...
                 && isfield(s.Data.Spikes, 'TimeStamp') && ~isempty(s.Data.Spikes.TimeStamp);
+        end
+
+        function A = segmentAnalog(trials, nsxdata, nsx_abs_time, nsx_samplingrate, preMs, postMs)
+        % Cut the continuous analog stream into one slice per trial.
+        % For each trial the window is [Start - preMs, End + postMs] (ms buffers),
+        % matched against nsx_abs_time (seconds, same NSP clock as the event
+        % timestamps). Slices are left-aligned (each starts at its own window
+        % start) and NaN-padded to the longest trial, so the result is one
+        % chan x maxSamples x nTrials array that lines up 1:1 with trials.
+        % A trial whose Start/End is NaN (or that has no samples in range) gets
+        % an all-NaN slice so the 3rd dimension stays index-aligned with trials.
+            if nargin < 5 || isempty(preMs);  preMs  = 500; end   % default buffer (ms)
+            if nargin < 6 || isempty(postMs); postMs = 500; end
+
+            pre  = preMs  / 1000;   % seconds
+            post = postMs / 1000;
+
+            nChan   = size(nsxdata, 1);
+            nTrials = numel(trials);
+
+            % --- first pass: find each trial's sample window ---
+            idx          = cell(nTrials, 1);
+            n            = zeros(nTrials, 1);
+            t_start      = nan(nTrials, 1);
+            t_end        = nan(nTrials, 1);
+            rawstarttime = nan(nTrials, 1);
+            for i = 1:nTrials
+                if isnan(trials(i).Start) || isnan(trials(i).End)
+                    continue   % missing marker -> all-NaN slice
+                end
+                t0 = trials(i).Start - pre;
+                t1 = trials(i).End   + post;
+                w  = find(nsx_abs_time >= t0 & nsx_abs_time <= t1);
+                if isempty(w)
+                    continue
+                end
+                idx{i}          = w;
+                n(i)            = numel(w);
+                t_start(i)      = t0;
+                t_end(i)        = t1;
+                rawstarttime(i) = nsx_abs_time(w(1));   % abs time of the first sample (first time bin)
+            end
+
+            % --- second pass: stack into NaN-padded 3-D array (left-aligned) ---
+            maxSamples = max([n; 0]);
+            data = nan(nChan, maxSamples, nTrials);
+            for i = 1:nTrials
+                if n(i) > 0
+                    data(:, 1:n(i), i) = nsxdata(:, idx{i});
+                end
+            end
+
+            % rel_time: 0 at the Start marker, negative through the pre-buffer
+            rel_time = ((0:maxSamples-1) / nsx_samplingrate) - pre;
+
+            A = struct();
+            A.data      = data;       % chan x maxSamples x nTrials, NaN-padded
+            A.n_samples = n;          % nTrials x 1, actual samples per trial
+            A.rel_time  = rel_time;   % 1 x maxSamples, seconds from Start marker
+            A.t_start   = t_start;    % nTrials x 1, requested window start = Start-pre (s)
+            A.t_end     = t_end;      % nTrials x 1, requested window end = End+post (s)
+            A.rawstarttime = rawstarttime;  % nTrials x 1, abs time of the first sample (first time bin, s)
+            A.fs        = nsx_samplingrate;
+            A.pre_ms    = preMs;
+            A.post_ms   = postMs;
+            A.nChan     = nChan;
+            A.nTrials   = nTrials;
         end
 
         function exp_template = defaultExpTemplate()
