@@ -87,8 +87,9 @@ flags, and the parsing schema (templates + event maps). Construct it with
 name/value overrides, then drive it once per date folder:
 
 ```matlab
-loader = BlackrockLoader('LoadAnalogData', true, ...   % override any property
-                         'LoadOnlineSpikeData', false);
+loader = BlackrockLoader('LoadAnalogData', true, ...        % override any property
+                         'LoadOnlineSpikeData', true, ...
+                         'LoadOnlineSpikeWaveform', false);  % opt-in spike waveforms (default off)
 S                    = loader.loadSession(DataFolder);     % resolve + load files
 [trials, experiment] = loader.parseEvents(S.Events, S.EventTime);  % comments -> records
 ```
@@ -98,11 +99,11 @@ S                    = loader.loadSession(DataFolder);     % resolve + load file
 A single recording is split across files **by filename prefix**, and each data
 product is verified present before use:
 
-| File                | Role                                   |
-|---------------------|----------------------------------------|
-| `NSP-*.nev`         | experiment comments + comment timing   |
-| `HUB-*.nev`         | online spike timing                    |
-| `NSP-*.ns2`         | analog / eye data                      |
+| File                | Role                                              |
+|---------------------|---------------------------------------------------|
+| `NSP-*.nev`         | experiment comments + comment timing              |
+| `HUB-*.nev`         | online spike timing (+ per-spike waveforms)       |
+| `NSP-*.ns2`         | analog / eye data                                 |
 
 - **Comments are required.** If `NSP-*.nev` is missing, comments **fall back to
   `HUB-*.nev`** (legacy recordings wrote comments there). If neither has them,
@@ -110,18 +111,33 @@ product is verified present before use:
 - **Spikes and analog are soft.** A missing or unreadable spike/analog file is
   recorded in a status string and that product is skipped — the folder still
   succeeds. The prefixes (`NSP`/`HUB`), the `.ns2` identifier, and the
-  `LoadAnalogData` / `LoadOnlineSpikeData` flags are all constructor-overridable
-  properties.
+  `LoadAnalogData` / `LoadOnlineSpikeData` / `LoadOnlineSpikeWaveform` flags are
+  all constructor-overridable properties.
+- **Online spikes** come from `HUB-*.nev` when `LoadOnlineSpikeData` is on:
+  `loadSession` reads each spike's time (s), electrode, and unit.
+- **Spike waveforms** are an **opt-in extra** (`LoadOnlineSpikeWaveform`,
+  default off). They live in the same `HUB-*.nev`, so they only load when
+  `LoadOnlineSpikeData` is also on; if waveforms are requested without spikes,
+  `loadSession` warns and skips them. Each waveform is converted to **µV**
+  per-electrode (mirroring openNEV's `'uv'`). The naming distinguishes these
+  *online* (Central-sorted, recorded live) waveforms from offline-sorted
+  waveforms added later.
 
-`loadSession` returns a struct `S` with `Events`, `EventTime`,
-`comments_source`, the spike fields (`SpikeTime`, `spike_status`), and the
-analog fields (`nsxdata`, `nsx_samplingrate`, `nsx_abs_time`, `analog_status`).
+`loadSession` returns a struct `S` with:
+- comments: `Events`, `EventTime`, `comments_source`;
+- spikes (`LoadOnlineSpikeData`): `SpikeTimeSec`, `SpikeChannel`, `SpikeUnit`,
+  and `spike_status`;
+- spike waveforms (`LoadOnlineSpikeWaveform`): `SpikeWaveform`
+  (`[nSamp × nSpikes]` µV, columns aligned to `SpikeTimeSec`),
+  `SpikeWaveformUnit`, `SpikeWaveformNSamp`;
+- analog (`LoadAnalogData`): `nsxdata`, `nsx_samplingrate`, `nsx_abs_time`,
+  `analog_status`.
 
 ### Output file schema (what the driver exports)
 
 Each date folder is written into its own `export_data/<date>/` subfolder, with
-filenames prefixed `Blackrock_<date>_`. Up to **four** files are produced; the
-two `.mat` files are written only when the matching load flag is on:
+filenames prefixed `Blackrock_<date>_`. Up to **five** files are produced; the
+three `.mat` files are written only when the matching load flag is on:
 
 | File                                | When        | Contents                                              |
 |-------------------------------------|-------------|-------------------------------------------------------|
@@ -129,6 +145,7 @@ two `.mat` files are written only when the matching load flag is on:
 | `Blackrock_<date>_trials_matlab.csv`   | always   | one row per trial (the parsed `trials` records)       |
 | `Blackrock_<date>_analog_matlab.mat`   | `LoadAnalogData`      | analog/eye stream cut into per-trial slices  |
 | `Blackrock_<date>_spikes_matlab.mat`   | `LoadOnlineSpikeData` | online spikes rasterized per trial           |
+| `Blackrock_<date>_spikes_waveform_matlab.mat` | `LoadOnlineSpikeWaveform` | per-spike waveforms (µV) per trial (`-v7.3`) |
 
 **`*_expmeta_matlab.txt`** — plain text. A single `.nev` may hold several
 experiment sessions, so the file has one `Session N:` header per session
@@ -167,6 +184,24 @@ but a binary raster:
   is `1 × maxBins`).
 - `online_spike.info` — `samplingrate` (bin rate, e.g. 1000 Hz for 1 ms bins),
   `Session`, `Trial_number`, plus `Channel_Number` and `Unit_No` per raster row.
+
+**`*_spikes_waveform_matlab.mat`** — written only when `LoadOnlineSpikeWaveform` is on
+(opt-in; off by default, and requires `LoadOnlineSpikeData`). One variable
+`online_spike_waveform` holding the raw waveform of every in-window spike, with
+the **same row order** as the raster (`info.Channel_Number` / `info.Unit_No`).
+Saved as `-v7.3` (HDF5) because the dense array can exceed the default MAT
+format's 2 GB per-variable cap.
+- `online_spike_waveform.waveform` — `NtotalUnit × nTrials × maxSpk × nSamp`, in
+  **µV**, NaN-padded. The spike dimension `maxSpk` is the largest per-`(unit,
+  trial)` in-window spike count, shared across all rows/trials (so the busiest
+  unit drives the array size — `segmentSpikeWaveforms` warns when it would exceed
+  ~2 GB).
+- `online_spike_waveform.waveform_time` — `NtotalUnit × nTrials × maxSpk`, each
+  spike's time in seconds **relative to the Start marker**, NaN-padded.
+- `online_spike_waveform.waveform_nsamp` — samples per waveform;
+  `.waveform_unit` is `'microVolts'`; `.timeseq` has `alignedrawtime` /
+  `aligned_marker`; `.info` has `Session`, `Trial_number`, `Channel_Number`,
+  `Unit_No`, and `maxSpikes`.
 
 The per-trial window buffers and the spike bin width are set by
 `Segment_PreBuffer` / `Segment_PostBuffer` / `Segment_BinWidth` (ms) near the top

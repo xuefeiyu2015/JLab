@@ -73,6 +73,8 @@ FolderList = BlackrockLoader.resolveFolders(Folder, DataTypePath);
 % skipped, recorded in the returned status string).
 LoadAnalogData      = true;
 LoadOnlineSpikeData = true;
+LoadOnlineSpikeWaveform   = false;   % default is false: also export per-spike waveforms (uV) to a
+                               % separate *_spikes_waveform_matlab.mat (needs online spikes; memory heavy)
 %AnalogIdentifier    = '*.ns2'; %default ns2
 SpikePrefix         = 'HUB';   % HUB-*.nev: online spike timing
 
@@ -90,6 +92,7 @@ Segment_BinWidth   = 1;     % spike raster bin width (ms)
 loader = BlackrockLoader( ...
     'LoadAnalogData',      LoadAnalogData, ...
     'LoadOnlineSpikeData', LoadOnlineSpikeData, ...
+    'LoadOnlineSpikeWaveform',   LoadOnlineSpikeWaveform, ...
     'SpikePrefix',         SpikePrefix);
     
     %'AnalogIdentifier',    AnalogIdentifier);
@@ -200,6 +203,20 @@ for fi = 1:numel(FolderList)
         save(fullfile(OutputPath, char(OutputFileName_spikes)), 'online_spike');
         fprintf('File:%s Spikes rasterized (%d units x %d trials) into %s\n', ...
             S.comments_source, size(online_spike.data, 1), size(online_spike.data, 2), OutputFileName_spikes);
+    end
+
+    % Per-spike waveforms: a separate, opt-in product (LoadOnlineSpikeWaveform). Saved
+    % to its own .mat as -v7.3 because the dense 4-D array can exceed the 2 GB
+    % per-variable cap of the default MAT format.
+    if S.LoadOnlineSpikeWaveform && ~isempty(S.SpikeWaveform)
+        online_spike_waveform = BlackrockLoader.segmentSpikeWaveforms(trials, ...
+                     S.SpikeTimeSec, S.SpikeChannel, S.SpikeUnit, S.SpikeWaveform, ...
+                     Segment_PreBuffer, Segment_PostBuffer);
+        OutputFileName_wf = 'Blackrock_'+string(CurrentFolder)+'_spikes_waveform_matlab.mat';
+        save(fullfile(OutputPath, char(OutputFileName_wf)), 'online_spike_waveform', '-v7.3');
+        fprintf('File:%s Spike waveforms (%d samples, up to %d spk/unit-trial) into %s\n', ...
+            S.comments_source, online_spike_waveform.waveform_nsamp, ...
+            online_spike_waveform.info.maxSpikes, OutputFileName_wf);
     end
 
     results(end+1) = struct('folder', CurrentFolder, 'status', 'ok', 'message', '');

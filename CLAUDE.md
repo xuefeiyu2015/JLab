@@ -80,6 +80,10 @@ product is verified present before use:
 - `NSP-*.nev` → comments + comment timing; **falls back to `HUB-*.nev`** (legacy
   recordings kept comments there).
 - `HUB-*.nev` → online spike timing (`ts2sec`, loaded into the workspace only).
+  Opt-in (`LoadOnlineSpikeWaveform`, default off): the per-spike waveforms are also
+  extracted and converted to µV (per-electrode `DigitalFactor`, mirroring
+  openNEV's `'uv'`). Waveforms need spikes, so they only load when
+  `LoadOnlineSpikeData` is on too.
 - `NSP-*.ns2` → analog/eye data.
 Comments are required (missing → that folder errors and is marked `failed`);
 spike/analog failures are **soft** (recorded in a status string, that product
@@ -112,7 +116,13 @@ turns them into structured records using the field maps from
 
 **Export** stays in the driver script: flattens 2-element vector fields into
 `_x`/`_y` columns and adds a 0-based `index` column (pandas-friendly), distinct
-from the real, resetting `Trial_number`.
+from the real, resetting `Trial_number`. The static `segmentSpikes` /
+`segmentAnalog` cut the spike raster / analog stream into per-trial slices saved
+as `.mat`. When `LoadOnlineSpikeWaveform` is on, `segmentSpikeWaveforms` builds a
+**separate** dense `NUnit × nTrial × maxSpk × nSamp` µV waveform product
+(variable `online_spike_waveform`), saved to its own
+`*_spikes_waveform_matlab.mat` as `-v7.3` (the array can exceed the default
+MAT format's 2 GB per-variable cap). It is not part of `online_spike`.
 
 When the comment string format from the task changes, the fix is almost always
 adding a key in `BlackrockLoader.defaultEventMaps()` and (if new) a field in
