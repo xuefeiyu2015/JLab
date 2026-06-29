@@ -33,6 +33,8 @@ classdef BlackrockLoader
         % --- what to load ---
         LoadAnalogData        = false
         LoadOnlineSpikeData   = false
+        LoadOnlineSpikeWaveform     = false    % opt-in: extract per-spike waveforms (uV);
+                                         % requires LoadOnlineSpikeData; exported to its own .mat
 
         % --- parsing schema (filled by static factories if left empty) ---
         TrialTemplate         % struct of NaN-initialised trial fields
@@ -65,6 +67,9 @@ classdef BlackrockLoader
             S.SpikeTimeSec        = [];
             S.SpikeChannel        = [];
             S.SpikeUnit           = [];
+            S.SpikeWaveform       = [];   % [nSamp x nSpikes] uV, columns aligned to SpikeTimeSec
+            S.SpikeWaveformUnit   = '';
+            S.SpikeWaveformNSamp  = [];
             S.spike_status     = 'not requested';
             S.nsxdata          = [];
             S.nsx_samplingrate = [];
@@ -72,6 +77,7 @@ classdef BlackrockLoader
             S.analog_status    = 'not requested';
             S.LoadAnalogData      = obj.LoadAnalogData;
             S.LoadOnlineSpikeData = obj.LoadOnlineSpikeData;
+            S.LoadOnlineSpikeWaveform   = obj.LoadOnlineSpikeWaveform;
             S.timeresolution = [];
 
             % --- classify the .nev files by role prefix (strict: must be NSP/HUB) ---
@@ -143,6 +149,12 @@ classdef BlackrockLoader
                 end
             end
 
+             % Waveforms reuse the online-spike products, so they need spikes on.
+            if obj.LoadOnlineSpikeWaveform && ~S.LoadOnlineSpikeData
+                warning(['LoadOnlineSpikeWaveform is on but LoadOnlineSpikeData is off; ' ...
+                    'spike waveforms need online spikes and are skipped.']);
+            end
+
              % --- Online spike timing (gated, soft failure) ---
             if S.LoadOnlineSpikeData
                 try
@@ -168,6 +180,24 @@ classdef BlackrockLoader
                     % keep channel identity for per-trial rasterization
                     S.SpikeChannel = hub_data.Data.Spikes.Electrode;
                     S.SpikeUnit    = hub_data.Data.Spikes.Unit;
+
+                    % Optional per-spike waveforms (opt-in via LoadOnlineSpikeWaveform),
+                    % converted to uV. openNEV returns Waveform as [nSamp x nSpikes]
+                    % int16 with columns aligned 1:1 to TimeStamp/Electrode/Unit. We
+                    % scale here (rather than passing 'uv' to openNEV) so the
+                    % conversion is independent of how hub_data was opened -- it may
+                    % already have been loaded raw for the legacy comment fallback.
+                    % This mirrors openNEV's 'uv' path exactly:
+                    % wf_uV = raw .* DigitalFactor(electrode) / 1000.
+                    if obj.LoadOnlineSpikeWaveform && isfield(hub_data.Data.Spikes, 'Waveform') ...
+                            && ~isempty(hub_data.Data.Spikes.Waveform)
+                        rawWf   = double(hub_data.Data.Spikes.Waveform);            % [nSamp x nSpikes]
+                        elecIdx = double(hub_data.Data.Spikes.Electrode);
+                        digi    = double([hub_data.ElectrodesInfo(elecIdx).DigitalFactor]); % 1 x nSpikes
+                        S.SpikeWaveform      = bsxfun(@times, rawWf, digi/1000);    % uV
+                        S.SpikeWaveformUnit  = 'microVolts';
+                        S.SpikeWaveformNSamp = size(rawWf, 1);
+                    end
 
                     S.spike_status = sprintf('ok (%s)', hub_nev);
                 catch ME_spk
@@ -723,6 +753,7 @@ classdef BlackrockLoader
         % info.Channel_Number / info.Unit_No record the IDs per row.
         % A trial whose Start/End is NaN gets an all-NaN slice so the trial
         % dimension stays index-aligned with trials.
+        % (Per-spike waveforms are a separate product: see segmentSpikeWaveforms.)
             if nargin < 5 || isempty(preMs);  preMs  = 500; end   % default buffer (ms)
             if nargin < 6 || isempty(postMs); postMs = 500; end
             if nargin < 7 || isempty(binMs);  binMs  = 1;   end   % bin width (ms)
@@ -800,6 +831,100 @@ classdef BlackrockLoader
             R.info.Trial_number   = [trials.Trial_number]';% nTrials x 1
             R.info.Channel_Number = electrode;             % NtotalUnit x 1, electrode per row
             R.info.Unit_No        = unit;                  % NtotalUnit x 1, unit per row
+        end
+
+        function W = segmentSpikeWaveforms(trials, spikeTimes, spikeElectrode, spikeUnit, spikeWaveform, preMs, postMs)
+        % Collect the raw waveform (uV) of every in-window spike into a dense,
+        % NaN-padded 4-D array. Rows are one per (electrode, unit) in the SAME
+        % order as segmentSpikes, so waveform rows line up 1:1 with the raster.
+        % For each trial the window is [Start - preMs, End + postMs] (ms buffers),
+        % matched against spikeTimes (seconds). spikeWaveform is [nSamp x nSpikes]
+        % with columns aligned 1:1 to spikeTimes/spikeElectrode/spikeUnit.
+        %   W.waveform       NtotalUnit x nTrials x maxSpk x nSamp  (uV, NaN-padded)
+        %   W.waveform_time  NtotalUnit x nTrials x maxSpk          (s, relative to Start)
+        % maxSpk is the largest per-(unit,trial) in-window spike count, shared
+        % across all rows/trials -> the busiest unit drives memory. Trials with a
+        % NaN Start/End contribute no spikes (all-NaN slice), staying index-aligned.
+            if nargin < 6 || isempty(preMs);  preMs  = 500; end   % default buffer (ms)
+            if nargin < 7 || isempty(postMs); postMs = 500; end
+
+            pre  = preMs  / 1000;   % seconds
+            post = postMs / 1000;
+
+            spikeTimes     = double(spikeTimes(:));
+            spikeElectrode = double(spikeElectrode(:));
+            spikeUnit      = double(spikeUnit(:));
+            nSamp = size(spikeWaveform, 1);   % [nSamp x nSpikes]
+
+            % --- channel list: one row per (electrode, unit), sorted (matches segmentSpikes) ---
+            chanKeys  = unique([spikeElectrode, spikeUnit], 'rows');
+            electrode = chanKeys(:, 1);
+            unit      = chanKeys(:, 2);
+            nChan     = size(chanKeys, 1);
+            [~, spikeRow] = ismember([spikeElectrode, spikeUnit], chanKeys, 'rows');
+
+            nTrials = numel(trials);
+
+            % --- first pass: window per trial + busiest (unit,trial) spike count ---
+            t_start      = nan(nTrials, 1);
+            t_end        = nan(nTrials, 1);
+            rawstarttime = nan(nTrials, 1);
+            maxSpk       = 0;
+            for i = 1:nTrials
+                if isnan(trials(i).Start) || isnan(trials(i).End)
+                    continue   % missing marker -> all-NaN slice
+                end
+                t_start(i)      = trials(i).Start - pre;
+                t_end(i)        = trials(i).End   + post;
+                rawstarttime(i) = trials(i).Start;   % abs time of the Start marker (s)
+                sel = spikeTimes >= t_start(i) & spikeTimes < t_end(i);
+                if any(sel)
+                    maxSpk = max(maxSpk, max(accumarray(spikeRow(sel), 1, [nChan 1])));
+                end
+            end
+
+            % --- allocate (warn first if the dense array is large) ---
+            if nChan*nTrials*maxSpk*nSamp*8 > 2e9
+                warning(['segmentSpikeWaveforms: waveform array is %.1f GB ' ...
+                    '(%d units x %d trials x %d spikes x %d samples). ' ...
+                    'Consider narrowing the data (fewer/sorted units or trials).'], ...
+                    nChan*nTrials*maxSpk*nSamp*8/1e9, nChan, nTrials, maxSpk, nSamp);
+            end
+            wf      = nan(nChan, nTrials, maxSpk, nSamp);   % uV, NaN-padded
+            wf_time = nan(nChan, nTrials, maxSpk);          % s, relative to Start
+
+            % --- second pass: each in-window spike -> position 1..k per (row, trial) ---
+            for i = 1:nTrials
+                if isnan(t_start(i))
+                    continue
+                end
+                sel = spikeTimes >= t_start(i) & spikeTimes < t_end(i);
+                if ~any(sel)
+                    continue
+                end
+                selIdx = find(sel);            % original spike indices, in time order
+                rws    = spikeRow(selIdx);
+                cnt    = zeros(nChan, 1);       % running per-row position within this trial
+                for j = 1:numel(selIdx)
+                    r = rws(j);
+                    cnt(r) = cnt(r) + 1;
+                    wf(r, i, cnt(r), :)   = spikeWaveform(:, selIdx(j));
+                    wf_time(r, i, cnt(r)) = spikeTimes(selIdx(j)) - rawstarttime(i);
+                end
+            end
+
+            W = struct();
+            W.waveform       = wf;       % NtotalUnit x nTrials x maxSpk x nSamp, uV, NaN-padded
+            W.waveform_time  = wf_time;  % NtotalUnit x nTrials x maxSpk, s, relative to Start
+            W.waveform_nsamp = nSamp;    % samples per waveform
+            W.waveform_unit  = 'microVolts';
+            W.timeseq.alignedrawtime = rawstarttime;   % nTrials x 1, abs Start time (s)
+            W.timeseq.aligned_marker = 'Start';        % waveform_time = 0 at the Start marker
+            W.info.Session        = [trials.Session]';     % nTrials x 1
+            W.info.Trial_number   = [trials.Trial_number]';% nTrials x 1
+            W.info.Channel_Number = electrode;             % NtotalUnit x 1, electrode per row
+            W.info.Unit_No        = unit;                  % NtotalUnit x 1, unit per row
+            W.info.maxSpikes      = maxSpk;                % spike-dimension length (busiest unit-trial)
         end
 
         function exp_template = defaultExpTemplate()
