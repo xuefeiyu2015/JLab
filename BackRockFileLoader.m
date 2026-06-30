@@ -16,7 +16,7 @@ clear
 close all
 
 %% Check if the path is setup ready
-% Step 1 - add JLab's own code. The repo root is added non-recursively (for the
+%% Step 1 - add JLab's own code. The repo root is added non-recursively (for the
 % top-level scripts) and only the ToolsAndFunctions tree is genpath'd (for the
 % BlackrockLoader class + analyze tools). We deliberately do NOT genpath the repo
 % root, so dot-folders at the root (.git, .claude, ...) never end up on the path.
@@ -24,7 +24,7 @@ JLabRoot = fileparts(mfilename('fullpath'));
 addpath(JLabRoot);
 addpath(genpath(fullfile(JLabRoot, 'ToolsAndFunctions')));
 
-% Step 2 - NPMK is a third-party dependency you supply yourself. If openNEV is
+%% Step 2 - NPMK is a third-party dependency you supply yourself. If openNEV is
 % already on the path (e.g. NPMK lives under ToolsAndFunctions/NPMK), we're done.
 % Otherwise ask the user to point at their NPMK folder and add it.
 if isempty(which('openNEV'))
@@ -72,11 +72,13 @@ FolderList = BlackrockLoader.resolveFolders(Folder, DataTypePath);
 % are gated here and are soft failures inside loadSession (that product is just
 % skipped, recorded in the returned status string).
 LoadAnalogData      = true;
-LoadOnlineSpikeData = true;
-LoadOnlineSpikeWaveform   = false;   % default is false: also export per-spike waveforms (uV) to a
+LoadOnlineSpikeData = false;  %default is false for online spikes
+%LoadOnlineSpikeWaveform   = false;   % default is false: also export per-spike waveforms (uV) to a
                                % separate *_spikes_waveform_matlab.mat (needs online spikes; memory heavy)
+%IncludeUnsorted = false;       % default false: drop unit 0 (unsorted) + 255 (noise)
+                               % spikes; set true to keep them
 %AnalogIdentifier    = '*.ns2'; %default ns2
-SpikePrefix         = 'HUB';   % HUB-*.nev: online spike timing
+%SpikePrefix         = 'HUB';   % default HUB-*.nev: online spike timing
 
 % Trial-segmentation buffers (ms). Window per trial = [Start - Pre, End + Post].
 % Defaults are 500 ms; edit here to change how much is kept around each trial.
@@ -91,9 +93,10 @@ Segment_BinWidth   = 1;     % spike raster bin width (ms)
 % a matching field in defaultTrialTemplate()/defaultExpTemplate().
 loader = BlackrockLoader( ...
     'LoadAnalogData',      LoadAnalogData, ...
-    'LoadOnlineSpikeData', LoadOnlineSpikeData, ...
-    'LoadOnlineSpikeWaveform',   LoadOnlineSpikeWaveform, ...
-    'SpikePrefix',         SpikePrefix);
+    'LoadOnlineSpikeData', LoadOnlineSpikeData);
+   % 'LoadOnlineSpikeWaveform',   LoadOnlineSpikeWaveform);
+  %  'IncludeUnsorted',           IncludeUnsorted, ...
+  %  'SpikePrefix',         SpikePrefix);
     
     %'AnalogIdentifier',    AnalogIdentifier);
 
@@ -141,7 +144,7 @@ for fi = 1:numel(FolderList)
         mkdir(OutputPath);
     end
 
-    % Save experiment meta as .txt
+    %% Save experiment meta as .txt
     % One section per session, separated by a "Session N:" header and a blank line.
     fid = fopen(fullfile(OutputPath, OutputFileName_exp), 'w');
     for s = 1:numel(experiment)
@@ -161,7 +164,7 @@ for fi = 1:numel(FolderList)
 
     fprintf('File:%s Experiment meta has been parsed into %s\n', S.comments_source, OutputFileName_exp);
 
-    % Save trials as .csv
+    %% Save trials as .csv
     % Flatten array/vector fields (e.g. positions) into separate columns
     trials_flat = rmfield(trials, {'undefined', 'duplicates'});
     trials_table = struct2table(trials_flat);
@@ -185,7 +188,7 @@ for fi = 1:numel(FolderList)
 
     fprintf('File:%s Trials Data has been parsed into %s\n', S.comments_source, OutputFileName_trials);
 
-    % Segment the analog stream into trials and save as .mat (only if loaded)
+    %% Segment the analog stream into trials and save as .mat (only if loaded)
     if S.LoadAnalogData
         analog = BlackrockLoader.segmentAnalog(trials, S.nsxdata, S.nsx_abs_time, ...
                      S.nsx_samplingrate, Segment_PreBuffer, Segment_PostBuffer);
@@ -195,28 +198,33 @@ for fi = 1:numel(FolderList)
             S.comments_source, size(analog.data, 2), OutputFileName_analog);
     end
 
-    % Rasterize online spikes into per-trial bins and save as .mat (only if loaded)
+    % Segment online spikes into per-trial products via the source-agnostic
+    % parser. parseSpikes returns the raster (online_spike) and, when waveforms
+    % were loaded, a separate waveform product (online_spike_waveform). The same
+    % call will serve a future offline source (just build offline_spike_raw and
+    % save offline_spike / offline_spike_waveform).
     if S.LoadOnlineSpikeData
-        online_spike = BlackrockLoader.segmentSpikes(trials, S.SpikeTimeSec, S.SpikeChannel, ...
-                     S.SpikeUnit, Segment_PreBuffer, Segment_PostBuffer, Segment_BinWidth);
-        OutputFileName_spikes = 'Blackrock_'+string(CurrentFolder)+'_spikes_matlab.mat';
-        save(fullfile(OutputPath, char(OutputFileName_spikes)), 'online_spike');
-        fprintf('File:%s Spikes rasterized (%d units x %d trials) into %s\n', ...
-            S.comments_source, size(online_spike.data, 1), size(online_spike.data, 2), OutputFileName_spikes);
-    end
+        if isempty(S.online_spike.TimeSec)
+            % Every spike was unsorted/noise (or none recorded) -> nothing to export.
+            fprintf('File:%s No sorted spikes found; skipping spike export.\n', S.comments_source);
+        else
+            [online_spike, online_spike_waveform] = BlackrockLoader.parseSpikes( ...
+                         S.online_spike, trials, Segment_PreBuffer, Segment_PostBuffer, Segment_BinWidth);
+            OutputFileName_spikes = 'Blackrock_'+string(CurrentFolder)+'_spikes_matlab.mat';
+            save(fullfile(OutputPath, char(OutputFileName_spikes)), 'online_spike');
+            fprintf('File:%s Spikes rasterized (%d units x %d trials) into %s\n', ...
+                S.comments_source, size(online_spike.data, 1), size(online_spike.data, 2), OutputFileName_spikes);
 
-    % Per-spike waveforms: a separate, opt-in product (LoadOnlineSpikeWaveform). Saved
-    % to its own .mat as -v7.3 because the dense 4-D array can exceed the 2 GB
-    % per-variable cap of the default MAT format.
-    if S.LoadOnlineSpikeWaveform && ~isempty(S.SpikeWaveform)
-        online_spike_waveform = BlackrockLoader.segmentSpikeWaveforms(trials, ...
-                     S.SpikeTimeSec, S.SpikeChannel, S.SpikeUnit, S.SpikeWaveform, ...
-                     Segment_PreBuffer, Segment_PostBuffer);
-        OutputFileName_wf = 'Blackrock_'+string(CurrentFolder)+'_spikes_waveform_matlab.mat';
-        save(fullfile(OutputPath, char(OutputFileName_wf)), 'online_spike_waveform', '-v7.3');
-        fprintf('File:%s Spike waveforms (%d samples, up to %d spk/unit-trial) into %s\n', ...
-            S.comments_source, online_spike_waveform.waveform_nsamp, ...
-            online_spike_waveform.info.maxSpikes, OutputFileName_wf);
+            % Waveforms: a separate file as -v7.3 because the dense 4-D array can
+            % exceed the 2 GB per-variable cap of the default MAT format.
+            if ~isempty(online_spike_waveform)
+                OutputFileName_wf = 'Blackrock_'+string(CurrentFolder)+'_spikes_waveform_matlab.mat';
+                save(fullfile(OutputPath, char(OutputFileName_wf)), 'online_spike_waveform', '-v7.3');
+                fprintf('File:%s Spike waveforms (%d samples, up to %d spk/unit-trial) into %s\n', ...
+                    S.comments_source, online_spike_waveform.waveform_nsamp, ...
+                    online_spike_waveform.info.maxSpikes, OutputFileName_wf);
+            end
+        end
     end
 
     results(end+1) = struct('folder', CurrentFolder, 'status', 'ok', 'message', '');
