@@ -79,11 +79,16 @@ The recording is split across files by filename **prefix**, and each data
 product is verified present before use:
 - `NSP-*.nev` → comments + comment timing; **falls back to `HUB-*.nev`** (legacy
   recordings kept comments there).
-- `HUB-*.nev` → online spike timing (`ts2sec`, loaded into the workspace only).
-  Opt-in (`LoadOnlineSpikeWaveform`, default off): the per-spike waveforms are also
-  extracted and converted to µV (per-electrode `DigitalFactor`, mirroring
-  openNEV's `'uv'`). Waveforms need spikes, so they only load when
-  `LoadOnlineSpikeData` is on too.
+- `HUB-*.nev` → online spike timing (`ts2sec`, loaded into the workspace only),
+  packed into the **generic container `S.online_spike`**
+  (`TimeSec/Channel/Unit/Waveform/WaveformUnit/source`, from
+  `BlackrockLoader.spikeContainer()`). By default unit `0` (unsorted) and unit
+  `255` (noise) spikes are **dropped** after load (all aligned arrays filtered
+  together); set `IncludeUnsorted` (default off, source-agnostic) true to keep
+  them. Opt-in (`LoadOnlineSpikeWaveform`, default off): the per-spike waveforms
+  are also extracted into the container and converted to µV (per-electrode
+  `DigitalFactor`, mirroring openNEV's `'uv'`). Waveforms need spikes, so they
+  only load when `LoadOnlineSpikeData` is on too.
 - `NSP-*.ns2` → analog/eye data.
 Comments are required (missing → that folder errors and is marked `failed`);
 spike/analog failures are **soft** (recorded in a status string, that product
@@ -116,13 +121,18 @@ turns them into structured records using the field maps from
 
 **Export** stays in the driver script: flattens 2-element vector fields into
 `_x`/`_y` columns and adds a 0-based `index` column (pandas-friendly), distinct
-from the real, resetting `Trial_number`. The static `segmentSpikes` /
-`segmentAnalog` cut the spike raster / analog stream into per-trial slices saved
-as `.mat`. When `LoadOnlineSpikeWaveform` is on, `segmentSpikeWaveforms` builds a
+from the real, resetting `Trial_number`. `segmentAnalog` cuts the analog stream
+into per-trial slices saved as `.mat`. Spikes go through the **source-agnostic**
+static parser `parseSpikes(spike, trials, pre, post, bin)` — the single
+entrypoint for both online (now) and offline (future) spikes — which returns
+`[R, W]`: `R` the binary raster (variable `online_spike`), and `W` an optional
 **separate** dense `NUnit × nTrial × maxSpk × nSamp` µV waveform product
-(variable `online_spike_waveform`), saved to its own
-`*_spikes_waveform_matlab.mat` as `-v7.3` (the array can exceed the default
-MAT format's 2 GB per-variable cap). It is not part of `online_spike`.
+(variable `online_spike_waveform`), `[]` unless the container carries waveforms.
+Internally `parseSpikes` reuses the `segmentSpikes` / `segmentSpikeWaveforms`
+workhorses. The raster saves to `*_spikes_matlab.mat`; the waveform to its own
+`*_spikes_waveform_matlab.mat` as `-v7.3` (the array can exceed the default MAT
+format's 2 GB per-variable cap). Each product carries `info.source`. A future
+offline source just fills another `spikeContainer()` and calls the same parser.
 
 When the comment string format from the task changes, the fix is almost always
 adding a key in `BlackrockLoader.defaultEventMaps()` and (if new) a field in
