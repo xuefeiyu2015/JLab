@@ -76,23 +76,42 @@ JLab/
    - then the analyzer: ```BlackRockFileAnalyzer``` for the psychometric curve
 
 `BackRockFileLoader.m` is a thin **driver script**: it sets the run config,
-constructs a `BlackrockLoader`, and loops over date folders. All loading and
-parsing logic lives in the class (`ToolsAndFunctions/LoadingTools/BlackrockLoader.m`).
+constructs a `BlackrockLoader`, and loops over date folders calling
+`loader.processFolder(...)`. All loading, parsing, preparation, and file writing
+live in the class (`ToolsAndFunctions/LoadingTools/BlackrockLoader.m`).
 
 ## How the BlackRock loader works
 
-Loading and parsing are handled by the **`BlackrockLoader`** class. It is a
-config-property class: its public properties hold the file schema, the load
-flags, and the parsing schema (templates + event maps). Construct it with
-name/value overrides, then drive it once per date folder:
+Loading, parsing, and exporting are handled by the **`BlackrockLoader`** class.
+It is a stateful (handle) config-property class: its config properties hold the
+file schema, the load flags, the parsing schema (templates + event maps), and
+the segmentation buffers (`Segment_PreBuffer` / `Segment_PostBuffer` /
+`Segment_BinWidth`). Construct it once with name/value overrides, then run the
+whole pipeline per date folder with the orchestrator:
 
 ```matlab
 loader = BlackrockLoader('LoadAnalogData', true, ...        % override any property
                          'LoadOnlineSpikeData', true, ...
                          'LoadOnlineSpikeWaveform', false);  % opt-in spike waveforms (default off)
-S                    = loader.loadSession(DataFolder);     % resolve + load files
-[trials, experiment] = loader.parseEvents(S.Events, S.EventTime);  % comments -> records
+loader.processFolder(DataFolder, OutputPath, 'Blackrock_2026-06-24');
 ```
+
+`processFolder` runs the six pipeline steps in order — each stores its result in
+a loader property, and every step is individually callable for debugging:
+
+```matlab
+loader.load(DataFolder);   % -> loader.Loaded  (resolves + loads files, resets prior state)
+loader.parseEvents();      % -> loader.Trials, loader.Experiment  (comments -> records)
+loader.parseAnalog();      % -> loader.Analog  (per-trial analog slices)
+loader.parseSpikes();      % -> loader.Spike, loader.SpikeWaveformData  (per-trial rasters)
+loader.prepareExport();    % -> loader.Export  (trials table + expmeta lines)
+loader.export(OutputPath, 'Blackrock_2026-06-24');   % writes the .txt/.csv/.mat files
+```
+
+State is cleared at the start of every `load()`, so a single loader can be
+reused across a batch of folders without leaking data between them. The pure
+`loadSession(DataFolder)` (returns the `S` struct) and
+`parseEvents(Events, EventTime)` methods are still available for ad-hoc use.
 
 ### Input file schema (role-aware resolution)
 
@@ -111,10 +130,15 @@ product is verified present before use:
 - **Spikes and analog are soft.** A missing or unreadable spike/analog file is
   recorded in a status string and that product is skipped — the folder still
   succeeds. The prefixes (`NSP`/`HUB`), the `.ns2` identifier, and the
-  `LoadAnalogData` / `LoadOnlineSpikeData` / `LoadOnlineSpikeWaveform` flags are
-  all constructor-overridable properties.
+  `LoadAnalogData` / `LoadOnlineSpikeData` / `LoadOnlineSpikeWaveform` /
+  `IncludeUnsorted` flags are all constructor-overridable properties.
 - **Online spikes** come from `HUB-*.nev` when `LoadOnlineSpikeData` is on:
-  `loadSession` reads each spike's time (s), electrode, and unit.
+  `loadSession` reads each spike's time (s), electrode, and unit. By default
+  unit `0` (unsorted) and unit `255` (noise) spikes are **dropped** after load
+  (with their channel/unit/waveform columns), so downstream segmentation only
+  sees sorted units; set `IncludeUnsorted` (default off) true to keep them. The
+  flag is source-agnostic — the same drop applies to a future offline spike
+  source feeding the same pipeline.
 - **Spike waveforms** are an **opt-in extra** (`LoadOnlineSpikeWaveform`,
   default off). They live in the same `HUB-*.nev`, so they only load when
   `LoadOnlineSpikeData` is also on; if waveforms are requested without spikes,
@@ -125,15 +149,15 @@ product is verified present before use:
 
 `loadSession` returns a struct `S` with:
 - comments: `Events`, `EventTime`, `comments_source`;
-- spikes (`LoadOnlineSpikeData`): `SpikeTimeSec`, `SpikeChannel`, `SpikeUnit`,
-  and `spike_status`;
-- spike waveforms (`LoadOnlineSpikeWaveform`): `SpikeWaveform`
-  (`[nSamp × nSpikes]` µV, columns aligned to `SpikeTimeSec`),
-  `SpikeWaveformUnit`, `SpikeWaveformNSamp`;
+- spikes (`LoadOnlineSpikeData`): `S.online_spike`, a generic **source-agnostic
+  container** (from `BlackrockLoader.spikeContainer()`) with `TimeSec`,
+  `Channel`, `Unit`, `Waveform` (`[nSamp × nSpikes]` µV, or `[]`; populated only
+  when `LoadOnlineSpikeWaveform` is on), `WaveformUnit`, and `source`
+  (`'online'`). All per-spike arrays are aligned 1:1. Plus `spike_status`;
 - analog (`LoadAnalogData`): `nsxdata`, `nsx_samplingrate`, `nsx_abs_time`,
   `analog_status`.
 
-### Output file schema (what the driver exports)
+### Output file schema (what the loader exports)
 
 Each date folder is written into its own `export_data/<date>/` subfolder, with
 filenames prefixed `Blackrock_<date>_`. Up to **five** files are produced; the
@@ -183,7 +207,8 @@ but a binary raster:
 - `online_spike.timeseq` — same fields as the analog `timeseq` (`relative_time`
   is `1 × maxBins`).
 - `online_spike.info` — `samplingrate` (bin rate, e.g. 1000 Hz for 1 ms bins),
-  `Session`, `Trial_number`, plus `Channel_Number` and `Unit_No` per raster row.
+  `Session`, `Trial_number`, `Channel_Number` and `Unit_No` per raster row, plus
+  `source` (`'online'`; `'offline'` for a future offline-sorted source).
 
 **`*_spikes_waveform_matlab.mat`** — written only when `LoadOnlineSpikeWaveform` is on
 (opt-in; off by default, and requires `LoadOnlineSpikeData`). One variable
@@ -201,7 +226,7 @@ format's 2 GB per-variable cap.
 - `online_spike_waveform.waveform_nsamp` — samples per waveform;
   `.waveform_unit` is `'microVolts'`; `.timeseq` has `alignedrawtime` /
   `aligned_marker`; `.info` has `Session`, `Trial_number`, `Channel_Number`,
-  `Unit_No`, and `maxSpikes`.
+  `Unit_No`, `maxSpikes`, and `source`.
 
 The per-trial window buffers and the spike bin width are set by
 `Segment_PreBuffer` / `Segment_PostBuffer` / `Segment_BinWidth` (ms) near the top
@@ -272,8 +297,8 @@ Folder = '2026-06-17';                    % a single session folder
 Folder = {'2026-06-17','2026-06-18'};     % several folders, loaded in order
 Folder = {};                              % every YYYY-MM-DD folder under DataTypePath
 ```
-For each folder the driver **loads → parses → adds features → exports** in turn,
-writing the per-session output files
+For each folder the driver calls `loader.processFolder(...)`, which **loads →
+parses → adds features → exports** in turn, writing the per-session output files
 (`Blackrock_<date>_expmeta_matlab.txt` and `Blackrock_<date>_trials_matlab.csv`)
 into the matching `export_data/<date>/` subfolder.
 

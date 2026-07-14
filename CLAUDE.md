@@ -33,9 +33,9 @@ loaders depend on its `openNEV`, `openNSx`, and `ts2sec` functions.
 
 **BlackRock / in-lab:**
 1. `BackRockFileLoader.m` — thin **driver script**: sets run config (paths,
-   monkey, folders), constructs a `BlackrockLoader`, loops over date folders
-   calling `loadSession` + `parseEvents`, and writes `*_trials_matlab.csv` and
-   `*_expmeta_matlab.txt`. All loading + parsing logic lives in the class
+   monkey, folders), constructs one `BlackrockLoader`, and loops over date
+   folders calling `loader.processFolder(DataFolder, OutputPath, BaseName)`.
+   All loading, parsing, and exporting logic lives in the class
    (`ToolsAndFunctions/LoadingTools/BlackrockLoader.m`).
 2. `BlackRockFileAnalyzer.m` — reads the trials CSV, filters, fits/plots the
    psychometric curve.
@@ -69,21 +69,34 @@ reported in a final summary).
 ## How the BlackRock loader/parser works (the non-obvious core)
 
 `ToolsAndFunctions/LoadingTools/BlackrockLoader.m` is the heaviest file — a
-config-property `classdef`. Its properties hold the file schema, load flags, and
-parsing schema; override any via the constructor
-(`BlackrockLoader('LoadOnlineSpikeData', false)`). Two instance methods do the
-work, called per date folder by the driver.
+stateful (`classdef ... < handle`) config-property class. Its config properties
+hold the file schema, load flags, parsing schema, and segmentation buffers
+(`Segment_PreBuffer`/`PostBuffer`/`BinWidth`); override any via the constructor
+(`BlackrockLoader('LoadOnlineSpikeData', false)`). The driver runs the whole
+pipeline per date folder via the orchestrator
+`processFolder(DataFolder, OutputPath, BaseName)`, which chains six instance
+methods — `load` → `parseEvents` → `parseAnalog` → `parseSpikes` →
+`prepareExport` → `export` — each storing its result in a private property
+(`Loaded`/`Trials`/`Experiment`/`Analog`/`Spike`/`SpikeWaveformData`/`Export`).
+`load` calls `resetSession` first, so one loader is reused across a batch without
+leaking state between folders. The two heaviest steps are `loadSession` (called
+by `load`) and `parseEvents`, described next.
 
 **`loadSession(DataFolder)` — schema-checked, role-aware file resolution.**
 The recording is split across files by filename **prefix**, and each data
 product is verified present before use:
 - `NSP-*.nev` → comments + comment timing; **falls back to `HUB-*.nev`** (legacy
   recordings kept comments there).
-- `HUB-*.nev` → online spike timing (`ts2sec`, loaded into the workspace only).
-  Opt-in (`LoadOnlineSpikeWaveform`, default off): the per-spike waveforms are also
-  extracted and converted to µV (per-electrode `DigitalFactor`, mirroring
-  openNEV's `'uv'`). Waveforms need spikes, so they only load when
-  `LoadOnlineSpikeData` is on too.
+- `HUB-*.nev` → online spike timing (`ts2sec`, loaded into the workspace only),
+  packed into the **generic container `S.online_spike`**
+  (`TimeSec/Channel/Unit/Waveform/WaveformUnit/source`, from
+  `BlackrockLoader.spikeContainer()`). By default unit `0` (unsorted) and unit
+  `255` (noise) spikes are **dropped** after load (all aligned arrays filtered
+  together); set `IncludeUnsorted` (default off, source-agnostic) true to keep
+  them. Opt-in (`LoadOnlineSpikeWaveform`, default off): the per-spike waveforms
+  are also extracted into the container and converted to µV (per-electrode
+  `DigitalFactor`, mirroring openNEV's `'uv'`). Waveforms need spikes, so they
+  only load when `LoadOnlineSpikeData` is on too.
 - `NSP-*.ns2` → analog/eye data.
 Comments are required (missing → that folder errors and is marked `failed`);
 spike/analog failures are **soft** (recorded in a status string, that product
@@ -114,13 +127,18 @@ turns them into structured records using the field maps from
 - **Derived features** added at the end: Cartesian→polar target angle and
   eccentricity, `Stimulus_direction`, `Choose_target`, `Choose_leftright`.
 
-**Export** stays in the driver script: flattens 2-element vector fields into
-`_x`/`_y` columns and adds a 0-based `index` column (pandas-friendly), distinct
-from the real, resetting `Trial_number`. The static `segmentSpikes` /
-`segmentAnalog` cut the spike raster / analog stream into per-trial slices saved
-as `.mat`. When `LoadOnlineSpikeWaveform` is on, `segmentSpikeWaveforms` builds a
-**separate** dense `NUnit × nTrial × maxSpk × nSamp` µV waveform product
-(variable `online_spike_waveform`), saved to its own
+**Preparation + export** live in the class. `prepareExport` builds the
+export-ready products into the `Export` property: the trials table (flattens
+2-element vector fields into `_x`/`_y` columns, adds a 0-based `index` column —
+pandas-friendly, distinct from the real, resetting `Trial_number`) and the
+experiment-meta text lines. `parseAnalog` / `parseSpikes` call the static
+`segmentAnalog` / `segmentSpikes` to cut the analog stream / spike raster into
+per-trial slices (`Analog` / `Spike`). `export(OutputPath, BaseName)` then writes
+the `.txt`/`.csv`/`.mat` files (only the products that were actually segmented).
+When `LoadOnlineSpikeWaveform` is on, `parseSpikes` also calls
+`segmentSpikeWaveforms` to build a **separate** dense
+`NUnit × nTrial × maxSpk × nSamp` µV waveform product (`SpikeWaveformData`,
+variable `online_spike_waveform`), which `export` saves to its own
 `*_spikes_waveform_matlab.mat` as `-v7.3` (the array can exceed the default
 MAT format's 2 GB per-variable cap). It is not part of `online_spike`.
 
