@@ -45,7 +45,7 @@ end
 % Per-run inputs: set the basic path once, supply the monkey name, and choose
 % which year-month-date folder(s) to process. The loader auto-detects .nev/.ns2.
 Basic_Path  = '/Users/xuefeiyu/Documents/XuefeiFile/WorkRelated/Data';
-Monkey = 'Porthos';        % bare monkey name; folder is "Monkey <name>"
+Monkey = 'test';        % bare monkey name; folder is "Monkey <name>"
 Location = 'in_lab';       % editable constant
 DataType = 'raw_data';     % editable constant
 OutputFolder = 'export_data';   % where parsed data is written
@@ -64,7 +64,7 @@ ExportPath = fullfile(Basic_Path,MonkeyFolder,Location,OutputFolder);
 %   '2026-06-17'                   a single folder
 %   {'2026-06-17','2026-06-18'}    several folders, loaded in order
 %   {}  (or '')                    every YYYY-MM-DD folder under DataTypePath
-Folder = {'2026-06-18'};
+Folder = {'2026-07-10'};
 FolderList = BlackrockLoader.resolveFolders(Folder, DataTypePath);
 
 %% Load configuration (passed to the loader; exports reuse the buffers)
@@ -72,7 +72,7 @@ FolderList = BlackrockLoader.resolveFolders(Folder, DataTypePath);
 % are gated here and are soft failures inside loadSession (that product is just
 % skipped, recorded in the returned status string).
 LoadAnalogData      = true;
-LoadOnlineSpikeData = false;
+LoadOnlineSpikeData = true;
 LoadOnlineSpikeWaveform   = false;   % default is false: also export per-spike waveforms (uV) to a
                                % separate *_spikes_waveform_matlab.mat (needs online spikes; memory heavy)
 %AnalogIdentifier    = '*.ns2'; %default ns2
@@ -120,7 +120,7 @@ for fi = 1:numel(FolderList)
     % recording order, BEFORE parsing. Useful when a task-software format change
     % is sending events into trials.undefined and you want to see the originals.
 
-    %{
+    %{ d
     rawComments = BlackrockLoader.commentsWithTime(S.Events, S.EventTime);
     disp(rawComments);              % print to the command window, or
     openvar('rawComments');        % open in the Variables editor to scroll/filter

@@ -16,14 +16,15 @@ clear;
 % Set paths and identifiers for the .mat file to load. The file is
 % expected at: main_path/monkey/task_type/folder/data_date/Blackrock_*.mat
 
-monkey = 'Monkey Porthos';
+monkey = 'Monkey test';
 main_path = '/Users/xuefeiyu/Documents/XuefeiFile/WorkRelated/Data';
-data_date = '2026-06-18';  % Session date in yyyy-mm-dd
+data_date = '2026-06-25';  % Session date in yyyy-mm-dd
 task_type = 'in_lab';
 folder = 'export_data';
 
 % Task name used to filter trials (must match the Task field in expdata)
-analyze_task = 'time_delay_experiment';
+%analyze_task = 'time_delay_experiment';
+analyze_task = 'visual_saccades_experiment';
 
 % Eye-trace plot settings (see section 4)
 eye_preMs      = 300;   % ms before go cue (fixation offset) to plot
@@ -32,7 +33,7 @@ angle_bin_deg  = 30;    % round target angle to this grid to form direction grou
 eye_num_sample = 100;    % [] = plot all trials; N = plot only first N traces per direction
 
 % Build full path to the BlackRock export .mat file
-data_trials = sprintf('Blackrock_%s_trials.csv', data_date);
+data_trials = sprintf('Blackrock_%s_trials_matlab.csv', data_date);
 data_path = fullfile(main_path, monkey, task_type, folder, data_date, data_trials);
 
 % Segmented analog / eye data lives next to the trials CSV
@@ -76,6 +77,12 @@ if exist(data_path, 'file')
     %{
     stimulus_real = ([task_data.Target_2_presented] - [task_data.Target_1_presented]) * 1000;  % Actual delay in ms
     
+   fixation_on = [task_data.Fixation_point_on ];
+   fixation_acquired = [task_data.Fixation_acquired ];
+
+   diff_fix = fixation_acquired-fixation_on;
+
+
     target1_position_x =[task_data.Target_1_position_x];
     target1_position_y =[task_data.Target_1_position_y];
 
@@ -96,7 +103,7 @@ if exist(data_path, 'file')
     Psymatrix = [stimulus, direction, choice_response];
 
     % Plot psychometric curve and return point of subjective equality (PSE) and threshold
-    [pse, threshold] = VisPsychometricFunction(Psymatrix);
+   % [pse, threshold] = VisPsychometricFunction(Psymatrix);
 
 
 
@@ -125,7 +132,9 @@ if exist(data_path, 'file')
         analog = L.analog;
 
         % Keep the same trials the psychometric fit used (successful trials).
-        eyedata = subsetAnalogTrials(analog, selected_data);
+      %  eyedata = subsetAnalogTrials(analog, selected_data);
+      eyedata = analog;
+      task_data = expdata;
      
 
         % Pull eye X/Y (uV) and the shared sample time base (s, from Start).
