@@ -130,10 +130,15 @@ product is verified present before use:
 - **Spikes and analog are soft.** A missing or unreadable spike/analog file is
   recorded in a status string and that product is skipped — the folder still
   succeeds. The prefixes (`NSP`/`HUB`), the `.ns2` identifier, and the
-  `LoadAnalogData` / `LoadOnlineSpikeData` / `LoadOnlineSpikeWaveform` flags are
-  all constructor-overridable properties.
+  `LoadAnalogData` / `LoadOnlineSpikeData` / `LoadOnlineSpikeWaveform` /
+  `IncludeUnsorted` flags are all constructor-overridable properties.
 - **Online spikes** come from `HUB-*.nev` when `LoadOnlineSpikeData` is on:
-  `loadSession` reads each spike's time (s), electrode, and unit.
+  `loadSession` reads each spike's time (s), electrode, and unit. By default
+  unit `0` (unsorted) and unit `255` (noise) spikes are **dropped** after load
+  (with their channel/unit/waveform columns), so downstream segmentation only
+  sees sorted units; set `IncludeUnsorted` (default off) true to keep them. The
+  flag is source-agnostic — the same drop applies to a future offline spike
+  source feeding the same pipeline.
 - **Spike waveforms** are an **opt-in extra** (`LoadOnlineSpikeWaveform`,
   default off). They live in the same `HUB-*.nev`, so they only load when
   `LoadOnlineSpikeData` is also on; if waveforms are requested without spikes,
@@ -144,11 +149,11 @@ product is verified present before use:
 
 `loadSession` returns a struct `S` with:
 - comments: `Events`, `EventTime`, `comments_source`;
-- spikes (`LoadOnlineSpikeData`): `SpikeTimeSec`, `SpikeChannel`, `SpikeUnit`,
-  and `spike_status`;
-- spike waveforms (`LoadOnlineSpikeWaveform`): `SpikeWaveform`
-  (`[nSamp × nSpikes]` µV, columns aligned to `SpikeTimeSec`),
-  `SpikeWaveformUnit`, `SpikeWaveformNSamp`;
+- spikes (`LoadOnlineSpikeData`): `S.online_spike`, a generic **source-agnostic
+  container** (from `BlackrockLoader.spikeContainer()`) with `TimeSec`,
+  `Channel`, `Unit`, `Waveform` (`[nSamp × nSpikes]` µV, or `[]`; populated only
+  when `LoadOnlineSpikeWaveform` is on), `WaveformUnit`, and `source`
+  (`'online'`). All per-spike arrays are aligned 1:1. Plus `spike_status`;
 - analog (`LoadAnalogData`): `nsxdata`, `nsx_samplingrate`, `nsx_abs_time`,
   `analog_status`.
 
@@ -202,7 +207,8 @@ but a binary raster:
 - `online_spike.timeseq` — same fields as the analog `timeseq` (`relative_time`
   is `1 × maxBins`).
 - `online_spike.info` — `samplingrate` (bin rate, e.g. 1000 Hz for 1 ms bins),
-  `Session`, `Trial_number`, plus `Channel_Number` and `Unit_No` per raster row.
+  `Session`, `Trial_number`, `Channel_Number` and `Unit_No` per raster row, plus
+  `source` (`'online'`; `'offline'` for a future offline-sorted source).
 
 **`*_spikes_waveform_matlab.mat`** — written only when `LoadOnlineSpikeWaveform` is on
 (opt-in; off by default, and requires `LoadOnlineSpikeData`). One variable
@@ -220,7 +226,7 @@ format's 2 GB per-variable cap.
 - `online_spike_waveform.waveform_nsamp` — samples per waveform;
   `.waveform_unit` is `'microVolts'`; `.timeseq` has `alignedrawtime` /
   `aligned_marker`; `.info` has `Session`, `Trial_number`, `Channel_Number`,
-  `Unit_No`, and `maxSpikes`.
+  `Unit_No`, `maxSpikes`, and `source`.
 
 The per-trial window buffers and the spike bin width are set by
 `Segment_PreBuffer` / `Segment_PostBuffer` / `Segment_BinWidth` (ms) near the top
