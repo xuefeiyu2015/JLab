@@ -76,24 +76,42 @@ JLab/
    - then the analyzer: ```BlackRockFileAnalyzer``` for the psychometric curve
 
 `BackRockFileLoader.m` is a thin **driver script**: it sets the run config,
-constructs a `BlackrockLoader`, and loops over date folders. All loading and
-parsing logic lives in the class (`ToolsAndFunctions/LoadingTools/BlackrockLoader.m`).
+constructs a `BlackrockLoader`, and loops over date folders calling
+`loader.processFolder(...)`. All loading, parsing, preparation, and file writing
+live in the class (`ToolsAndFunctions/LoadingTools/BlackrockLoader.m`).
 
 ## How the BlackRock loader works
 
-Loading and parsing are handled by the **`BlackrockLoader`** class. It is a
-config-property class: its public properties hold the file schema, the load
-flags, and the parsing schema (templates + event maps). Construct it with
-name/value overrides, then drive it once per date folder:
+Loading, parsing, and exporting are handled by the **`BlackrockLoader`** class.
+It is a stateful (handle) config-property class: its config properties hold the
+file schema, the load flags, the parsing schema (templates + event maps), and
+the segmentation buffers (`Segment_PreBuffer` / `Segment_PostBuffer` /
+`Segment_BinWidth`). Construct it once with name/value overrides, then run the
+whole pipeline per date folder with the orchestrator:
 
 ```matlab
 loader = BlackrockLoader('LoadAnalogData', true, ...        % override any property
                          'LoadOnlineSpikeData', true, ...
-                         'LoadOnlineSpikeWaveform', false, ...  % opt-in spike waveforms (default off)
-                         'IncludeUnsorted', false);         % keep unit 0/255 spikes (default off)
-S                    = loader.loadSession(DataFolder);     % resolve + load files
-[trials, experiment] = loader.parseEvents(S.Events, S.EventTime);  % comments -> records
+                         'LoadOnlineSpikeWaveform', false);  % opt-in spike waveforms (default off)
+loader.processFolder(DataFolder, OutputPath, 'Blackrock_2026-06-24');
 ```
+
+`processFolder` runs the six pipeline steps in order — each stores its result in
+a loader property, and every step is individually callable for debugging:
+
+```matlab
+loader.load(DataFolder);   % -> loader.Loaded  (resolves + loads files, resets prior state)
+loader.parseEvents();      % -> loader.Trials, loader.Experiment  (comments -> records)
+loader.parseAnalog();      % -> loader.Analog  (per-trial analog slices)
+loader.parseSpikes();      % -> loader.Spike, loader.SpikeWaveformData  (per-trial rasters)
+loader.prepareExport();    % -> loader.Export  (trials table + expmeta lines)
+loader.export(OutputPath, 'Blackrock_2026-06-24');   % writes the .txt/.csv/.mat files
+```
+
+State is cleared at the start of every `load()`, so a single loader can be
+reused across a batch of folders without leaking data between them. The pure
+`loadSession(DataFolder)` (returns the `S` struct) and
+`parseEvents(Events, EventTime)` methods are still available for ad-hoc use.
 
 ### Input file schema (role-aware resolution)
 
@@ -139,20 +157,7 @@ product is verified present before use:
 - analog (`LoadAnalogData`): `nsxdata`, `nsx_samplingrate`, `nsx_abs_time`,
   `analog_status`.
 
-The same container shape is what a future **offline** spike source will fill, so
-both feed the one segmentation entrypoint:
-
-```matlab
-% online now; offline later builds offline_spike_raw the same way
-[online_spike, online_spike_waveform] = ...
-    BlackrockLoader.parseSpikes(S.online_spike, trials, preMs, postMs, binMs);
-```
-
-`parseSpikes` (the source-agnostic spike parser) returns the raster product and,
-when the container carries waveforms, a separate waveform product (`[]`
-otherwise). Both products tag their origin in `info.source`.
-
-### Output file schema (what the driver exports)
+### Output file schema (what the loader exports)
 
 Each date folder is written into its own `export_data/<date>/` subfolder, with
 filenames prefixed `Blackrock_<date>_`. Up to **five** files are produced; the
@@ -292,8 +297,8 @@ Folder = '2026-06-17';                    % a single session folder
 Folder = {'2026-06-17','2026-06-18'};     % several folders, loaded in order
 Folder = {};                              % every YYYY-MM-DD folder under DataTypePath
 ```
-For each folder the driver **loads → parses → adds features → exports** in turn,
-writing the per-session output files
+For each folder the driver calls `loader.processFolder(...)`, which **loads →
+parses → adds features → exports** in turn, writing the per-session output files
 (`Blackrock_<date>_expmeta_matlab.txt` and `Blackrock_<date>_trials_matlab.csv`)
 into the matching `export_data/<date>/` subfolder.
 

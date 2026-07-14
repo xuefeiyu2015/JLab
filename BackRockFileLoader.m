@@ -9,9 +9,10 @@
 % Add batch run and export, now  it supports loading and exporting multiple
 % files -- June 19th, 2026
 % Migrate to the object-oriented BlackrockLoader: this script is now a thin
-% driver that constructs one loader, then per date folder calls loadSession +
-% parseEvents and writes the exports. All load/parse/templates/maps logic lives
-% in ToolsAndFunctions/LoadingTools/BlackrockLoader.m -- June 27th, 2026
+% driver that constructs one loader, then per date folder calls
+% loader.processFolder (load -> parseEvents -> parseAnalog -> parseSpikes ->
+% prepareExport -> export). All load/parse/prepare/export/templates/maps logic
+% lives in ToolsAndFunctions/LoadingTools/BlackrockLoader.m -- June 27th, 2026
 clear
 close all
 
@@ -86,18 +87,20 @@ Segment_PreBuffer  = 500;   % ms kept before each trial's Start marker
 Segment_PostBuffer = 500;   % ms kept after  each trial's End  marker
 Segment_BinWidth   = 1;     % spike raster bin width (ms)
 
-%% Construct the loader once (config-only / stateless)
+%% Construct the loader once (config now; per-folder state is reset each load)
 % Override any schema/flag via name-value pairs; the parsing schema (templates +
 % event maps) is filled from BlackrockLoader's static factories. To capture a
 % new comment-string event, add a key in BlackrockLoader.defaultEventMaps() and
 % a matching field in defaultTrialTemplate()/defaultExpTemplate().
 loader = BlackrockLoader( ...
     'LoadAnalogData',      LoadAnalogData, ...
-    'LoadOnlineSpikeData', LoadOnlineSpikeData);
-   % 'LoadOnlineSpikeWaveform',   LoadOnlineSpikeWaveform);
-  %  'IncludeUnsorted',           IncludeUnsorted, ...
-  %  'SpikePrefix',         SpikePrefix);
-    
+    'LoadOnlineSpikeData', LoadOnlineSpikeData, ...
+    'LoadOnlineSpikeWaveform',   LoadOnlineSpikeWaveform, ...
+    'SpikePrefix',         SpikePrefix, ...
+    'Segment_PreBuffer',   Segment_PreBuffer, ...
+    'Segment_PostBuffer',  Segment_PostBuffer, ...
+    'Segment_BinWidth',    Segment_BinWidth);
+
     %'AnalogIdentifier',    AnalogIdentifier);
 
 %% Batch process each date folder
@@ -109,123 +112,29 @@ for fi = 1:numel(FolderList)
     fprintf('\n===== [%d/%d] %s =====\n', fi, numel(FolderList), CurrentFolder);
 
   try
-    % --- per-folder paths and output filenames ---
+    % --- per-folder paths and output filename stem ---
     DataFolder = fullfile(DataTypePath, CurrentFolder);
     OutputPath = fullfile(ExportPath, CurrentFolder);
-    OutputFileName_exp    = 'Blackrock_'+string(CurrentFolder)+'_expmeta_matlab.txt';
-    OutputFileName_trials = 'Blackrock_'+string(CurrentFolder)+'_trials_matlab.csv';
-
-    % --- Load (schema-checked, role-aware) and parse the comment strings ---
-    S = loader.loadSession(DataFolder);
+    BaseName   = char("Blackrock_" + string(CurrentFolder));
 
     % --- (debug) inspect the RAW comments with timestamps ---
-    % Pairs each comment string with its timestamp (seconds) into a table, in
-    % recording order, BEFORE parsing. Useful when a task-software format change
-    % is sending events into trials.undefined and you want to see the originals.
+    % Load, then pair each comment string with its timestamp (seconds) into a
+    % table, in recording order, BEFORE parsing. Useful when a task-software
+    % format change is sending events into trials.undefined.
 
     %{
-    rawComments = BlackrockLoader.commentsWithTime(S.Events, S.EventTime);
+    loader.load(DataFolder);
+    rawComments = BlackrockLoader.commentsWithTime(loader.Loaded.Events, loader.Loaded.EventTime);
     disp(rawComments);              % print to the command window, or
     openvar('rawComments');        % open in the Variables editor to scroll/filter
     %}
-    
-    [trials, experiment] = loader.parseEvents(S.Events, S.EventTime);
 
-    % --- Report the files / data products that were actually loaded ---
-    fprintf('\n--- Loaded Blackrock data ---\n');
-    fprintf('  Comments: %s\n', S.comments_source);
-    fprintf('  Analog:   %s\n', S.analog_status);
-    fprintf('  Spikes:   %s\n', S.spike_status);
-    fprintf('-----------------------------\n');
-
-    %% Export the parsed data into folders
-    % Set up export path
-    if ~exist(OutputPath, 'dir')
-        mkdir(OutputPath);
-    end
-
-    %% Save experiment meta as .txt
-    % One section per session, separated by a "Session N:" header and a blank line.
-    fid = fopen(fullfile(OutputPath, OutputFileName_exp), 'w');
-    for s = 1:numel(experiment)
-        fprintf(fid, 'Session %d:\n', s);
-        fields = fieldnames(experiment(s));
-        for i = 1:numel(fields)
-            val = experiment(s).(fields{i});
-            if isnumeric(val)
-                fprintf(fid, '%s: %s\n', fields{i}, mat2str(val));
-            else
-                fprintf(fid, '%s: %s\n', fields{i}, string(val));
-            end
-        end
-        fprintf(fid, '\n');
-    end
-    fclose(fid);
-
-    fprintf('File:%s Experiment meta has been parsed into %s\n', S.comments_source, OutputFileName_exp);
-
-    %% Save trials as .csv
-    % Flatten array/vector fields (e.g. positions) into separate columns
-    trials_flat = rmfield(trials, {'undefined', 'duplicates'});
-    trials_table = struct2table(trials_flat);
-
-    % Explicit 0-based sequential row index (pandas-friendly: read_csv(index_col='index')).
-    % Kept separate from Trial_number, which holds the real (resetting) trial number.
-    trials_table = addvars(trials_table, (0:height(trials_table)-1)', ...
-        'Before', 1, 'NewVariableNames', 'index');
-
-    % Split any 2-column numeric fields (positions) into _x/_y columns for CSV
-    for col = trials_table.Properties.VariableNames
-        c = col{1};
-        if isnumeric(trials_table.(c)) && size(trials_table.(c), 2) == 2
-            trials_table.([c '_x']) = trials_table.(c)(:,1);
-            trials_table.([c '_y']) = trials_table.(c)(:,2);
-            trials_table.(c) = [];
-        end
-    end
-
-    writetable(trials_table, fullfile(OutputPath, OutputFileName_trials));
-
-    fprintf('File:%s Trials Data has been parsed into %s\n', S.comments_source, OutputFileName_trials);
-
-    %% Segment the analog stream into trials and save as .mat (only if loaded)
-    if S.LoadAnalogData
-        analog = BlackrockLoader.segmentAnalog(trials, S.nsxdata, S.nsx_abs_time, ...
-                     S.nsx_samplingrate, Segment_PreBuffer, Segment_PostBuffer);
-        OutputFileName_analog = 'Blackrock_'+string(CurrentFolder)+'_analog_matlab.mat';
-        save(fullfile(OutputPath, char(OutputFileName_analog)), 'analog');
-        fprintf('File:%s Analog segmented (%d trials) into %s\n', ...
-            S.comments_source, size(analog.data, 2), OutputFileName_analog);
-    end
-
-    % Segment online spikes into per-trial products via the source-agnostic
-    % parser. parseSpikes returns the raster (online_spike) and, when waveforms
-    % were loaded, a separate waveform product (online_spike_waveform). The same
-    % call will serve a future offline source (just build offline_spike_raw and
-    % save offline_spike / offline_spike_waveform).
-    if S.LoadOnlineSpikeData
-        if isempty(S.online_spike.TimeSec)
-            % Every spike was unsorted/noise (or none recorded) -> nothing to export.
-            fprintf('File:%s No sorted spikes found; skipping spike export.\n', S.comments_source);
-        else
-            [online_spike, online_spike_waveform] = BlackrockLoader.parseSpikes( ...
-                         S.online_spike, trials, Segment_PreBuffer, Segment_PostBuffer, Segment_BinWidth);
-            OutputFileName_spikes = 'Blackrock_'+string(CurrentFolder)+'_spikes_matlab.mat';
-            save(fullfile(OutputPath, char(OutputFileName_spikes)), 'online_spike');
-            fprintf('File:%s Spikes rasterized (%d units x %d trials) into %s\n', ...
-                S.comments_source, size(online_spike.data, 1), size(online_spike.data, 2), OutputFileName_spikes);
-
-            % Waveforms: a separate file as -v7.3 because the dense 4-D array can
-            % exceed the 2 GB per-variable cap of the default MAT format.
-            if ~isempty(online_spike_waveform)
-                OutputFileName_wf = 'Blackrock_'+string(CurrentFolder)+'_spikes_waveform_matlab.mat';
-                save(fullfile(OutputPath, char(OutputFileName_wf)), 'online_spike_waveform', '-v7.3');
-                fprintf('File:%s Spike waveforms (%d samples, up to %d spk/unit-trial) into %s\n', ...
-                    S.comments_source, online_spike_waveform.waveform_nsamp, ...
-                    online_spike_waveform.info.maxSpikes, OutputFileName_wf);
-            end
-        end
-    end
+    % --- Run the whole pipeline for this folder ---
+    % load -> parseEvents -> parseAnalog -> parseSpikes -> prepareExport -> export.
+    % All loading/parsing/preparation/writing lives in the class; each step's
+    % result is stored on the loader (loader.Loaded/Trials/Experiment/Analog/
+    % Spike/SpikeWaveformData/Export) if you want to inspect it afterwards.
+    loader.processFolder(DataFolder, OutputPath, BaseName);
 
     results(end+1) = struct('folder', CurrentFolder, 'status', 'ok', 'message', '');
 
