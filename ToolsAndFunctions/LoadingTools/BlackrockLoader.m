@@ -1,4 +1,4 @@
-classdef BlackrockLoader
+classdef BlackrockLoader < handle
 % BlackrockLoader  Schema-checked loading and parsing of Blackrock behavior data.
 %
 % The recording for one session is split across files by role; the loader picks
@@ -11,15 +11,24 @@ classdef BlackrockLoader
 % Legacy exception: in early sessions comments AND spikes were both written to
 % the HUB-*.nev file, so comments fall back from NSP to HUB.
 %
-% This is a config-property class: the properties below hold the file schema,
-% the load flags, and the parsing schema (templates + event maps). Override any
-% of them through the constructor, e.g.
+% This is a stateful (handle) config-property class: the config properties below
+% hold the file schema, the load flags, the parsing schema (templates + event
+% maps), and the segmentation buffers. Override any of them through the
+% constructor, e.g.
 %   loader = BlackrockLoader('LoadOnlineSpikeData', false);
-% then drive it per date folder:
-%   S = loader.loadSession(DataFolder);
-%   [trials, experiment] = loader.parseEvents(S.Events, S.EventTime);
+% then run the whole pipeline per date folder with the orchestrator:
+%   loader.processFolder(DataFolder, OutputPath, 'Blackrock_2026-06-24');
+% or drive it step by step (each step stores its result in a loader property):
+%   loader.load(DataFolder);   % -> loader.Loaded
+%   loader.parseEvents();      % -> loader.Trials, loader.Experiment
+%   loader.parseAnalog();      % -> loader.Analog
+%   loader.parseSpikes();      % -> loader.Spike, loader.SpikeWaveformData
+%   loader.prepareExport();    % -> loader.Export (trials table + expmeta lines)
+%   loader.export(OutputPath, 'Blackrock_2026-06-24');   % writes the files
+% Session state is cleared at the start of every load(), so one loader can be
+% reused across a batch of folders without leaking data between them.
 %
-% Last updates of the comments --June 18th, 2026
+% Last updates of the comments --June 27th, 2026
 % by Xuefei Yu
 
     properties
@@ -40,6 +49,23 @@ classdef BlackrockLoader
         TrialTemplate         % struct of NaN-initialised trial fields
         ExpTemplate           % struct of NaN-initialised experiment fields
         EventMaps             % struct of containers.Map + cell-list event maps
+
+        % --- segmentation buffers (ms). Window per trial = [Start-Pre, End+Post] ---
+        Segment_PreBuffer  = 500   % ms kept before each trial's Start marker
+        Segment_PostBuffer = 500   % ms kept after  each trial's End  marker
+        Segment_BinWidth   = 1     % spike raster bin width (ms)
+    end
+
+    properties (SetAccess = private)
+        % --- per-folder session state, populated by the pipeline steps and
+        % cleared at the start of every load() (see resetSession) ---
+        Loaded            % the S struct from loadSession (events, spikes, analog, statuses, flags)
+        Trials            % struct array from parseEvents
+        Experiment        % struct array from parseEvents
+        Analog            % segmentAnalog output   ([] when analog not loaded)
+        Spike             % segmentSpikes output   ([] when spikes not loaded)
+        SpikeWaveformData % segmentSpikeWaveforms output ([] unless waveforms on)
+        Export            % struct: .trials_table (table) + .expmeta_lines (cellstr)
     end
 
     methods
@@ -52,6 +78,33 @@ classdef BlackrockLoader
             if isempty(obj.TrialTemplate); obj.TrialTemplate = BlackrockLoader.defaultTrialTemplate(); end
             if isempty(obj.ExpTemplate);   obj.ExpTemplate   = BlackrockLoader.defaultExpTemplate();   end
             if isempty(obj.EventMaps);     obj.EventMaps     = BlackrockLoader.defaultEventMaps();      end
+        end
+
+        function processFolder(obj, DataFolder, OutputPath, BaseName)
+        % Run the whole pipeline for one date folder:
+        %   load -> parseEvents -> parseAnalog -> parseSpikes -> prepareExport -> export
+        % Exceptions propagate so a batch driver's per-folder try/catch can mark
+        % just this folder failed and keep going.
+            obj.load(DataFolder);
+            obj.parseEvents();
+            obj.parseAnalog();
+            obj.parseSpikes();
+            obj.prepareExport();
+            obj.export(OutputPath, BaseName);
+        end
+
+        function load(obj, DataFolder)
+        % Clear any previous session state, load one date folder's files into
+        % obj.Loaded, and report which data products were actually loaded.
+            obj.resetSession();
+            obj.Loaded = obj.loadSession(DataFolder);
+
+            S = obj.Loaded;
+            fprintf('\n--- Loaded Blackrock data ---\n');
+            fprintf('  Comments: %s\n', S.comments_source);
+            fprintf('  Analog:   %s\n', S.analog_status);
+            fprintf('  Spikes:   %s\n', S.spike_status);
+            fprintf('-----------------------------\n');
         end
 
         function S = loadSession(obj, DataFolder)
@@ -216,6 +269,15 @@ classdef BlackrockLoader
         % A single .nev can hold several sessions (task started/stopped), so
         % experiment is a struct array indexed by session_index; trials are
         % keyed by position so a resetting trial counter starts new trials.
+        %
+        % Called with no data args it reads obj.Loaded (the stateful pipeline);
+        % pass Events/EventTime explicitly to parse an arbitrary comment set.
+        % Either way the result is stored in obj.Trials / obj.Experiment AND
+        % returned.
+            if nargin < 2
+                Events    = obj.Loaded.Events;
+                EventTime = obj.Loaded.EventTime;
+            end
 
             exp_template       = obj.ExpTemplate;
             trial              = obj.TrialTemplate;
@@ -615,6 +677,164 @@ classdef BlackrockLoader
 
             Target_2_ecc_cell = num2cell(Target_2_ecc);
             [trials.Target_2_eccentricity] = deal(Target_2_ecc_cell{:});
+
+            obj.Trials     = trials;
+            obj.Experiment = experiment;
+        end
+
+        function A = parseAnalog(obj)
+        % Segment the loaded analog stream into per-trial slices, stored in
+        % obj.Analog. When analog was not loaded, obj.Analog is [].
+            if isempty(obj.Loaded) || ~obj.Loaded.LoadAnalogData
+                obj.Analog = [];
+            else
+                S = obj.Loaded;
+                obj.Analog = BlackrockLoader.segmentAnalog(obj.Trials, S.nsxdata, ...
+                    S.nsx_abs_time, S.nsx_samplingrate, ...
+                    obj.Segment_PreBuffer, obj.Segment_PostBuffer);
+            end
+            A = obj.Analog;
+        end
+
+        function R = parseSpikes(obj)
+        % Rasterize the loaded online spikes into obj.Spike and, when
+        % LoadOnlineSpikeWaveform is on, collect per-spike waveforms into
+        % obj.SpikeWaveformData. Products that were not loaded stay [].
+            obj.Spike = [];
+            obj.SpikeWaveformData = [];
+            if isempty(obj.Loaded)
+                R = obj.Spike;
+                return
+            end
+            S = obj.Loaded;
+            if S.LoadOnlineSpikeData
+                obj.Spike = BlackrockLoader.segmentSpikes(obj.Trials, S.SpikeTimeSec, ...
+                    S.SpikeChannel, S.SpikeUnit, ...
+                    obj.Segment_PreBuffer, obj.Segment_PostBuffer, obj.Segment_BinWidth);
+            end
+            if S.LoadOnlineSpikeWaveform && ~isempty(S.SpikeWaveform)
+                obj.SpikeWaveformData = BlackrockLoader.segmentSpikeWaveforms(obj.Trials, ...
+                    S.SpikeTimeSec, S.SpikeChannel, S.SpikeUnit, S.SpikeWaveform, ...
+                    obj.Segment_PreBuffer, obj.Segment_PostBuffer);
+            end
+            R = obj.Spike;
+        end
+
+        function E = prepareExport(obj)
+        % Build the export-ready products from obj.Trials / obj.Experiment and
+        % store them in obj.Export (.trials_table and .expmeta_lines). This is
+        % pure preparation; export() does the file writing.
+            trials     = obj.Trials;
+            experiment = obj.Experiment;
+
+            % --- experiment meta: one text block per session ---
+            % "Session N:" header, then "field: value" (mat2str for numerics),
+            % then a blank line.
+            expmeta_lines = {};
+            for s = 1:numel(experiment)
+                expmeta_lines{end+1,1} = sprintf('Session %d:', s); %#ok<AGROW>
+                fields = fieldnames(experiment(s));
+                for i = 1:numel(fields)
+                    val = experiment(s).(fields{i});
+                    if isnumeric(val)
+                        expmeta_lines{end+1,1} = sprintf('%s: %s', fields{i}, mat2str(val)); %#ok<AGROW>
+                    else
+                        expmeta_lines{end+1,1} = sprintf('%s: %s', fields{i}, string(val)); %#ok<AGROW>
+                    end
+                end
+                expmeta_lines{end+1,1} = ''; %#ok<AGROW>
+            end
+
+            % --- trials table: drop bookkeeping, add index, split _x/_y ---
+            trials_flat  = rmfield(trials, {'undefined', 'duplicates'});
+            trials_table = struct2table(trials_flat);
+
+            % Explicit 0-based sequential row index (pandas-friendly:
+            % read_csv(index_col='index')). Kept separate from Trial_number,
+            % which holds the real (resetting) trial number.
+            trials_table = addvars(trials_table, (0:height(trials_table)-1)', ...
+                'Before', 1, 'NewVariableNames', 'index');
+
+            % Split any 2-column numeric fields (positions) into _x/_y columns.
+            for col = trials_table.Properties.VariableNames
+                c = col{1};
+                if isnumeric(trials_table.(c)) && size(trials_table.(c), 2) == 2
+                    trials_table.([c '_x']) = trials_table.(c)(:,1);
+                    trials_table.([c '_y']) = trials_table.(c)(:,2);
+                    trials_table.(c) = [];
+                end
+            end
+
+            obj.Export = struct('trials_table', trials_table, ...
+                                'expmeta_lines', {expmeta_lines});
+            E = obj.Export;
+        end
+
+        function export(obj, OutputPath, BaseName)
+        % Write the prepared products to OutputPath, filenames stemmed on
+        % BaseName (e.g. 'Blackrock_2026-06-24'):
+        %   <BaseName>_expmeta_matlab.txt          (always)
+        %   <BaseName>_trials_matlab.csv           (always)
+        %   <BaseName>_analog_matlab.mat           (if analog was segmented)
+        %   <BaseName>_spikes_matlab.mat           (if spikes were segmented)
+        %   <BaseName>_spikes_waveform_matlab.mat  (if waveforms were segmented)
+            if ~exist(OutputPath, 'dir')
+                mkdir(OutputPath);
+            end
+            src = obj.Loaded.comments_source;
+
+            % Experiment meta (.txt)
+            fname_exp = [BaseName '_expmeta_matlab.txt'];
+            fid = fopen(fullfile(OutputPath, fname_exp), 'w');
+            fprintf(fid, '%s\n', obj.Export.expmeta_lines{:});
+            fclose(fid);
+            fprintf('File:%s Experiment meta has been parsed into %s\n', src, fname_exp);
+
+            % Trials (.csv)
+            fname_trials = [BaseName '_trials_matlab.csv'];
+            writetable(obj.Export.trials_table, fullfile(OutputPath, fname_trials));
+            fprintf('File:%s Trials Data has been parsed into %s\n', src, fname_trials);
+
+            % Analog (.mat) - only when segmented
+            if ~isempty(obj.Analog)
+                analog = obj.Analog; %#ok<NASGU>
+                fname_analog = [BaseName '_analog_matlab.mat'];
+                save(fullfile(OutputPath, fname_analog), 'analog');
+                fprintf('File:%s Analog segmented (%d trials) into %s\n', ...
+                    src, size(obj.Analog.data, 2), fname_analog);
+            end
+
+            % Spikes (.mat) - only when segmented
+            if ~isempty(obj.Spike)
+                online_spike = obj.Spike; %#ok<NASGU>
+                fname_spikes = [BaseName '_spikes_matlab.mat'];
+                save(fullfile(OutputPath, fname_spikes), 'online_spike');
+                fprintf('File:%s Spikes rasterized (%d units x %d trials) into %s\n', ...
+                    src, size(obj.Spike.data, 1), size(obj.Spike.data, 2), fname_spikes);
+            end
+
+            % Spike waveforms (.mat, -v7.3) - only when segmented. The dense 4-D
+            % array can exceed the 2 GB per-variable cap of the default format.
+            if ~isempty(obj.SpikeWaveformData)
+                online_spike_waveform = obj.SpikeWaveformData; %#ok<NASGU>
+                fname_wf = [BaseName '_spikes_waveform_matlab.mat'];
+                save(fullfile(OutputPath, fname_wf), 'online_spike_waveform', '-v7.3');
+                fprintf('File:%s Spike waveforms (%d samples, up to %d spk/unit-trial) into %s\n', ...
+                    src, obj.SpikeWaveformData.waveform_nsamp, ...
+                    obj.SpikeWaveformData.info.maxSpikes, fname_wf);
+            end
+        end
+
+        function resetSession(obj)
+        % Clear all per-folder session state so one loader can be reused across
+        % a batch without leaking data from a previous folder.
+            obj.Loaded            = [];
+            obj.Trials            = [];
+            obj.Experiment        = [];
+            obj.Analog            = [];
+            obj.Spike             = [];
+            obj.SpikeWaveformData = [];
+            obj.Export            = [];
         end
     end
 
