@@ -65,7 +65,7 @@ ExportPath = fullfile(Basic_Path,MonkeyFolder,Location,OutputFolder);
 %   '2026-06-17'                   a single folder
 %   {'2026-06-17','2026-06-18'}    several folders, loaded in order
 %   {}  (or '')                    every YYYY-MM-DD folder under DataTypePath
-Folder = {'2026-06-24'};
+Folder = {'2026-07-10'};
 FolderList = BlackrockLoader.resolveFolders(Folder, DataTypePath);
 
 %% Load configuration (passed to the loader; exports reuse the buffers)
@@ -125,6 +125,7 @@ for fi = 1:numel(FolderList)
     %{
     loader.load(DataFolder);
     rawComments = BlackrockLoader.commentsWithTime(loader.Loaded.Events, loader.Loaded.EventTime);
+
     disp(rawComments);              % print to the command window, or
     openvar('rawComments');        % open in the Variables editor to scroll/filter
     %}
