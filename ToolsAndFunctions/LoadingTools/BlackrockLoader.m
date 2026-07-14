@@ -267,8 +267,8 @@ classdef BlackrockLoader < handle
                         S.spike_status = sprintf('ok (%s)', hub_nev);
                     end
 
-                    % Pack into the generic, source-agnostic container so the
-                    % driver can feed it straight to BlackrockLoader.parseSpikes.
+                    % Pack into the generic, source-agnostic container that
+                    % parseSpikes/segmentSpikes then rasterize per trial.
                     S.online_spike.TimeSec  = spikeTimeSec;
                     S.online_spike.Channel  = spikeChannel;
                     S.online_spike.Unit     = spikeUnit;
@@ -821,11 +821,7 @@ classdef BlackrockLoader < handle
 
             % Analog (.mat) - only when segmented
             if ~isempty(obj.Analog)
-<<<<<<< HEAD
                 analog = obj.Analog; %#ok<NASGU>
-=======
-                analog = obj.Analog; 
->>>>>>> add-analog-check
                 fname_analog = [BaseName '_analog_matlab.mat'];
                 save(fullfile(OutputPath, fname_analog), 'analog');
                 fprintf('File:%s Analog segmented (%d trials) into %s\n', ...
@@ -834,11 +830,7 @@ classdef BlackrockLoader < handle
 
             % Spikes (.mat) - only when segmented
             if ~isempty(obj.Spike)
-<<<<<<< HEAD
                 online_spike = obj.Spike; %#ok<NASGU>
-=======
-                online_spike = obj.Spike; 
->>>>>>> add-analog-check
                 fname_spikes = [BaseName '_spikes_matlab.mat'];
                 save(fullfile(OutputPath, fname_spikes), 'online_spike');
                 fprintf('File:%s Spikes rasterized (%d units x %d trials) into %s\n', ...
@@ -848,11 +840,7 @@ classdef BlackrockLoader < handle
             % Spike waveforms (.mat, -v7.3) - only when segmented. The dense 4-D
             % array can exceed the 2 GB per-variable cap of the default format.
             if ~isempty(obj.SpikeWaveformData)
-<<<<<<< HEAD
                 online_spike_waveform = obj.SpikeWaveformData; %#ok<NASGU>
-=======
-                online_spike_waveform = obj.SpikeWaveformData; 
->>>>>>> add-analog-check
                 fname_wf = [BaseName '_spikes_waveform_matlab.mat'];
                 save(fullfile(OutputPath, fname_wf), 'online_spike_waveform', '-v7.3');
                 fprintf('File:%s Spike waveforms (%d samples, up to %d spk/unit-trial) into %s\n', ...
@@ -938,7 +926,7 @@ classdef BlackrockLoader < handle
         function s = spikeContainer()
         % Canonical, source-agnostic raw-spike container. Every spike source
         % (online now, offline later) fills this same shape, then feeds it to
-        % parseSpikes. All per-spike arrays are aligned 1:1 (same length / column
+        % parseSpikes/segmentSpikes. All per-spike arrays are aligned 1:1 (same length / column
         % count), so they can be filtered or segmented together.
             s = struct( ...
                 'TimeSec',      [], ...   % spike times (s, recording clock); 1 x nSpikes
@@ -947,39 +935,6 @@ classdef BlackrockLoader < handle
                 'Waveform',     [], ...   % [nSamp x nSpikes] uV, or [] when none
                 'WaveformUnit', '', ...   % e.g. 'microVolts' (label for Waveform)
                 'source',       '');      % provenance: 'online' | 'offline'
-        end
-
-        function [R, W] = parseSpikes(spike, trials, preMs, postMs, binMs)
-        % Source-agnostic spike parser: segment a raw-spike container (see
-        % spikeContainer) into trial-aligned products. The SAME entrypoint serves
-        % online and (future) offline spikes -- only spike.source differs.
-        %   R = binary raster (segmentSpikes output) + R.info.source
-        %   W = per-spike waveform product (segmentSpikeWaveforms output) +
-        %       W.info.source, or [] when the container carries no waveform.
-        % Persistence (separate .mat files) is the driver's job; this just builds
-        % the in-memory products by reusing the existing segmentation helpers.
-            req = {'TimeSec','Channel','Unit'};
-            for k = 1:numel(req)
-                if ~isfield(spike, req{k})
-                    error('parseSpikes:badContainer', ...
-                        'spike container is missing field "%s" (see BlackrockLoader.spikeContainer).', req{k});
-                end
-            end
-            if ~isfield(spike, 'source'); spike.source = ''; end
-
-            R = BlackrockLoader.segmentSpikes(trials, spike.TimeSec, spike.Channel, ...
-                    spike.Unit, preMs, postMs, binMs);
-            R.info.source = spike.source;
-
-            W = [];
-            if isfield(spike, 'Waveform') && ~isempty(spike.Waveform)
-                W = BlackrockLoader.segmentSpikeWaveforms(trials, spike.TimeSec, ...
-                        spike.Channel, spike.Unit, spike.Waveform, preMs, postMs);
-                if isfield(spike, 'WaveformUnit') && ~isempty(spike.WaveformUnit)
-                    W.waveform_unit = spike.WaveformUnit;
-                end
-                W.info.source = spike.source;
-            end
         end
 
         function A = segmentAnalog(trials, nsxdata, nsx_abs_time, nsx_samplingrate, preMs, postMs)

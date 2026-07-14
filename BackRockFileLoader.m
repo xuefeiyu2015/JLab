@@ -46,7 +46,7 @@ end
 % Per-run inputs: set the basic path once, supply the monkey name, and choose
 % which year-month-date folder(s) to process. The loader auto-detects .nev/.ns2.
 Basic_Path  = '/Users/xuefeiyu/Documents/XuefeiFile/WorkRelated/Data';
-Monkey = 'test';        % bare monkey name; folder is "Monkey <name>"
+Monkey = 'Betty';        % bare monkey name; folder is "Monkey <name>"
 Location = 'in_lab';       % editable constant
 DataType = 'raw_data';     % editable constant
 OutputFolder = 'export_data';   % where parsed data is written
@@ -65,21 +65,21 @@ ExportPath = fullfile(Basic_Path,MonkeyFolder,Location,OutputFolder);
 %   '2026-06-17'                   a single folder
 %   {'2026-06-17','2026-06-18'}    several folders, loaded in order
 %   {}  (or '')                    every YYYY-MM-DD folder under DataTypePath
-Folder = {'2026-07-10'};
+Folder = {'2026-07-14'};
 FolderList = BlackrockLoader.resolveFolders(Folder, DataTypePath);
 
 %% Load configuration (passed to the loader; exports reuse the buffers)
 % Analog (eye) data lives in NSP-*.ns2; online spikes live in HUB-*.nev. Both
 % are gated here and are soft failures inside loadSession (that product is just
 % skipped, recorded in the returned status string).
-LoadAnalogData      = true;
+LoadAnalogData      = false;
 LoadOnlineSpikeData = false;  %default is false for online spikes
-%LoadOnlineSpikeWaveform   = false;   % default is false: also export per-spike waveforms (uV) to a
+LoadOnlineSpikeWaveform   = false;   % default is false: also export per-spike waveforms (uV) to a
                                % separate *_spikes_waveform_matlab.mat (needs online spikes; memory heavy)
 %IncludeUnsorted = false;       % default false: drop unit 0 (unsorted) + 255 (noise)
                                % spikes; set true to keep them
 %AnalogIdentifier    = '*.ns2'; %default ns2
-%SpikePrefix         = 'HUB';   % default HUB-*.nev: online spike timing
+SpikePrefix         = 'HUB';   % default HUB-*.nev: online spike timing
 
 % Trial-segmentation buffers (ms). Window per trial = [Start - Pre, End + Post].
 % Defaults are 500 ms; edit here to change how much is kept around each trial.
@@ -127,7 +127,8 @@ for fi = 1:numel(FolderList)
     rawComments = BlackrockLoader.commentsWithTime(loader.Loaded.Events, loader.Loaded.EventTime);
 
     disp(rawComments);              % print to the command window, or
-    openvar('rawComments');        % open in the Variables editor to scroll/filter
+    %openvar('rawComments');        % open in the Variables editor to scroll/filter
+    keyboard
     %}
 
     % --- Run the whole pipeline for this folder ---
