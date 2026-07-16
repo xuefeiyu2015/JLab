@@ -86,18 +86,27 @@ Loading, parsing, and exporting are handled by the **`BlackrockLoader`** class.
 It is a stateful (handle) config-property class: its config properties hold the
 file schema, the load flags, the parsing schema (templates + event maps), and
 the segmentation buffers (`Segment_PreBuffer` / `Segment_PostBuffer` /
-`Segment_BinWidth`). Construct it once with name/value overrides, then run the
-whole pipeline per date folder with the orchestrator:
+`Segment_BinWidth`). Construct it once with name/value overrides, then drive it
+in whichever of the three ways below fits the task:
 
 ```matlab
 loader = BlackrockLoader('LoadAnalogData', true, ...        % override any property
                          'LoadOnlineSpikeData', true, ...
                          'LoadOnlineSpikeWaveform', false);  % opt-in spike waveforms (default off)
+```
+
+### Three ways to use the loader
+
+**1. Run everything (normal use).** One call does the whole pipeline for a date
+folder and writes the output files:
+
+```matlab
 loader.processFolder(DataFolder, OutputPath, 'Blackrock_2026-06-24');
 ```
 
-`processFolder` runs the six pipeline steps in order — each stores its result in
-a loader property, and every step is individually callable for debugging:
+**2. Step by step (staged pipeline, for debugging).** `processFolder` just runs
+these six methods in order; call them yourself to inspect the loader property
+each one fills before moving on:
 
 ```matlab
 loader.load(DataFolder);   % -> loader.Loaded  (resolves + loads files, resets prior state)
@@ -109,9 +118,78 @@ loader.export(OutputPath, 'Blackrock_2026-06-24');   % writes the .txt/.csv/.mat
 ```
 
 State is cleared at the start of every `load()`, so a single loader can be
-reused across a batch of folders without leaking data between them. The pure
-`loadSession(DataFolder)` (returns the `S` struct) and
-`parseEvents(Events, EventTime)` methods are still available for ad-hoc use.
+reused across a batch of folders without leaking data between them. `load()`
+delegates the actual file reading to the orchestrator `loadSession(DataFolder)`
+(returns the `S` struct), which throws only when comments are missing and wraps
+analog/spike loading in the load-flag gating and soft-failure handling.
+
+**3. Load one data product on its own.** When you only want to look at the
+comments, the analog stream, or the spikes — not run the whole session — call
+the matching **pure** loader. Each opens only the file(s) it needs, returns just
+its own product, and touches no loader state:
+
+```matlab
+C = loader.loadComments(DataFolder);   % -> .Events, .EventTime, .comments_source (required)
+A = loader.loadAnalog(DataFolder);     % -> .nsxdata, .nsx_samplingrate, .nsx_abs_time, .timeresolution, .analog_status
+R = loader.loadSpikes(DataFolder);     % -> .online_spike, .spike_status
+```
+
+These are independent: `loadSpikes` does not need `loadAnalog` to have run
+(it reads its own time resolution from the NEV's clock), and either can be
+called without touching comments. `parseEvents(Events, EventTime)` is likewise
+available for ad-hoc parsing of a comment set you pass in directly.
+
+#### Loading a different analog file (`.ns6`, other prefixes)
+
+`loadAnalog` takes two optional arguments —
+`loadAnalog(DataFolder, postFix, preFix)` — that override which analog file is
+picked **for that call only**, leaving `AnalogIdentifier` / `AnalogPrefix`
+untouched, so a loader being reused across a batch is unaffected:
+
+```matlab
+A = loader.loadAnalog(f);                  % '*.ns2' (AnalogIdentifier), any prefix
+A = loader.loadAnalog(f, '.ns6');          % the .ns6, whatever its prefix
+A = loader.loadAnalog(f, '.ns6', 'NSP');   % the .ns6, NSP only
+A = loader.loadAnalog(f, [], 'Hub1');      % the .ns2, Hub1 only
+```
+
+- `postFix` — file extension. Accepts `'.ns6'`, `'ns6'` or `'*.ns6'`. Omitted or
+  `[]` falls back to `AnalogIdentifier` (`'*.ns2'`).
+- `preFix` — filename prefix. Omitted or `[]` means **no prefix filter**: any
+  file with that extension. This is what lets you reach analog stored under a
+  non-`NSP` prefix (e.g. a `Hub1-*.ns6`), which the schema table below otherwise
+  pins to `NSP`.
+
+Handy for pulling the 30 kHz broadband `.ns6` alongside the 1 kHz `.ns2` when
+checking a signal. Two things to keep in mind:
+
+- `.ns6` is ~30× the samples of a `.ns2` and `openNSx` forces double precision
+  for the µV conversion, so a full session is a large array (~560 MB for ~10 min
+  on 4 channels). Sampling rate is read from the file's own metadata, so
+  downstream timing stays correct.
+- With no prefix, several files may match, and `loadAnalog` then raises the
+  selection dialog rather than guessing.
+
+This applies to standalone calls only. `loadSession` always passes
+`obj.AnalogPrefix`, so the pipeline stays pinned to the schema below.
+
+### Checking the comments to debug parsing
+
+When the task's comment-string format changes, parsed events can silently land
+in `trials.undefined` instead of the expected fields. Load just the comments
+(way 3 above) and pair each raw, **unparsed** comment with its timestamp using
+the static helper `BlackrockLoader.commentsWithTime`, so you can eyeball exactly
+what the recording contains:
+
+```matlab
+C = loader.loadComments(DataFolder);                          % just the comments
+T = BlackrockLoader.commentsWithTime(C.Events, C.EventTime);  % N-row table
+disp(T)   % columns: TimeStampSec, Comment  (in recording order)
+```
+
+Use this to spot a new or renamed comment prefix, then add the matching key in
+`BlackrockLoader.defaultEventMaps()` (and, if it is a new field, in
+`defaultTrialTemplate()` / `defaultExpTemplate()`).
 
 ### Input file schema (role-aware resolution)
 
@@ -132,8 +210,12 @@ product is verified present before use:
   succeeds. The prefixes (`NSP`/`HUB`), the `.ns2` identifier, and the
   `LoadAnalogData` / `LoadOnlineSpikeData` / `LoadOnlineSpikeWaveform` /
   `IncludeUnsorted` flags are all constructor-overridable properties.
+  `loadAnalog` additionally takes per-call prefix/extension overrides — see
+  [Loading a different analog file](#loading-a-different-analog-file-ns6-other-prefixes).
 - **Online spikes** come from `HUB-*.nev` when `LoadOnlineSpikeData` is on:
-  `loadSession` reads each spike's time (s), electrode, and unit. By default
+  `loadSpikes` reads each spike's time (s) — converting timestamps with the
+  NEV's own clock (`MetaTags.TimeRes`, so the times are self-contained rather
+  than borrowed from the analog file) — plus electrode and unit. By default
   unit `0` (unsorted) and unit `255` (noise) spikes are **dropped** after load
   (with their channel/unit/waveform columns), so downstream segmentation only
   sees sorted units; set `IncludeUnsorted` (default off) true to keep them. The
@@ -243,22 +325,8 @@ keyed by position so a reset trial counter starts a new trial rather than
 merging. Derived features (polar target angle/eccentricity,
 `Stimulus_direction`, `Choose_target`, `Choose_leftright`) are added at the end.
 
-### Inspecting the raw comments
-
-When the task's comment-string format changes, parsed events can silently land
-in `trials.undefined` instead of the expected fields. The static helper
-`BlackrockLoader.commentsWithTime` pairs each raw, **unparsed** comment with its
-timestamp so you can eyeball exactly what the recording contains:
-
-```matlab
-S = loader.loadSession(DataFolder);
-T = BlackrockLoader.commentsWithTime(S.Events, S.EventTime);  % N-row table
-disp(T)   % columns: TimeStampSec, Comment  (in recording order)
-```
-
-Use this to spot a new or renamed comment prefix, then add the matching key in
-`BlackrockLoader.defaultEventMaps()` (and, if it is a new field, in
-`defaultTrialTemplate()` / `defaultExpTemplate()`).
+(See **Checking the comments to debug parsing** above for how to eyeball the raw,
+unparsed comment strings when adding or fixing a comment key.)
 
 ### Setting up the data path
 
