@@ -46,7 +46,7 @@ end
 % Per-run inputs: set the basic path once, supply the monkey name, and choose
 % which year-month-date folder(s) to process. The loader auto-detects .nev/.ns2.
 Basic_Path  = '/Users/xuefeiyu/Documents/XuefeiFile/WorkRelated/Data';
-Monkey = 'Betty';        % bare monkey name; folder is "Monkey <name>"
+Monkey = 'test';        % bare monkey name; folder is "Monkey <name>"
 Location = 'in_lab';       % editable constant
 DataType = 'raw_data';     % editable constant
 OutputFolder = 'export_data';   % where parsed data is written
@@ -65,16 +65,16 @@ ExportPath = fullfile(Basic_Path,MonkeyFolder,Location,OutputFolder);
 %   '2026-06-17'                   a single folder
 %   {'2026-06-17','2026-06-18'}    several folders, loaded in order
 %   {}  (or '')                    every YYYY-MM-DD folder under DataTypePath
-Folder = {'2026-07-14'};
+Folder = {'2026-07-15'};
 FolderList = BlackrockLoader.resolveFolders(Folder, DataTypePath);
 
 %% Load configuration (passed to the loader; exports reuse the buffers)
 % Analog (eye) data lives in NSP-*.ns2; online spikes live in HUB-*.nev. Both
 % are gated here and are soft failures inside loadSession (that product is just
 % skipped, recorded in the returned status string).
-LoadAnalogData      = false;
-LoadOnlineSpikeData = false;  %default is false for online spikes
-LoadOnlineSpikeWaveform   = false;   % default is false: also export per-spike waveforms (uV) to a
+LoadAnalogData      = true;
+LoadOnlineSpikeData = true;  %default is false for online spikes
+LoadOnlineSpikeWaveform   = true;   % default is false: also export per-spike waveforms (uV) to a
                                % separate *_spikes_waveform_matlab.mat (needs online spikes; memory heavy)
 %IncludeUnsorted = false;       % default false: drop unit 0 (unsorted) + 255 (noise)
                                % spikes; set true to keep them
@@ -138,6 +138,23 @@ for fi = 1:numel(FolderList)
     % Spike/SpikeWaveformData/Export) if you want to inspect it afterwards.
     loader.processFolder(DataFolder, OutputPath, BaseName);
 
+    %--- If you want to check raw files one by one-- 
+    %{
+    C = loader.loadComments(DataFolder); %loaded raw comments
+    A = loader.loadAnalog(DataFolder); %loaded raw analog channels
+    S = loader.loadSpikes(DataFolder);%load raw online spikes
+    %}
+
+    %---If you want to run the whole process step by step--
+    %{
+    loader.load(DataFolder);
+    loader.parseEvents();
+    loader.parseAnalog();
+    loader.parseSpikes();
+    loader.prepareExport();
+    loader.export(OutputPath, BaseName);
+    %}
+    
     results(end+1) = struct('folder', CurrentFolder, 'status', 'ok', 'message', '');
 
   catch ME

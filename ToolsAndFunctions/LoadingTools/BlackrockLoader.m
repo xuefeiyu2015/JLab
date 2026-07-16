@@ -111,10 +111,13 @@ classdef BlackrockLoader < handle
         end
 
         function S = loadSession(obj, DataFolder)
-        % Schema-checked, role-aware load of one date folder's Blackrock files.
-        % Throws ONLY when comments cannot be obtained (so the caller's
-        % per-folder try/catch fails just that folder). Spike/analog problems are
-        % recorded in the returned status strings and that product is skipped.
+        % Orchestrator: assemble one date folder's Blackrock products into the
+        % session struct S by delegating to loadComments / loadAnalog /
+        % loadSpikes. Throws ONLY when comments cannot be obtained (loadComments
+        % throws uncaught, so the caller's per-folder try/catch fails just that
+        % folder). Analog/spikes are gated by the load flags and fail soft:
+        % their throws are caught here, recorded in a status string, and that
+        % product is skipped.
 
             % defaults so every field exists on return
             S.Events           = [];
@@ -132,68 +135,22 @@ classdef BlackrockLoader < handle
             S.IncludeUnsorted           = obj.IncludeUnsorted;
             S.timeresolution = [];
 
-            % --- classify the .nev files by role prefix (strict: must be NSP/HUB) ---
-            nev_all = dir(fullfile(DataFolder, '*.nev'));
-            nsp_nev = BlackrockLoader.pickByPrefix(nev_all, obj.CommentPrefix_primary);  % '' if none
-            hub_nev = BlackrockLoader.pickByPrefix(nev_all, obj.CommentPrefix_legacy);   % '' if none
-
-            % --- Comments + comment timing (required): NSP first, then HUB (legacy) ---
-            hub_data = [];   % reused for spike loading if opened here
-            if ~isempty(nsp_nev)
-                nsp_data = openNEV(fullfile(DataFolder, nsp_nev), 'report', 'nosave');
-                if BlackrockLoader.hasComments(nsp_data)
-                    S.Events          = nsp_data.Data.Comments.Text;
-                    S.EventTime       = nsp_data.Data.Comments.TimeStampSec;
-                    S.comments_source = nsp_nev;
-                end
-            end
-            if isempty(S.comments_source) && ~isempty(hub_nev)
-                hub_data = openNEV(fullfile(DataFolder, hub_nev), 'report', 'nosave');
-                if BlackrockLoader.hasComments(hub_data)
-                    S.Events          = hub_data.Data.Comments.Text;
-                    S.EventTime       = hub_data.Data.Comments.TimeStampSec;
-                    S.comments_source = hub_nev;   % legacy: comments live in the HUB file
-                end
-            end
-            if isempty(S.comments_source)
-                error('No comments found in %s-*.nev or %s-*.nev under: %s', ...
-                    obj.CommentPrefix_primary, obj.CommentPrefix_legacy, DataFolder);
-            end
+            % --- Comments + comment timing (required): throws if none found ---
+            C = obj.loadComments(DataFolder);
+            S.Events          = C.Events;
+            S.EventTime       = C.EventTime;
+            S.comments_source = C.comments_source;
 
 
             % --- Online analog / eye data (gated, soft failure) ---
             if S.LoadAnalogData
                 try
-                    ns_list = BlackrockLoader.filterByPrefix( ...
-                        dir(fullfile(DataFolder, obj.AnalogIdentifier)), obj.AnalogPrefix);
-                    if isempty(ns_list)
-                        error('No %s %s analog file found.', obj.AnalogPrefix, obj.AnalogIdentifier);
-                    end
-                    ns_names = {ns_list.name};
-                    if numel(ns_names) > 1
-                        [sel, ok] = listdlg('PromptString', 'Select eye (.ns2) file to load (Cancel = skip):', ...
-                            'SelectionMode', 'single', 'ListString', ns_names, 'ListSize', [400 200]);
-                        if ~ok
-                            S.LoadAnalogData = false;
-                            S.analog_status = 'skipped by user';
-                            return
-                        end
-                        Filename_ns = ns_names{sel};
-                    else
-                        Filename_ns = ns_names{1};
-                    end
-
-                    tmp_ana_data = openNSx(fullfile(DataFolder, Filename_ns), 'read', 'report', 'uv');
-                    S.nsxdata          = tmp_ana_data.Data;                       % in uV
-                    nsx_starttime      = tmp_ana_data.MetaTags.Timestamp;
-                    nsx_timeresolution = tmp_ana_data.MetaTags.TimeRes;
-                    S.nsx_samplingrate = tmp_ana_data.MetaTags.SamplingFreq;
-                    nsx_starttimeSec   = nsx_starttime / nsx_timeresolution;
-                    N = length(S.nsxdata);
-                    nsx_rel_time       = (0:N-1) / S.nsx_samplingrate;            % from start time
-                    S.nsx_abs_time     = nsx_starttimeSec + nsx_rel_time;
-                    S.analog_status    = sprintf('ok (%s)', Filename_ns);
-                    S.timeresolution   = nsx_timeresolution;
+                    A = obj.loadAnalog(DataFolder);
+                    S.nsxdata          = A.nsxdata;
+                    S.nsx_samplingrate = A.nsx_samplingrate;
+                    S.nsx_abs_time     = A.nsx_abs_time;
+                    S.timeresolution   = A.timeresolution;
+                    S.analog_status    = A.analog_status;
                 catch ME_ana
                     S.LoadAnalogData = false;
                     S.analog_status = ['failed: ' ME_ana.message];
@@ -210,79 +167,176 @@ classdef BlackrockLoader < handle
              % --- Online spike timing (gated, soft failure) ---
             if S.LoadOnlineSpikeData
                 try
-                    if isempty(hub_nev)
-                        error('No %s-*.nev file for online spikes.', obj.SpikePrefix);
-                    end
-                    if isempty(hub_data)
-                        hub_data = openNEV(fullfile(DataFolder, hub_nev), 'report', 'nosave');
-                    end
-                    if ~BlackrockLoader.hasSpikes(hub_data)
-                        error('No spike timestamps in %s', hub_nev);
-                    end
-                        % Load and trasform spiketime into seconds. TimeStamp is
-                        % uint64; cast to double FIRST, otherwise the divide stays
-                        % integer-typed and rounds spike times to whole seconds.
-                    if isfield(S,'timeresolution') && S.timeresolution >0
-                        spikeTimeSec = double(hub_data.Data.Spikes.TimeStamp)/S.timeresolution;
-                    else
-                        disp('Use empircle time resolution: 10^9')
-                        spikeTimeSec = double(hub_data.Data.Spikes.TimeStamp)/10^9;
-
-                    end
-                    % keep channel identity for per-trial rasterization
-                    spikeChannel  = hub_data.Data.Spikes.Electrode;
-                    spikeUnit     = hub_data.Data.Spikes.Unit;
-                    spikeWaveform = [];   % stays empty unless waveforms are requested
-
-                    % Optional per-spike waveforms (opt-in via LoadOnlineSpikeWaveform),
-                    % converted to uV. openNEV returns Waveform as [nSamp x nSpikes]
-                    % int16 with columns aligned 1:1 to TimeStamp/Electrode/Unit. We
-                    % scale here (rather than passing 'uv' to openNEV) so the
-                    % conversion is independent of how hub_data was opened -- it may
-                    % already have been loaded raw for the legacy comment fallback.
-                    % This mirrors openNEV's 'uv' path exactly:
-                    % wf_uV = raw .* DigitalFactor(electrode) / 1000.
-                    if obj.LoadOnlineSpikeWaveform && isfield(hub_data.Data.Spikes, 'Waveform') ...
-                            && ~isempty(hub_data.Data.Spikes.Waveform)
-                        rawWf   = double(hub_data.Data.Spikes.Waveform);            % [nSamp x nSpikes]
-                        elecIdx = double(hub_data.Data.Spikes.Electrode);
-                        digi    = double([hub_data.ElectrodesInfo(elecIdx).DigitalFactor]); % 1 x nSpikes
-                        spikeWaveform = bsxfun(@times, rawWf, digi/1000);          % uV
-                    end
-
-                    % Drop unsorted (unit 0) and noise (unit 255) spikes unless opted in.
-                    % time/channel/unit are 1 x nSpikes; waveform is nSamp x nSpikes
-                    % with columns aligned 1:1 -- filter all together so they stay aligned.
-                    if ~obj.IncludeUnsorted
-                        keep = ~ismember(double(spikeUnit), [0 255]);
-                        nDropped = sum(~keep);
-                        spikeTimeSec = spikeTimeSec(keep);
-                        spikeChannel = spikeChannel(keep);
-                        spikeUnit    = spikeUnit(keep);
-                        if ~isempty(spikeWaveform)
-                            spikeWaveform = spikeWaveform(:, keep);
-                        end
-                        S.spike_status = sprintf('ok (%s; dropped %d unsorted/noise spikes)', hub_nev, nDropped);
-                    else
-                        S.spike_status = sprintf('ok (%s)', hub_nev);
-                    end
-
-                    % Pack into the generic, source-agnostic container that
-                    % parseSpikes/segmentSpikes then rasterize per trial.
-                    S.online_spike.TimeSec  = spikeTimeSec;
-                    S.online_spike.Channel  = spikeChannel;
-                    S.online_spike.Unit     = spikeUnit;
-                    S.online_spike.Waveform = spikeWaveform;
-                    if ~isempty(spikeWaveform)
-                        S.online_spike.WaveformUnit = 'microVolts';
-                    end
-                    S.online_spike.source = 'online';
+                    R = obj.loadSpikes(DataFolder);
+                    S.online_spike = R.online_spike;
+                    S.spike_status = R.spike_status;
                 catch ME_spk
                     S.LoadOnlineSpikeData = false;
                     S.spike_status = ['failed: ' ME_spk.message];
                     warning('%s', ['Spike loading ' S.spike_status]);
                 end
             end
+        end
+
+        function C = loadComments(obj, DataFolder)
+        % Load comment strings + their timing from one date folder (required
+        % product). Resolves the .nev by role prefix: NSP primary, then HUB
+        % (legacy recordings kept comments in the HUB file). Returns a struct
+        % with .Events, .EventTime, .comments_source. Throws if neither file
+        % carries comments -- comments are mandatory for downstream parsing.
+        % Pure: opens only the .nev it needs, touches no session state.
+            C.Events          = [];
+            C.EventTime       = [];
+            C.comments_source = '';
+
+            nev_all = dir(fullfile(DataFolder, '*.nev'));
+            nsp_nev = BlackrockLoader.pickByPrefix(nev_all, obj.CommentPrefix_primary);  % '' if none
+            hub_nev = BlackrockLoader.pickByPrefix(nev_all, obj.CommentPrefix_legacy);   % '' if none
+
+            if ~isempty(nsp_nev)
+                nsp_data = openNEV(fullfile(DataFolder, nsp_nev), 'report', 'nosave');
+                if BlackrockLoader.hasComments(nsp_data)
+                    C.Events          = nsp_data.Data.Comments.Text;
+                    C.EventTime       = nsp_data.Data.Comments.TimeStampSec;
+                    C.comments_source = nsp_nev;
+                end
+            end
+            if isempty(C.comments_source) && ~isempty(hub_nev)
+                hub_data = openNEV(fullfile(DataFolder, hub_nev), 'report', 'nosave');
+                if BlackrockLoader.hasComments(hub_data)
+                    C.Events          = hub_data.Data.Comments.Text;
+                    C.EventTime       = hub_data.Data.Comments.TimeStampSec;
+                    C.comments_source = hub_nev;   % legacy: comments live in the HUB file
+                end
+            end
+            if isempty(C.comments_source)
+                error('No comments found in %s-*.nev or %s-*.nev under: %s', ...
+                    obj.CommentPrefix_primary, obj.CommentPrefix_legacy, DataFolder);
+            end
+        end
+
+        function A = loadAnalog(obj, DataFolder)
+        % Load analog / eye (.ns2) data for one date folder. Returns a struct
+        % with .nsxdata (uV), .nsx_samplingrate, .nsx_abs_time, .timeresolution,
+        % and .analog_status. Throws if no matching analog file is present or if
+        % the user cancels the multi-file selection dialog; the orchestrator
+        % (loadSession) turns such throws into a soft status string.
+        % Pure: opens only the .ns2 it needs, touches no session state.
+            A.nsxdata          = [];
+            A.nsx_samplingrate = [];
+            A.nsx_abs_time     = [];
+            A.timeresolution   = [];
+            A.analog_status    = '';
+
+            ns_list = BlackrockLoader.filterByPrefix( ...
+                dir(fullfile(DataFolder, obj.AnalogIdentifier)), obj.AnalogPrefix);
+            if isempty(ns_list)
+                error('No %s %s analog file found.', obj.AnalogPrefix, obj.AnalogIdentifier);
+            end
+            ns_names = {ns_list.name};
+            if numel(ns_names) > 1
+                [sel, ok] = listdlg('PromptString', 'Select eye (.ns2) file to load (Cancel = skip):', ...
+                    'SelectionMode', 'single', 'ListString', ns_names, 'ListSize', [400 200]);
+                if ~ok
+                    error('Analog file selection cancelled by user.');
+                end
+                Filename_ns = ns_names{sel};
+            else
+                Filename_ns = ns_names{1};
+            end
+
+            tmp_ana_data = openNSx(fullfile(DataFolder, Filename_ns), 'read', 'report', 'uv');
+            A.nsxdata          = tmp_ana_data.Data;                       % in uV
+            nsx_starttime      = tmp_ana_data.MetaTags.Timestamp;
+            nsx_timeresolution = tmp_ana_data.MetaTags.TimeRes;
+            A.nsx_samplingrate = tmp_ana_data.MetaTags.SamplingFreq;
+            nsx_starttimeSec   = nsx_starttime / nsx_timeresolution;
+            N = length(A.nsxdata);
+            nsx_rel_time       = (0:N-1) / A.nsx_samplingrate;            % from start time
+            A.nsx_abs_time     = nsx_starttimeSec + nsx_rel_time;
+            A.timeresolution   = nsx_timeresolution;
+            A.analog_status    = sprintf('ok (%s)', Filename_ns);
+        end
+
+        function R = loadSpikes(obj, DataFolder)
+        % Load online spike timing (+ optional waveforms) for one date folder.
+        % Opens the HUB-*.nev itself and converts timestamps to seconds using the
+        % NEV's OWN clock (MetaTags.TimeRes; falls back to 1e9 if absent), so the
+        % result is independent of whether analog was loaded. Drops unsorted
+        % (unit 0) / noise (unit 255) spikes unless IncludeUnsorted is set.
+        % Returns a struct with .online_spike (the generic spike container) and
+        % .spike_status. Throws if no HUB file or no spike timestamps are present.
+        % Pure: opens only the .nev it needs, touches no session state.
+            R.online_spike = BlackrockLoader.spikeContainer();
+            R.spike_status = '';
+
+            nev_all = dir(fullfile(DataFolder, '*.nev'));
+            hub_nev = BlackrockLoader.pickByPrefix(nev_all, obj.CommentPrefix_legacy);   % '' if none
+            if isempty(hub_nev)
+                error('No %s-*.nev file for online spikes.', obj.SpikePrefix);
+            end
+            hub_data = openNEV(fullfile(DataFolder, hub_nev), 'report', 'nosave');
+            if ~BlackrockLoader.hasSpikes(hub_data)
+                error('No spike timestamps in %s', hub_nev);
+            end
+
+            % Load and transform spiketime into seconds using the NEV's own
+            % timestamp clock. TimeStamp is uint64; cast to double FIRST,
+            % otherwise the divide stays integer-typed and rounds spike times to
+            % whole seconds.
+            if isfield(hub_data.MetaTags, 'TimeRes') && hub_data.MetaTags.TimeRes > 0
+                timeRes = double(hub_data.MetaTags.TimeRes);
+            else
+                disp('Use empircle time resolution: 10^9')
+                timeRes = 10^9;
+            end
+            spikeTimeSec  = double(hub_data.Data.Spikes.TimeStamp)/timeRes;
+            % keep channel identity for per-trial rasterization
+            spikeChannel  = hub_data.Data.Spikes.Electrode;
+            spikeUnit     = hub_data.Data.Spikes.Unit;
+            spikeWaveform = [];   % stays empty unless waveforms are requested
+
+            % Optional per-spike waveforms (opt-in via LoadOnlineSpikeWaveform),
+            % converted to uV. openNEV returns Waveform as [nSamp x nSpikes]
+            % int16 with columns aligned 1:1 to TimeStamp/Electrode/Unit. We scale
+            % here (rather than passing 'uv' to openNEV) so the conversion is
+            % independent of how hub_data was opened. This mirrors openNEV's 'uv'
+            % path exactly: wf_uV = raw .* DigitalFactor(electrode) / 1000.
+            if obj.LoadOnlineSpikeWaveform && isfield(hub_data.Data.Spikes, 'Waveform') ...
+                    && ~isempty(hub_data.Data.Spikes.Waveform)
+                rawWf   = double(hub_data.Data.Spikes.Waveform);            % [nSamp x nSpikes]
+                elecIdx = double(hub_data.Data.Spikes.Electrode);
+                digi    = double([hub_data.ElectrodesInfo(elecIdx).DigitalFactor]); % 1 x nSpikes
+                spikeWaveform = bsxfun(@times, rawWf, digi/1000);          % uV
+            end
+
+            % Drop unsorted (unit 0) and noise (unit 255) spikes unless opted in.
+            % time/channel/unit are 1 x nSpikes; waveform is nSamp x nSpikes
+            % with columns aligned 1:1 -- filter all together so they stay aligned.
+            if ~obj.IncludeUnsorted
+                keep = ~ismember(double(spikeUnit), [0 255]);
+                nDropped = sum(~keep);
+                spikeTimeSec = spikeTimeSec(keep);
+                spikeChannel = spikeChannel(keep);
+                spikeUnit    = spikeUnit(keep);
+                if ~isempty(spikeWaveform)
+                    spikeWaveform = spikeWaveform(:, keep);
+                end
+                R.spike_status = sprintf('ok (%s; dropped %d unsorted/noise spikes)', hub_nev, nDropped);
+            else
+                R.spike_status = sprintf('ok (%s)', hub_nev);
+            end
+
+            % Pack into the generic, source-agnostic container that
+            % parseSpikes/segmentSpikes then rasterize per trial.
+            R.online_spike.TimeSec  = spikeTimeSec;
+            R.online_spike.Channel  = spikeChannel;
+            R.online_spike.Unit     = spikeUnit;
+            R.online_spike.Waveform = spikeWaveform;
+            if ~isempty(spikeWaveform)
+                R.online_spike.WaveformUnit = 'microVolts';
+            end
+            R.online_spike.source = 'online';
         end
 
         
@@ -721,7 +775,7 @@ classdef BlackrockLoader < handle
         end
 
         function R = parseSpikes(obj)
-        % Rasterize the loaded online spikes into obj.Spike and, when
+        % Parse the spikes into trial based structor and rasterize the loaded online spikes into obj.Spike and, when
         % LoadOnlineSpikeWaveform is on, collect per-spike waveforms into
         % obj.SpikeWaveformData. Products that were not loaded stay [].
             obj.Spike = [];
@@ -730,15 +784,16 @@ classdef BlackrockLoader < handle
                 R = obj.Spike;
                 return
             end
-            S = obj.Loaded;
-            if S.LoadOnlineSpikeData
-                obj.Spike = BlackrockLoader.segmentSpikes(obj.Trials, S.SpikeTimeSec, ...
-                    S.SpikeChannel, S.SpikeUnit, ...
+            L = obj.Loaded;
+            S = L.online_spike;   % source-agnostic spikeContainer (TimeSec/Channel/Unit/Waveform)
+            if L.LoadOnlineSpikeData
+                obj.Spike = BlackrockLoader.segmentSpikes(obj.Trials, S.TimeSec, ...
+                    S.Channel, S.Unit, ...
                     obj.Segment_PreBuffer, obj.Segment_PostBuffer, obj.Segment_BinWidth);
             end
-            if S.LoadOnlineSpikeWaveform && ~isempty(S.SpikeWaveform)
+            if L.LoadOnlineSpikeWaveform && ~isempty(S.Waveform)
                 obj.SpikeWaveformData = BlackrockLoader.segmentSpikeWaveforms(obj.Trials, ...
-                    S.SpikeTimeSec, S.SpikeChannel, S.SpikeUnit, S.SpikeWaveform, ...
+                    S.TimeSec, S.Channel, S.Unit, S.Waveform, ...
                     obj.Segment_PreBuffer, obj.Segment_PostBuffer);
             end
             R = obj.Spike;
