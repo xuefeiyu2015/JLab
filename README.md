@@ -139,6 +139,40 @@ These are independent: `loadSpikes` does not need `loadAnalog` to have run
 called without touching comments. `parseEvents(Events, EventTime)` is likewise
 available for ad-hoc parsing of a comment set you pass in directly.
 
+#### Loading a different analog file (`.ns6`, other prefixes)
+
+`loadAnalog` takes two optional arguments —
+`loadAnalog(DataFolder, postFix, preFix)` — that override which analog file is
+picked **for that call only**, leaving `AnalogIdentifier` / `AnalogPrefix`
+untouched, so a loader being reused across a batch is unaffected:
+
+```matlab
+A = loader.loadAnalog(f);                  % '*.ns2' (AnalogIdentifier), any prefix
+A = loader.loadAnalog(f, '.ns6');          % the .ns6, whatever its prefix
+A = loader.loadAnalog(f, '.ns6', 'NSP');   % the .ns6, NSP only
+A = loader.loadAnalog(f, [], 'Hub1');      % the .ns2, Hub1 only
+```
+
+- `postFix` — file extension. Accepts `'.ns6'`, `'ns6'` or `'*.ns6'`. Omitted or
+  `[]` falls back to `AnalogIdentifier` (`'*.ns2'`).
+- `preFix` — filename prefix. Omitted or `[]` means **no prefix filter**: any
+  file with that extension. This is what lets you reach analog stored under a
+  non-`NSP` prefix (e.g. a `Hub1-*.ns6`), which the schema table below otherwise
+  pins to `NSP`.
+
+Handy for pulling the 30 kHz broadband `.ns6` alongside the 1 kHz `.ns2` when
+checking a signal. Two things to keep in mind:
+
+- `.ns6` is ~30× the samples of a `.ns2` and `openNSx` forces double precision
+  for the µV conversion, so a full session is a large array (~560 MB for ~10 min
+  on 4 channels). Sampling rate is read from the file's own metadata, so
+  downstream timing stays correct.
+- With no prefix, several files may match, and `loadAnalog` then raises the
+  selection dialog rather than guessing.
+
+This applies to standalone calls only. `loadSession` always passes
+`obj.AnalogPrefix`, so the pipeline stays pinned to the schema below.
+
 ### Checking the comments to debug parsing
 
 When the task's comment-string format changes, parsed events can silently land
@@ -176,6 +210,8 @@ product is verified present before use:
   succeeds. The prefixes (`NSP`/`HUB`), the `.ns2` identifier, and the
   `LoadAnalogData` / `LoadOnlineSpikeData` / `LoadOnlineSpikeWaveform` /
   `IncludeUnsorted` flags are all constructor-overridable properties.
+  `loadAnalog` additionally takes per-call prefix/extension overrides — see
+  [Loading a different analog file](#loading-a-different-analog-file-ns6-other-prefixes).
 - **Online spikes** come from `HUB-*.nev` when `LoadOnlineSpikeData` is on:
   `loadSpikes` reads each spike's time (s) — converting timestamps with the
   NEV's own clock (`MetaTags.TimeRes`, so the times are self-contained rather

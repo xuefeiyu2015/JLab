@@ -136,12 +136,18 @@ for fi = 1:numel(FolderList)
     % All loading/parsing/preparation/writing lives in the class; each step's
     % result is stored on the loader (loader.Loaded/Trials/Experiment/Analog/
     % Spike/SpikeWaveformData/Export) if you want to inspect it afterwards.
-    loader.processFolder(DataFolder, OutputPath, BaseName);
 
-    %--- If you want to check raw files one by one-- 
+
+    %loader.processFolder(DataFolder, OutputPath, BaseName);
+
+    %--- If you want to check raw files one by one--
+   
     %{
     C = loader.loadComments(DataFolder); %loaded raw comments
-    A = loader.loadAnalog(DataFolder); %loaded raw analog channels
+    A = loader.loadAnalog(DataFolder); %loaded raw analog
+    channels,Optional1, "*.ns2" or "*.ns4","*.ns6",Optional2, preFix:
+    "HUB",'NSP',etc
+    %A = loader.loadAnalog(DataFolder,'*.ns6'); 
     S = loader.loadSpikes(DataFolder);%load raw online spikes
     %}
 

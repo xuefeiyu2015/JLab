@@ -83,6 +83,8 @@ classdef BlackrockLoader < handle
             if isempty(obj.EventMaps);     obj.EventMaps     = BlackrockLoader.defaultEventMaps();      end
         end
 
+
+
         function processFolder(obj, DataFolder, OutputPath, BaseName)
         % Run the whole pipeline for one date folder:
         %   load -> parseEvents -> parseAnalog -> parseSpikes -> prepareExport -> export
@@ -109,6 +111,7 @@ classdef BlackrockLoader < handle
             fprintf('  Spikes:   %s\n', S.spike_status);
             fprintf('-----------------------------\n');
         end
+        
 
         function S = loadSession(obj, DataFolder)
         % Orchestrator: assemble one date folder's Blackrock products into the
@@ -145,7 +148,9 @@ classdef BlackrockLoader < handle
             % --- Online analog / eye data (gated, soft failure) ---
             if S.LoadAnalogData
                 try
-                    A = obj.loadAnalog(DataFolder);
+                    % [] keeps obj.AnalogIdentifier; the prefix must be passed
+                    % explicitly since loadAnalog defaults to match-any.
+                    A = obj.loadAnalog(DataFolder, [], obj.AnalogPrefix);
                     S.nsxdata          = A.nsxdata;
                     S.nsx_samplingrate = A.nsx_samplingrate;
                     S.nsx_abs_time     = A.nsx_abs_time;
@@ -178,7 +183,7 @@ classdef BlackrockLoader < handle
             end
         end
 
-        function C = loadComments(obj, DataFolder)
+          function C = loadComments(obj, DataFolder)
         % Load comment strings + their timing from one date folder (required
         % product). Resolves the .nev by role prefix: NSP primary, then HUB
         % (legacy recordings kept comments in the HUB file). Returns a struct
@@ -215,27 +220,63 @@ classdef BlackrockLoader < handle
             end
         end
 
-        function A = loadAnalog(obj, DataFolder)
-        % Load analog / eye (.ns2) data for one date folder. Returns a struct
-        % with .nsxdata (uV), .nsx_samplingrate, .nsx_abs_time, .timeresolution,
-        % and .analog_status. Throws if no matching analog file is present or if
-        % the user cancels the multi-file selection dialog; the orchestrator
+        function A = loadAnalog(obj, DataFolder, postFix, preFix)
+        % Load analog / eye data for one date folder. Returns a struct with
+        % .nsxdata (uV), .nsx_samplingrate, .nsx_abs_time, .timeresolution, and
+        % .analog_status. Throws if no matching analog file is present or if the
+        % user cancels the multi-file selection dialog; the orchestrator
         % (loadSession) turns such throws into a soft status string.
-        % Pure: opens only the .ns2 it needs, touches no session state.
+        % Pure: opens only the .nsx it needs, touches no session state.
+        %
+        % Both overrides apply to this call only and leave the config properties
+        % untouched:
+        %   postFix -- file extension. Accepts '.ns6', 'ns6' or '*.ns6'.
+        %              Omitted/empty -> obj.AnalogIdentifier ('*.ns2').
+        %              Note .ns6 is 30 kHz broadband, ~30x the samples of a .ns2.
+        %   preFix  -- filename prefix, e.g. 'NSP' or 'Hub1'. Omitted/empty ->
+        %              no prefix filter, i.e. any file with that extension
+        %              (several matches raise the selection dialog).
+        %              loadSession always passes obj.AnalogPrefix, so the
+        %              pipeline stays prefix-pinned.
+        %
+        %   loadAnalog(f)                  % '*.ns2', any prefix
+        %   loadAnalog(f, '.ns6')          % '*.ns6', any prefix
+        %   loadAnalog(f, '.ns6', 'NSP')   % '*.ns6', NSP only
+        %   loadAnalog(f, [], 'Hub1')      % '*.ns2', Hub1 only
+            if nargin < 3 || isempty(postFix)
+                ident = obj.AnalogIdentifier;
+            else
+                ident = postFix;
+                if ~startsWith(ident, '*')
+                    if ~startsWith(ident, '.'); ident = ['.' ident]; end
+                    ident = ['*' ident];
+                end
+            end
+            if nargin < 4 || isempty(preFix)
+                preFix = '';
+            end
+
             A.nsxdata          = [];
             A.nsx_samplingrate = [];
             A.nsx_abs_time     = [];
             A.timeresolution   = [];
             A.analog_status    = '';
 
-            ns_list = BlackrockLoader.filterByPrefix( ...
-                dir(fullfile(DataFolder, obj.AnalogIdentifier)), obj.AnalogPrefix);
+            % No prefix -> take every match; filterByPrefix cannot express
+            % match-any (its '^' regex returns a zero-length match, which reads
+            % as "no match" and would drop everything).
+            ns_list = dir(fullfile(DataFolder, ident));
+            if ~isempty(preFix)
+                ns_list = BlackrockLoader.filterByPrefix(ns_list, preFix);
+            end
             if isempty(ns_list)
-                error('No %s %s analog file found.', obj.AnalogPrefix, obj.AnalogIdentifier);
+                if isempty(preFix); prefix_desc = 'any-prefix'; else; prefix_desc = preFix; end
+                error('No %s %s analog file found.', prefix_desc, ident);
             end
             ns_names = {ns_list.name};
             if numel(ns_names) > 1
-                [sel, ok] = listdlg('PromptString', 'Select eye (.ns2) file to load (Cancel = skip):', ...
+                [sel, ok] = listdlg('PromptString', ...
+                    sprintf('Select eye (%s) file to load (Cancel = skip):', ident), ...
                     'SelectionMode', 'single', 'ListString', ns_names, 'ListSize', [400 200]);
                 if ~ok
                     error('Analog file selection cancelled by user.');
@@ -339,7 +380,6 @@ classdef BlackrockLoader < handle
             R.online_spike.source = 'online';
         end
 
-        
 
         function [trials, experiment] = parseEvents(obj, Events, EventTime)
         % Single pass over the .nev comment strings, building one experiment
