@@ -27,11 +27,11 @@ addpath(genpath(fullfile(JLabRoot, 'ToolsAndFunctions')));
 % expected at: main_path/monkey/task_type/folder/data_date/Blackrock_*.mat
 
 Basic_Path  = '/Users/xuefeiyu/Documents/XuefeiFile/WorkRelated/Data';
-Monkey = 'test';        % bare monkey name; folder is "Monkey <name>"
+Monkey = 'Porthos';        % bare monkey name; folder is "Monkey <name>"
 Location = 'in_lab';       % editable constant
 DataType = 'export_data';     % editable constant
 
-Folder = '2026-07-15';
+Folder = '2026-06-18';
 
 %Check all the exported files in the folder
 
@@ -40,10 +40,10 @@ all_files = dir(main_path);
 all_files = {all_files(~[all_files.isdir]).name};
 
 %Search for comments file
-comments_path = findExportFile(all_files, main_path, 'trials');
+comments_path = findExportFile(all_files, main_path, 'trials_matlab');
 
 %Search for the Eye data/analog file
-analog_path   = findExportFile(all_files, main_path, 'analog');
+analog_path   = findExportFile(all_files, main_path, 'analog_matlab');
 
 %Search for online spike file. 'spikes' alone would also catch the waveform
 %file, so it has to be excluded explicitly.
@@ -60,7 +60,7 @@ if ~isempty(comments_path)
     FileValid(1) = 1; 
 else
     disp('No parsed trials data found, please parse the data using the loader first')
-
+    comments_data = [];
 end
 
 if ~isempty(analog_path)
@@ -77,11 +77,13 @@ if ~isempty(analog_path)
     if caled_eyes.cal.applied == false
         disp('Eye calibration failed!');
         FileValid(2) = 0; 
+        eye_data = [];
     end
 
 
 else
     disp('No parsed eye data found');
+    eye_data = [];
 end
 
 if ~isempty(spike_path)
@@ -90,6 +92,7 @@ if ~isempty(spike_path)
     FileValid(3) = 1; 
 else
     disp('No spike data found');
+    spike_data = [];
 end
 
 if ~isempty(waveform_path)
@@ -97,6 +100,7 @@ if ~isempty(waveform_path)
     spikewaveform_data = tmp.online_spike_waveform;
 else
     disp('No spike waveform found');
+    spikewaveform_data = [];
 end
 
 

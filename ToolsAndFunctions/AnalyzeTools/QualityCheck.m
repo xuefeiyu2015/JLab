@@ -15,7 +15,8 @@ function quality = QualityCheck(data, FileValid)
 %   quality    - struct of what was checked and the numbers behind each panel:
 %                  .behavior.tasks         - per-task trial counts / success rate
 %                  .behavior.hitRate       - per saccade type, hit rate by target
-%                  .behavior.psychometric  - PSE / threshold, first vs last half
+%                  .behavior.psychometric  - per choice task, PSE / threshold,
+%                                            first vs last half
 %                  .pass                   - true when every check that ran passed
 %
 % Xuefei Yu Jul 16, 2026
@@ -35,7 +36,11 @@ function B = behaviorCheck(cd)
 % All behavior panels on one figure:
 %   row 1 : running success rate over the whole recording   (1)
 %   row 2 : target hit-rate maps          | psychometric    (2) | (4)
-%   row 3 : saccade trials per condition  | delay conditions (3) | (5)
+%   row 3 : saccade trials per condition  | choice conditions (3) | (5)
+%
+% The left column subdivides per saccade task, the right column per choice task,
+% so a session running several of either gets a panel each rather than one panel
+% silently covering only the first.
 
     TRIAL_BIN  = 20;    % trials per accuracy window
     TRIAL_STEP = 5;     % step between windows
@@ -55,13 +60,13 @@ function B = behaviorCheck(cd)
     B.hitRate = plotHitRateMaps(tl, 3, cd);
 
     % (4) psychometric, second row right -----------------------------------
-    B.psychometric = plotPsychometric(nexttile(tl, 4), cd);
+    B.psychometric = plotPsychometric(tl, 4, cd);
 
     % (3) saccade conditions, third row left --------------------------------
     plotSaccadeConditions(tl, 5, cd);
 
-    % (5) delay conditions, third row right ---------------------------------
-    plotDelayConditions(nexttile(tl, 6), cd);
+    % (5) choice conditions, third row right ---------------------------------
+    plotChoiceConditions(tl, 6, cd);
 
     title(tl, 'Behavior quality check', 'FontWeight', 'bold');
 end
@@ -164,9 +169,7 @@ function H = plotHitRateMaps(tl, tile, cd)
     grps  = saccadeGroups(cd);
 
     if isempty(grps)
-        ax = nexttile(tl, tile);
-        text(ax, 0.5, 0.5, 'No saccade task', 'HorizontalAlignment', 'center');
-        axis(ax, 'off');
+        blankPanel(nexttile(tl, tile), 'No saccade task');
         return
     end
 
@@ -181,6 +184,17 @@ function H = plotHitRateMaps(tl, tile, cd)
         ok      = all(~isnan(loc), 2);
         loc     = loc(ok, :);
         success = strcmp(cd.Trialoutcome(rows(ok)), 'correct');%In saccade task, there is no wrong trials
+
+        % A saccade group is picked by task name alone, so its trials may carry no
+        % recorded target position at all. There is no map to draw then, and the
+        % axis limits below would come out empty. Report it and keep going: the
+        % rest of this session's panels are still worth having.
+        if isempty(loc)
+            H(end+1) = struct('type', grps(g).name, 'xy', zeros(0,2), ...
+                              'hitRate', zeros(0,1), 'n', zeros(0,1));  %#ok<AGROW>
+            blankPanel(ax, '%s:\nno target positions', grps(g).name);
+            continue
+        end
 
         [xy, ~, id] = unique(loc, 'rows');
         nTrial  = accumarray(id, 1);
@@ -243,29 +257,114 @@ function grps = saccadeGroups(cd)
     % than being dropped for not matching the two known kinds.
     for t = unique(cd.Task(is_sacc & ~known), 'stable')'
         grps(end+1) = struct('name', strrep(t{1}, '_', ' '), ...
-            'rows', find(strcmp(cd.Task, t{1})));  
+            'rows', find(strcmp(cd.Task, t{1})));
     end
 end
 
 
-% =========================================================================
-% (4) Psychometric function, first vs last half
-% =========================================================================
-function P = plotPsychometric(ax, cd)
-% Time-delay psychometric, fitted separately on the first and last half of the
-% task's trials so a shift in bias or threshold across the session shows up.
+function grps = choiceGroups(cd)
+% The choice tasks present in this session, one entry each.
+%
+% This is the only place in the file that knows a task by name. Everything it
+% returns is what the psychometric and condition panels need in order to plot
+% without knowing which task they are drawing: which column holds the stimulus
+% strength, and what to call that axis. A new choice task is a row of spec and
+% nothing else.
 
-    P    = struct('half', {}, 'pse', {}, 'threshold', {}, 'n', {}, 'separable', {});
-    rows = find(contains(cd.Task, 'time_delay') & cd.Save_complete == 1 & ...
-                ~isnan(cd.Choose_leftright) & ~isnan(cd.Requested_target_2_time_offset));
+    spec = { % name                    match         stimulus column
+             % xlabel                          xlabel signed
+             'Time delay',            'time_delay', 'Requested_target_2_time_offset', ...
+             'Target asynchrony (ms)',        'Signed target asynchrony (ms)'
+             'Motion discrimination', 'motion',     'Requested_motion_coherence', ...
+             'Motion coherence (%)',          'Signed motion coherence (%)' };
 
-    if numel(rows) < 8
-        text(ax, 0.5, 0.5, 'No time delay task', 'HorizontalAlignment', 'center');
-        axis(ax, 'off');
+    grps = struct('name', {}, 'rows', {}, 'stim', {}, 'xlabel', {}, ...
+                  'xlabel_signed', {}, 'missing', {});
+
+    for s = 1:size(spec, 1)
+        [name, match, stim, xlab, xlab_signed] = deal(spec{s,:});
+
+        is_task = contains(cd.Task, match);
+        if ~any(is_task);  continue;  end
+
+        % The stimulus column can be absent: a task's trials reach the exported
+        % table before the loader learns to record its stimulus. Say so on the
+        % panel rather than erroring out of the whole quality check.
+        if ~ismember(stim, cd.Properties.VariableNames)
+            grps(end+1) = struct('name', name, 'rows', [], 'stim', stim, ...
+                'xlabel', xlab, 'xlabel_signed', xlab_signed, 'missing', true);  %#ok<AGROW>
+            continue
+        end
+
+        % Only trials that were saved whole and reached a choice: the rest carry
+        % no stimulus-response pair to fit or count.
+        rows = find(is_task & cd.Save_complete == 1 & ...
+                    ~isnan(cd.Choose_leftright) & ~isnan(cd.(stim)));
+
+        grps(end+1) = struct('name', name, 'rows', rows, 'stim', stim, ...
+            'xlabel', xlab, 'xlabel_signed', xlab_signed, 'missing', false);  %#ok<AGROW>
+    end
+
+    % No fallback for unrecognised choice tasks, unlike saccadeGroups: without a
+    % spec row we have no stimulus column, and there is nothing to plot against.
+end
+
+
+% =========================================================================
+% (4) Psychometric function, first vs last half, per choice task
+% =========================================================================
+function P = plotPsychometric(tl, tile, cd)
+% One psychometric per choice task, side by side.
+
+    P    = struct('task', {}, 'half', {}, 'pse', {}, 'threshold', {}, ...
+                  'n', {}, 'separable', {});
+    grps = choiceGroups(cd);
+
+    if isempty(grps)
+        blankPanel(nexttile(tl, tile), 'No choice task');
         return
     end
 
-    half   = {rows(1:floor(end/2)), rows(floor(end/2)+1:end)};
+    inner = tiledlayout(tl, 1, numel(grps), 'TileSpacing', 'compact', 'Padding', 'none');
+    inner.Layout.Tile = tile;
+
+    for g = 1:numel(grps)
+        ax = nexttile(inner);
+        if emptyPanel(ax, grps(g));  continue;  end
+
+        r = grps(g).rows;
+        Pg = psychometricPanel(ax, cd.(grps(g).stim)(r), cd.Stimulus_direction(r), ...
+                               cd.Choose_leftright(r), grps(g).name, grps(g).xlabel);
+        P = [P, Pg];  %#ok<AGROW>
+    end
+end
+
+
+function P = psychometricPanel(ax, stim, stim_dir, choice, name, xlab)
+% Psychometric fitted separately on the first and last half of the trials, so a
+% shift in bias or threshold across the session shows up.
+%
+% Task-blind: it plots against whatever stimulus it is handed. Pass target
+% asynchrony and it is a time-delay psychometric; pass coherence and it is a
+% motion psychometric. Nothing below names a task or a column.
+%
+%   stim     - stimulus strength per trial (asynchrony in ms, coherence, ...)
+%   stim_dir - +1 / -1 stimulus direction per trial
+%   choice   - chosen side per trial (+1 = right)
+%   name     - display name, for the title and the returned struct
+%   xlab     - what to call the stimulus axis
+
+    P     = struct('task', {}, 'half', {}, 'pse', {}, 'threshold', {}, ...
+                   'n', {}, 'separable', {});
+    nTot  = numel(stim);
+
+    if nTot < 8
+        blankPanel(ax, '%s:\ntoo few trials', name);
+        return
+    end
+
+    idx    = (1:nTot).';
+    half   = {idx(1:floor(end/2)), idx(floor(end/2)+1:end)};
     names  = {'First half', 'Last half'};
     cols   = [0 0.45 0.74; 0.85 0.33 0.10];
 
@@ -273,9 +372,7 @@ function P = plotPsychometric(ax, cd)
     h = gobjects(0);  lbl = {};
     for k = 1:2
         r      = half{k};
-        psymat = [cd.Requested_target_2_time_offset(r), ...
-                  cd.Stimulus_direction(r), ...
-                  double(cd.Choose_leftright(r) == 1)];
+        psymat = [stim(r), stim_dir(r), double(choice(r) == 1)];
 
         % Fit only. psy carries the points and the fitted curve, so both halves
         % land on this one axes instead of each opening its own figure, and
@@ -287,12 +384,12 @@ function P = plotPsychometric(ax, cd)
         [pse, threshold, psy] = VisPsychometricFunction(psymat, 0);
         warning(ws);  warning(wp);
 
-        P(end+1) = struct('half', names{k}, 'pse', pse, 'threshold', threshold, ...
-                          'n', numel(r), 'separable', psy.separable);  
+        P(end+1) = struct('task', name, 'half', names{k}, 'pse', pse, ...
+            'threshold', threshold, 'n', numel(r), 'separable', psy.separable);  %#ok<AGROW>
 
         plot(ax, psy.stim_levels, psy.pRight, '.', 'Color', cols(k,:), 'MarkerSize', 16);
         h(end+1) = plot(ax, psy.fit_x, psy.fit_y, '-', ...
-            'Color', cols(k,:), 'LineWidth', 2);  
+            'Color', cols(k,:), 'LineWidth', 2);  %#ok<AGROW>
 
         % Two rows per half: on one line the entry runs wider than the panel.
         if psy.separable
@@ -307,12 +404,26 @@ function P = plotPsychometric(ax, cd)
     plot(ax, xlim(ax), [0.5 0.5], '--k');
     plot(ax, [0 0], [0 1], '--k');
     ylim(ax, [0 1]);  yticks(ax, [0 0.5 1]);
-    xlabel(ax, 'Target asynchrony (ms)');
+    xlabel(ax, xlab);
     ylabel(ax, 'P(rightward)');
-    title(ax, 'Time delay psychometric');
+    title(ax, sprintf('%s psychometric', name));
     legend(ax, h, lbl, 'Location', 'northwest', 'FontSize', 8);
     set(ax, 'LineWidth', 1, 'FontSize', 11);
     box(ax, 'off');
+end
+
+
+function is_empty = emptyPanel(ax, grp)
+% The two reasons a choice group has nothing to draw, reported on its own tile so
+% the panel says which task went missing and why.
+    is_empty = true;
+    if grp.missing
+        blankPanel(ax, '%s:\n%s column missing', grp.name, strrep(grp.stim, '_', ' '));
+    elseif isempty(grp.rows)
+        blankPanel(ax, '%s:\nno completed choice trials', grp.name);
+    else
+        is_empty = false;
+    end
 end
 
 
@@ -327,9 +438,7 @@ function plotSaccadeConditions(tl, tile, cd)
 
     grps = saccadeGroups(cd);
     if isempty(grps)
-        ax = nexttile(tl, tile);
-        text(ax, 0.5, 0.5, 'No saccade task', 'HorizontalAlignment', 'center');
-        axis(ax, 'off');
+        blankPanel(nexttile(tl, tile), 'No saccade task');
         return
     end
 
@@ -343,7 +452,13 @@ function plotSaccadeConditions(tl, tile, cd)
                 'rows', r(ecc == e), 'ecc', e);  %#ok<AGROW>
         end
     end
-    if isempty(rowspec);  return;  end
+    % Same story as the hit-rate maps: saccade trials with no recorded eccentricity
+    % leave nothing to lay out. Claim the tile and say so, rather than returning
+    % and leaving an unexplained hole in the figure.
+    if isempty(rowspec)
+        blankPanel(nexttile(tl, tile), 'No saccade conditions');
+        return
+    end
 
     % One angle axis shared by every row: each row builds its own categories
     % otherwise, and the same angle then lands at a different x per row, which
@@ -386,34 +501,61 @@ function plotSaccadeConditions(tl, tile, cd)
 end
 
 
-function plotDelayConditions(ax, cd)
-% Trials per condition for the time-delay task: the looping variables are the
-% requested offset and the stimulus direction, which combine into a signed delay.
+function plotChoiceConditions(tl, tile, cd)
+% Trials per condition for each choice task, side by side.
 
-    rows = find(contains(cd.Task, 'time_delay') & ...
-                ~isnan(cd.Requested_target_2_time_offset) & ~isnan(cd.Stimulus_direction));
-    if isempty(rows)
-        text(ax, 0.5, 0.5, 'No time delay task', 'HorizontalAlignment', 'center');
-        axis(ax, 'off');
+    grps = choiceGroups(cd);
+    if isempty(grps)
+        blankPanel(nexttile(tl, tile), 'No choice task');
         return
     end
 
-    signed      = cd.Requested_target_2_time_offset(rows) .* cd.Stimulus_direction(rows);
+    inner = tiledlayout(tl, 1, numel(grps), 'TileSpacing', 'compact', 'Padding', 'none');
+    inner.Layout.Tile = tile;
+
+    for g = 1:numel(grps)
+        ax = nexttile(inner);
+        if emptyPanel(ax, grps(g));  continue;  end
+
+        r = grps(g).rows;
+        conditionPanel(ax, cd.(grps(g).stim)(r), cd.Stimulus_direction(r), ...
+                       cd.Trialoutcome(r), grps(g).name, grps(g).xlabel_signed);
+    end
+end
+
+
+function conditionPanel(ax, stim, stim_dir, outcome, name, xlab_signed)
+% Trials per condition for a choice task: the looping variables are the stimulus
+% strength and its direction, which combine into one signed stimulus axis.
+%
+% Task-blind, like psychometricPanel: signed asynchrony and signed coherence are
+% the same plot over a different column.
+%
+%   outcome  - Trialoutcome per trial, for the correct/wrong stack
+
+    ok = ~isnan(stim) & ~isnan(stim_dir);
+    if ~any(ok)
+        blankPanel(ax, '%s:\nno conditions', name);
+        return
+    end
+
+    signed      = stim(ok) .* stim_dir(ok);
+    outcome     = outcome(ok);
     [lv, ~, id] = unique(signed);
 
     % Bars are the successful trials only: correct + wrong. Broke and timeout
     % trials never got to a choice, so they say nothing about this condition;
     % their counts are on the success-rate panel above.
-    correct = accumarray(id, strcmp(cd.Trialoutcome(rows), 'correct'));
-    wrong   = accumarray(id, strcmp(cd.Trialoutcome(rows), 'wrong'));
+    correct = accumarray(id, strcmp(outcome, 'correct'));
+    wrong   = accumarray(id, strcmp(outcome, 'wrong'));
 
     col = outcomeColors();
     b = bar(ax, categorical(lv), [correct, wrong], 'stacked');
     b(1).FaceColor = col.correct;
     b(2).FaceColor = col.wrong;
-    xlabel(ax, 'Signed target asynchrony (ms)');
+    xlabel(ax, xlab_signed);
     ylabel(ax, 'Successful trials');
-    title(ax, 'Time delay trials per condition');
+    title(ax, sprintf('%s trials per condition', name));
     legend(ax, {'correct', 'wrong'}, 'Location', 'best', 'FontSize', 8);
     set(ax, 'LineWidth', 1, 'FontSize', 10);
     box(ax, 'off');
@@ -424,4 +566,13 @@ function col = outcomeColors()
 % Colours for the successful-trial categories, shared by both condition panels
 % so a stack means the same thing in each.
     col = struct('correct', [0.2 0.6 0.3], 'wrong', [0.8 0.4 0.4]);
+end
+
+
+function blankPanel(ax, varargin)
+% An axes that says why it has nothing to show, rather than an empty box the
+% reader has to guess at. Takes sprintf arguments.
+    text(ax, 0.5, 0.5, sprintf(varargin{:}), 'HorizontalAlignment', 'center', ...
+        'VerticalAlignment', 'middle');
+    axis(ax, 'off');
 end
