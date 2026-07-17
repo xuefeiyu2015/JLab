@@ -753,6 +753,16 @@ classdef BlackrockLoader < handle
 
             end
 
+            %% Change visual guided saccade (memory type) into memory guided saccade
+            tasks = {trials.Task};
+            trial_type = {trials.Trial_type};
+
+            memory_idx = strcmp(trial_type, 'memory');
+            task_idx = strcmp(tasks, 'visual_saccades_experiment');
+
+            tasks(memory_idx&task_idx) = {'memory_saccades_experiment'};
+            [trials.Task] = deal(tasks{:});
+
             %% Add a few feature for further analysis
             %1. Transform Cartesian into Polar for target postion
             % -180(left) to 180(right)
@@ -882,6 +892,25 @@ classdef BlackrockLoader < handle
                     trials_table.([c '_y']) = trials_table.(c)(:,2);
                     trials_table.(c) = [];
                 end
+            end
+
+            % Text fields start life as NaN in the trial template, so any column
+            % that some trials fill with text is a cell of char and numeric NaN.
+            % writetable prints those NaN as the literal text "NaN", which parses
+            % back as a number: readtable then types the whole column double and
+            % silently drops every text value (Trial_type, Choosen_choice,
+            % Target_1_side, ...). Convert to string with missing so the CSV
+            % carries empty fields, which survive the round trip.
+            for col = trials_table.Properties.VariableNames
+                c = col{1};
+                v = trials_table.(c);
+                if ~iscell(v);  continue;  end
+                is_text = cellfun(@(x) ischar(x) || isstring(x), v);
+                if ~any(is_text);  continue;  end
+                s = strings(numel(v), 1);
+                s(is_text)  = string(v(is_text));
+                s(~is_text) = missing;              % the NaN placeholders
+                trials_table.(c) = s;
             end
 
             obj.Export = struct('trials_table', trials_table, ...
