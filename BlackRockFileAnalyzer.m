@@ -27,11 +27,11 @@ addpath(genpath(fullfile(JLabRoot, 'ToolsAndFunctions')));
 % expected at: main_path/monkey/task_type/folder/data_date/Blackrock_*.mat
 
 Basic_Path  = '/Users/xuefeiyu/Documents/XuefeiFile/WorkRelated/Data';
-Monkey = 'Porthos';        % bare monkey name; folder is "Monkey <name>"
+Monkey = 'test';        % bare monkey name; folder is "Monkey <name>"
 Location = 'in_lab';       % editable constant
 DataType = 'export_data';     % editable constant
 
-Folder = '2026-06-18';
+Folder = '2026-07-15';
 
 %Check all the exported files in the folder
 
@@ -70,7 +70,9 @@ if ~isempty(analog_path)
 
     %Eye calibration 
 
-    task_cal  = 'fixation';
+    % Candidates in priority order: a session with a dedicated fixation block
+    % calibrates off it, otherwise off whichever saccade task it ran.
+    task_cal  = {'fixation', 'visual_saccade', 'memory_saccade'};
     PlotCalibratedEyes = 1;%Optional, for plotting
     caled_eyes = EyeCalibration(comments_data,eye_data,task_cal,[],[], PlotCalibratedEyes); 
 

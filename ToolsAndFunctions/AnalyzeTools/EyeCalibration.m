@@ -13,11 +13,16 @@ function caled_eyes = EyeCalibration(comments_data, eye_data, task_cal, holdWinM
 % it return the calibrated eye signal with the structure the same as
 % eye_data, just with calibrated eye in degree.
 %
-% Two tasks can supply calibration points, one task per call:
+% Two kinds of task can supply calibration points:
 %   fixation task - the fixation hold, gaze at Fixation_position_x/_y.
 %   saccade task  - two epochs per trial: the fixation period before the
 %                   target appears (gaze at Fixation_position_x/_y), and the
 %                   target hold (gaze at Target_1_position_x/_y).
+%
+% Pass several and the calibration task is detected from what the session
+% actually ran: they are tried in the order given and the first that yields a
+% fit is used, so a session with no fixation block still calibrates off its
+% saccade trials. Each task passed over says so in a warning as it happens.
 %
 %   comments_data - table of parsed trials (one row per trial, 1:1 with dim 2
 %                   of eye_data.data). Needs Task, Session, Save_complete,
@@ -25,9 +30,17 @@ function caled_eyes = EyeCalibration(comments_data, eye_data, task_cal, holdWinM
 %   eye_data      - segmented analog product from BlackrockLoader.segmentAnalog:
 %                   .data (chan x nTrials x maxSamples, uV, NaN-padded),
 %                   .timeseq.relative_time (s from Start), .timeseq.alignedrawtime (s).
-%   task_cal      - task name used to pick calibration trials, matched as a
-%                   substring of Task (e.g. 'fixation' matches 'fixation_experiment').
-%                   One task per call.
+%   task_cal      - task name(s) to calibrate from, each matched as a substring
+%                   of Task (e.g. 'fixation' matches 'fixation_experiment').
+%                   Either a char (one task) or a cellstr tried in order, e.g.
+%                   {'fixation','visual_saccade','memory_saccade'}: the first
+%                   one that fits is used and the rest are not tried. Any way a
+%                   task can turn out unusable -- absent from the session, no
+%                   correct trials, too few conditions, degenerate grid --
+%                   falls through to the next. An entry matching several tasks
+%                   (a bare 'saccade' where the session ran both kinds) fits
+%                   them pooled, with a warning; name them separately to fit
+%                   just one.
 %   holdWinMs     - [start end] ms from each epoch's anchor marker to average
 %                   over (default [100 300], skips the saccade into the target).
 %                   The end is cut short per trial when the epoch closes early,
@@ -51,9 +64,15 @@ function caled_eyes = EyeCalibration(comments_data, eye_data, task_cal, holdWinM
 %
 % Returns:
 %   caled_eyes    - eye_data with .data on the eye channels converted to deg,
-%                   plus a .cal sub-struct holding the fit coefficients, R^2,
-%                   the epochs/sessions used, sample counts, how many windows
-%                   were cut short (nClamped) and whether the fit was applied.
+%                   plus .cal:
+%                     .applied  - false when nothing could calibrate, in which
+%                                 case .data is untouched and still in uV
+%                     .units    - 'deg' once applied, otherwise 'uV'
+%                     .task_cal - cellstr of the task(s) actually fitted
+%                     .coef_x/y - [offset; gain; coupling], coupling 0 if unfit
+%                     .R2_x/y   - fit quality per axis
+%                   Why a task was passed over is warned about as it happens,
+%                   not stored.
 %
 % Xuefei Yu Jul 16, 2026
 
@@ -67,48 +86,118 @@ function caled_eyes = EyeCalibration(comments_data, eye_data, task_cal, holdWinM
 
     caled_eyes = eye_data;
 
-    % Provenance, filled in as we go. Kept even when the fit fails so callers
-    % can always ask caled_eyes.cal.applied.
-    cal = struct('applied', false, 'units', 'uV', 'task_cal', task_cal, ...
-                 'holdWinMs', holdWinMs, 'eyeChans', eyeChans, ...
-                 'Sessions', [], 'nCalTrials', nCalTrials, 'epochs', {{}}, ...
-                 'coef_x', [], 'coef_y', [], 'R2_x', NaN, 'R2_y', NaN, ...
-                 'nTrials', 0, 'nSamples', 0, 'nConditions', 0, ...
-                 'samplesPerCondition', [], 'nClamped', 0, 'coupling_fitted', false);
+    % Kept even when the fit fails, so callers can always ask cal.applied.
+    cal = struct('applied', false, 'units', 'uV', 'task_cal', {{}}, ...
+                 'coef_x', [], 'coef_y', [], 'R2_x', NaN, 'R2_y', NaN);
+
+    task_list = cellstr(task_cal);
 
     % ---------------------------------------------------------------------
-    % 1. Resolve the task and its calibration epochs
+    % 1. Try each task in the order asked for; the first one that fits wins
     % ---------------------------------------------------------------------
-    task_hit = contains(comments_data.Task, task_cal);
-    if ~any(task_hit)
-        warning('EyeCalibration:NoTask', ...
-            'No trials with a Task matching "%s"; eye data left in uV.', task_cal);
+    % Every way a task can turn out unusable -- absent from the session, no
+    % correct trials, too few conditions, a degenerate grid -- falls through to
+    % the next, so a session with no fixation block still calibrates off the
+    % saccade task it did run. Each attempt gets the untouched cal template, so
+    % nothing a failed attempt computed can leak into the next one.
+    fitpts = [];
+    for c = 1:numel(task_list)
+        [cal_c, pts_c] = fitOneTask(comments_data, eye_data, task_list{c}, cal, ...
+            holdWinMs, eyeChans, calSessions, nCalTrials);
+        if cal_c.applied
+            cal    = cal_c;
+            fitpts = pts_c;
+            break
+        end
+    end
+
+    if ~cal.applied
+        warning('EyeCalibration:NoCalibration', ...
+            'None of (%s) could calibrate this session; eye data left in uV.', ...
+            strjoin(task_list, ', '));
         caled_eyes.cal = cal;  return
     end
 
-    % A substring that spans several distinct tasks would silently pool them.
-    matched_tasks = unique(comments_data.Task(task_hit));
-    if numel(matched_tasks) > 1
-        error('EyeCalibration:AmbiguousTask', ...
-            'task_cal "%s" matches %d tasks (%s). Pass a more specific name.', ...
-            task_cal, numel(matched_tasks), strjoin(matched_tasks(:)', ', '));
-    end
-    task_name = matched_tasks{1};
+    fprintf('Eye calibration: using "%s" (R^2 x=%.3f y=%.3f).\n', ...
+        strjoin(cal.task_cal, ', '), cal.R2_x, cal.R2_y);
 
-    epochs = calibrationEpochs(task_name);
+    % ---------------------------------------------------------------------
+    % 2. Apply to every trial (all tasks, all sessions)
+    % ---------------------------------------------------------------------
+    % NaN padding propagates through the arithmetic and stays NaN.
+    raw_x = eye_data.data(eyeChans(1), :, :);
+    raw_y = eye_data.data(eyeChans(2), :, :);
+
+    caled_eyes.data(eyeChans(1), :, :) = applyAxis(raw_x, raw_y, cal.coef_x);
+    caled_eyes.data(eyeChans(2), :, :) = applyAxis(raw_y, raw_x, cal.coef_y);
+
+    caled_eyes.cal = cal;
+
+    % ---------------------------------------------------------------------
+    % 3. Optional QC plots
+    % ---------------------------------------------------------------------
+    if plotCal
+        % (a) the calibrated points the fit was built from, against their grid
+        gaze_x = applyAxis(fitpts.xv, fitpts.yv, cal.coef_x);
+        gaze_y = applyAxis(fitpts.yv, fitpts.xv, cal.coef_y);
+        plotCalibratedGaze(gaze_x, gaze_y, fitpts.tx, fitpts.ty, cal);
+
+        % (b) eye traces for the tasks the fit was NOT built from
+        plotCalibratedEyes(caled_eyes, comments_data, eyeChans, cal.task_cal);
+    end
+end
+
+
+function [cal, fitpts] = fitOneTask(comments_data, eye_data, task_entry, cal, ...
+        holdWinMs, eyeChans, calSessions, nCalTrials)
+% Fit the calibration from one task. Returns cal.applied false rather than
+% throwing, so the caller can move on to the next task in its list.
+%
+%   task_entry - the caller's task name, matched as a substring of Task.
+%   cal        - the pristine template; filled in and returned.
+%   fitpts     - the points the fit was built from (xv, yv, tx, ty), for the plot.
+
+    fitpts = [];
+
+    % calibrationEpochs is the authority on what can calibrate at all, and reads
+    % the entry as a substring exactly as the Task match below does. A task with
+    % no known-gaze epoch must never be fitted, or it would be calibrated against
+    % a gaze location that was never pinned down.
+    epochs = calibrationEpochs(task_entry);
+    if isempty(epochs)
+        warning('EyeCalibration:UnsupportedTask', ...
+            ['"%s" has no defined calibration epoch; skipping it. Only fixation ' ...
+             'and saccade tasks can calibrate.'], task_entry);
+        return
+    end
+
+    task_hit = contains(comments_data.Task, task_entry);
+    if ~any(task_hit);  return;  end     % not in this session: the normal case
+
+    % A loose entry can span several tasks ('saccade' where the session ran both
+    % kinds). Pooling them is sound -- the eye-to-degree mapping belongs to the
+    % tracker, not the task -- as long as it is not silent.
+    matched = unique(comments_data.Task(task_hit));
+    if numel(matched) > 1
+        warning('EyeCalibration:PooledTasks', ...
+            '"%s" matches %d tasks (%s); pooling them for the fit.', ...
+            task_entry, numel(matched), strjoin(matched(:)', ', '));
+    end
+    cal.task_cal = matched(:)';
 
     % The fixation task is a dedicated calibration block, so use all of it. The
     % saccade task is an experiment that can run long, and 50 trials already
     % cover the target grid several times over; capping keeps the fit from
     % drifting with the session. min() is applied later against what survives.
+    % Resolved per attempt, so a fall-back to saccade does not inherit
+    % fixation's uncapped default.
     if isempty(nCalTrials)
-        if contains(task_name, 'fixation')
+        if contains(task_entry, 'fixation')
             nCalTrials = Inf;
         else
             nCalTrials = 50;
         end
     end
-    cal.nCalTrials = nCalTrials;
 
     % Restrict to the requested sessions (default: every session with the task).
     if isempty(calSessions)
@@ -118,35 +207,22 @@ function caled_eyes = EyeCalibration(comments_data, eye_data, task_cal, holdWinM
     end
 
     % Trials usable at all: right task, right session, fully saved, correct.
+    % A correct trial is one where the animal held the gaze the epoch expects,
+    % which is the whole requirement -- nothing further to check.
     trial_ok = task_hit & session_ok ...
         & comments_data.Save_complete == 1 ...
         & strcmp(comments_data.Trialoutcome, 'correct');
 
-    % The saccade task scores a choice; only target_1 exists, so require it.
-    if ismember('Choose_target', comments_data.Properties.VariableNames) ...
-            && any(strcmp({epochs.name}, 'target_hold'))
-        trial_ok = trial_ok & comments_data.Choose_target == 1;
-    end
-
-    if ~any(trial_ok)
-        warning('EyeCalibration:NoTrials', ...
-            'No correct "%s" trials in session(s) [%s]; eye data left in uV.', ...
-            task_cal, num2str(calSessions(:)'));
-        caled_eyes.cal = cal;  return
-    end
-
-    cal.Sessions = unique(comments_data.Session(trial_ok))';
+    if ~any(trial_ok);  return;  end
 
     % ---------------------------------------------------------------------
-    % 2. Collect calibration points from every epoch
+    % Collect calibration points from every epoch
     % ---------------------------------------------------------------------
     nTrials = size(eye_data.data, 2);
     eye_x   = reshape(eye_data.data(eyeChans(1), :, :), nTrials, []);
     eye_y   = reshape(eye_data.data(eyeChans(2), :, :), nTrials, []);
 
     pts = struct('xv', [], 'yv', [], 'tx', [], 'ty', [], 'trial', [], 'epoch', []);
-    used_epochs = {};
-    nClamped    = 0;
 
     % Shortest window worth taking a median over once clamped to the epoch.
     % At 1 kHz this is ~50 samples, enough for the median to be stable.
@@ -198,8 +274,6 @@ function caled_eyes = EyeCalibration(comments_data, eye_data, task_cal, holdWinM
         keep = ep_ok & ~isnan(xv_all) & ~isnan(yv_all);
         if ~any(keep);  continue;  end
 
-        nClamped = nClamped + sum(keep & win_end < holdWinMs(2));
-
         idx = find(keep);
         pts.xv    = [pts.xv;    xv_all(keep)];
         pts.yv    = [pts.yv;    yv_all(keep)];
@@ -207,23 +281,18 @@ function caled_eyes = EyeCalibration(comments_data, eye_data, task_cal, holdWinM
         pts.ty    = [pts.ty;    tgt_y(keep)];
         pts.trial = [pts.trial; idx];
         pts.epoch = [pts.epoch; repmat(e, numel(idx), 1)];
-
-        used_epochs{end+1} = ep.name;  %#ok<AGROW>
     end
-
-    cal.epochs   = used_epochs;
-    cal.nClamped = nClamped;
 
     if isempty(pts.xv)
         warning('EyeCalibration:NoTrials', ...
             ['No usable calibration epochs for "%s": no epoch keeps %g ms of the ' ...
-             '%g-%g ms window. Eye data left in uV.'], ...
-            task_cal, MIN_WIN_MS, holdWinMs(1), holdWinMs(2));
-        caled_eyes.cal = cal;  return
+             '%g-%g ms window.'], ...
+            task_entry, MIN_WIN_MS, holdWinMs(1), holdWinMs(2));
+        return
     end
 
     % ---------------------------------------------------------------------
-    % 3. Cap the number of calibration trials
+    % Cap the number of calibration trials
     % ---------------------------------------------------------------------
     % Selection is per TRIAL, not per point: a saccade trial contributes both
     % its epochs, so picking a trial keeps its fixation and target points.
@@ -243,15 +312,10 @@ function caled_eyes = EyeCalibration(comments_data, eye_data, task_cal, holdWinM
     % Round before grouping: target coordinates carry float jitter (8.66, 4.95).
     [~, ~, cond_id] = unique(round([tx ty], 3), 'rows');
 
-    cal.nSamples            = numel(xv);
-    cal.nTrials             = numel(unique(pts.trial(keep)));
-    cal.samplesPerCondition = accumarray(cond_id, 1)';
-
     % ---------------------------------------------------------------------
-    % 4. Fit (pooled across the selected sessions)
+    % Fit (pooled across the selected sessions)
     % ---------------------------------------------------------------------
-    nCond           = max(cond_id);
-    cal.nConditions = nCond;
+    nCond = max(cond_id);
 
     % Each axis needs its own targets to vary, otherwise that axis's offset and
     % gain are unidentifiable and the fit collapses to a constant. Distinct grid
@@ -261,10 +325,10 @@ function caled_eyes = EyeCalibration(comments_data, eye_data, task_cal, holdWinM
     nTargetY = numel(unique(ty));
     if nTargetX < 2 || nTargetY < 2
         warning('EyeCalibration:TooFewConditions', ...
-            ['Calibration targets span %d distinct x and %d distinct y value(s) over %d usable ' ...
-             'points; each axis needs >= 2. Eye data left in uV.'], ...
-            nTargetX, nTargetY, numel(xv));
-        caled_eyes.cal = cal;  return
+            ['"%s" calibration targets span %d distinct x and %d distinct y value(s) over ' ...
+             '%d usable points; each axis needs >= 2.'], ...
+            task_entry, nTargetX, nTargetY, numel(xv));
+        return
     end
 
     % The coupling column needs a third condition to be identifiable at all.
@@ -282,8 +346,8 @@ function caled_eyes = EyeCalibration(comments_data, eye_data, task_cal, holdWinM
 
     if rank(Dx) < size(Dx,2) || rank(Dy) < size(Dy,2)
         warning('EyeCalibration:RankDeficient', ...
-            'Calibration grid is degenerate (rank-deficient design); eye data left in uV.');
-        caled_eyes.cal = cal;  return
+            '"%s" calibration grid is degenerate (rank-deficient design).', task_entry);
+        return
     end
 
     coef_x = Dx \ tx;                       % [offset_x; gain_x; couple_xy]
@@ -297,36 +361,13 @@ function caled_eyes = EyeCalibration(comments_data, eye_data, task_cal, holdWinM
         coef_y(3) = 0;
     end
 
-    cal.coef_x          = coef_x;
-    cal.coef_y          = coef_y;
-    cal.coupling_fitted = use_coupling;
-    cal.applied         = true;
-    cal.units           = 'deg';
+    cal.coef_x  = coef_x;
+    cal.coef_y  = coef_y;
+    cal.applied = true;
+    cal.units   = 'deg';
 
-    % ---------------------------------------------------------------------
-    % 5. Apply to every trial (all tasks, all sessions)
-    % ---------------------------------------------------------------------
-    % NaN padding propagates through the arithmetic and stays NaN.
-    raw_x = eye_data.data(eyeChans(1), :, :);
-    raw_y = eye_data.data(eyeChans(2), :, :);
-
-    caled_eyes.data(eyeChans(1), :, :) = applyAxis(raw_x, raw_y, coef_x);
-    caled_eyes.data(eyeChans(2), :, :) = applyAxis(raw_y, raw_x, coef_y);
-
-    caled_eyes.cal = cal;
-
-    % ---------------------------------------------------------------------
-    % 6. Optional QC plots
-    % ---------------------------------------------------------------------
-    if plotCal
-        % (a) the calibrated points the fit was built from, against their grid
-        gaze_x = applyAxis(xv, yv, coef_x);
-        gaze_y = applyAxis(yv, xv, coef_y);
-        plotCalibratedGaze(gaze_x, gaze_y, tx, ty, cal);
-
-        % (b) eye traces for the tasks the fit was NOT built from
-        plotCalibratedEyes(caled_eyes, comments_data, eyeChans, task_name);
-    end
+    % The points behind the fit, for the caller's QC plot.
+    fitpts = struct('xv', xv, 'yv', yv, 'tx', tx, 'ty', ty);
 end
 
 
@@ -360,7 +401,8 @@ function plotCalibratedGaze(gaze_x, gaze_y, tx, ty, cal)
     xlabel('Eye X (\circ)');
     ylabel('Eye Y (\circ)');
     title(sprintf('%s  |  R^2_x=%.3f  R^2_y=%.3f  (%d points, %d conditions)', ...
-        strrep(cal.task_cal, '_', ' '), cal.R2_x, cal.R2_y, cal.nSamples, cal.nConditions));
+        strrep(strjoin(cal.task_cal, ', '), '_', ' '), cal.R2_x, cal.R2_y, ...
+        numel(tx), size(unique(round([tx ty], 3), 'rows'), 1)));
     legend(hleg, arrayfun(@(i) sprintf('(%.1f, %.1f)\\circ', pts(i,1), pts(i,2)), ...
         (1:nGrp)', 'UniformOutput', false), 'Location', 'bestoutside');
     set(gcf, 'color', 'w');
@@ -369,7 +411,7 @@ function plotCalibratedGaze(gaze_x, gaze_y, tx, ty, cal)
 end
 
 
-function plotCalibratedEyes(caled_eyes, comments_data, eyeChans, fitted_task)
+function plotCalibratedEyes(caled_eyes, comments_data, eyeChans, fitted_tasks)
 % Sample plot of calibrated eye traces on the 2D screen, one subplot per task.
 %
 % Only the tasks the fit was NOT built from are drawn: the calibrated task has
@@ -385,8 +427,12 @@ function plotCalibratedEyes(caled_eyes, comments_data, eyeChans, fitted_task)
     MAX_TRIALS = 50;
     PAD_DEG    = 5;             % breathing room outside the outermost target
 
+    % ismember, not strcmp: fitted_tasks can name more than one task when a
+    % loose entry pooled them, and every task the fit was built from has to be
+    % excluded or this plot would claim to test generalisation on its own
+    % training trials.
     tasks = unique(comments_data.Task);
-    tasks = tasks(~strcmp(tasks, fitted_task));
+    tasks = tasks(~ismember(tasks, fitted_tasks));
     nTask = numel(tasks);
     if nTask == 0;  return;  end
 
@@ -452,7 +498,7 @@ function plotCalibratedEyes(caled_eyes, comments_data, eyeChans, fitted_task)
     end
 
     sgtitle(sprintf(['Calibrated eye traces, Start to End  |  evenly sampled completed trials' ...
-        '  |  calibrated on %s'], strrep(fitted_task, '_', ' ')));
+        '  |  calibrated on %s'], strrep(strjoin(fitted_tasks, ', '), '_', ' ')));
     set(gcf, 'color', 'w');
 end
 
@@ -549,8 +595,12 @@ function epochs = calibrationEpochs(task_name)
 %   limit    - marker the window must end before (s)
 %   target_x/_y - columns holding the known gaze location (deg)
 %
-% Each task must be listed explicitly: a task with no known-gaze epoch (e.g.
-% time_delay_experiment) has to fail loudly rather than be mis-calibrated.
+% Each task must be listed explicitly. A task with no known-gaze epoch (e.g.
+% time_delay_experiment) returns empty and must never be calibrated from:
+% fitOneTask warns and skips it, so it is reported rather than mis-calibrated.
+%
+% task_name is matched as a substring, so the caller's own string ('saccade',
+% 'visual_saccade', 'visual_saccades_experiment') all resolve here identically.
 
     if contains(task_name, 'fixation')
         epochs = struct( ...
@@ -573,9 +623,7 @@ function epochs = calibrationEpochs(task_name)
             'target_y', {'Fixation_position_y', 'Target_1_position_y'});
 
     else
-        error('EyeCalibration:UnsupportedTask', ...
-            ['Task "%s" has no defined calibration epoch. Only fixation and ' ...
-             'saccade tasks can calibrate.'], task_name);
+        epochs = [];
     end
 end
 

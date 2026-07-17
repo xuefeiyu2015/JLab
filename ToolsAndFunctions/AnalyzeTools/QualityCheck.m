@@ -6,7 +6,7 @@ function quality = QualityCheck(data, FileValid)
 %
 %   data       - struct with the loaded products:
 %                  .comments      - trials table (one row per trial)
-%                  .eyes          - calibrated analog product (optional)
+%                  .eyes          - calibrated analog product (optional)(not used now)
 %                  .spike         - online spike product (optional)
 %                  .spikewaveform - spike waveform product (optional)
 %   FileValid  - logical per product; FileValid(1) gates the behavior checks.
@@ -28,7 +28,78 @@ function quality = QualityCheck(data, FileValid)
         quality.pass = false;
         return
     end
-    quality.behavior = behaviorCheck(data.comments);
+    quality = behaviorCheck(data.comments);
+
+    %Quality check for the spikes 
+
+    if FileValid(3) == 1
+        %Check spikes
+        if FileValid(4) == 1
+            %Check waveform
+            CheckWaveform = true;
+        end
+        
+        %Make a plot with gui handles, a list showing all channels, and a
+        %second list showing all units in the selected channel, default is
+        %unit 1 and channel 1
+        %Use a left arrow button to swith to the previous unit and right
+        %arrow button to switch to the next unit. Channel and unit can also
+        %be modifyed through the channel and unit list. 
+
+        %Do the following spike quality check
+        %(1)Plot the the baseline firing rate changes as a function of Trial NO 
+        % like in the behavior check, use different block color to indicate
+        % different trials. Use open circle to indicate unsuccessful trial
+        % and filled dots to indicate successful trial. 
+        % On the top, list the average firing rate (+- std) of the baseline in the current task. 
+        % Bold and highlight the text if the average firing rate is less than a threshold, e.g 5Hz 
+        % On the title or above, also show the overall spike rate, if it's
+        % less than the Treshold, highlight it.(If there is space, also show the threhsold)
+
+        %(2) Plot the histogram for the inter spike interval for all
+        %spikes.
+        %Stack the interspike interval with different tasks, and do an
+        %exponential fitting for the spike interval for each task.
+        % Show the voliation rate: i.e. the proportion of spike intervals
+        % within 1ms 
+        % Show the number of total spikes, and number of total spikes in
+        % each task. Show the Fano Factor for total spikes and for each
+        % task. 
+
+
+
+        %Do the waveform check if waveforms are available for the selected
+        %unit
+        %(3)Plot the waveform, use different color for different tasks. Use
+        %a thicker curve to indicate the average, overlap with each
+        %waveforms with light/opac same color.      
+   
+        % Calculate the Signal Noise Ratio, SpikeWaveWidth, Top to valley
+        % Difference for all the waveforms, and also for each task. List it
+        % below the waveform plot as a table. Make this waveform feature
+        % extraction function a reusable one and save separately in the
+        % folder. 
+
+        %(3)Do PCA and plot the waveform on the first three PC axis, and
+        %color different waveforms in different tasks with different color.
+        % Mark the centroid for the "clusters" in each task and calculate
+        % the within clusters distance and between clusters distance ratio.
+
+        % Try to make those waveform check functions reusable for further
+        % use. 
+        
+
+
+        
+
+
+
+
+    end
+
+
+
+
 end
 
 
@@ -57,10 +128,12 @@ function B = behaviorCheck(cd)
     B.tasks = plotSuccessRate(ax, cd, tasks, colors, TRIAL_BIN, TRIAL_STEP);
 
     % (2) hit-rate maps, second row left -----------------------------------
-    B.hitRate = plotHitRateMaps(tl, 3, cd);
+    %B.hitRate = plotHitRateMaps(tl, 3, cd);
+    plotHitRateMaps(tl, 3, cd);
 
     % (4) psychometric, second row right -----------------------------------
-    B.psychometric = plotPsychometric(tl, 4, cd);
+   % B.psychometric = plotPsychometric(tl, 4, cd);
+    plotPsychometric(tl, 4, cd);
 
     % (3) saccade conditions, third row left --------------------------------
     plotSaccadeConditions(tl, 5, cd);
@@ -78,6 +151,10 @@ end
 function S = plotSuccessRate(ax, cd, tasks, colors, binN, stepN)
 % Success rate in a sliding window over trial number, with each task's stretch
 % of the recording shaded behind it and its trial counts printed on top.
+%
+% The shading and labels are per contiguous block, so a task run twice shows as
+% two stretches. The RETURNED S is per task instead: one row for each unique
+% task, its blocks merged, since that is what "how did each task go" asks for.
 
     hold(ax, 'on');
 
@@ -87,10 +164,9 @@ function S = plotSuccessRate(ax, cd, tasks, colors, binN, stepN)
     success = correct | wrong;
     x       = (1:n).';
 
-    % Shade each contiguous run of one task, and label it.
+    % Shade each contiguous run of one task, and label it with that block's own
+    % numbers (break/timeout/incomplete are only meaningful per block).
     blocks = contiguousBlocks(cd.Task);
-    S      = struct('Task', {}, 'Session', {}, 'total', {}, 'success', {}, ...
-                    'broke', {}, 'timeout', {}, 'incomplete', {}, 'rate', {});
 
     for b = 1:numel(blocks)
         rows = blocks(b).first:blocks(b).last;
@@ -100,7 +176,6 @@ function S = plotSuccessRate(ax, cd, tasks, colors, binN, stepN)
             [0 0 1 1], colors(ci,:), 'FaceAlpha', 0.10, 'EdgeColor', 'none');
 
         s = struct( ...
-            'Task',       blocks(b).name, ...
             'Session',    unique(cd.Session(rows))', ...
             'total',      numel(rows), ...
             'success',    sum(success(rows)), ...
@@ -108,7 +183,6 @@ function S = plotSuccessRate(ax, cd, tasks, colors, binN, stepN)
             'timeout',    sum(strcmp(cd.Trialoutcome(rows), 'timeout')), ...
             'incomplete', sum(cd.Save_complete(rows) ~= 1), ...
             'rate',       mean(success(rows)));
-        S(end+1) = s;  
 
         text(ax, mean([blocks(b).first blocks(b).last]), 1.03, ...
             sprintf(['%s\nSession %s | N=%d\nsuccess %d (%.0f%%)\nbreak %d | timeout %d\n' ...
@@ -117,6 +191,17 @@ function S = plotSuccessRate(ax, cd, tasks, colors, binN, stepN)
                 s.success, 100*s.rate, s.broke, s.timeout, s.incomplete), ...
             'HorizontalAlignment', 'center', 'VerticalAlignment', 'bottom', ...
             'FontSize', 8, 'Color', colors(ci,:)*0.6);
+    end
+
+    % One row per task, its blocks merged. tasks is unique(cd.Task,'stable'), so
+    % rows come out in the order the session first ran each task.
+    S = struct('Task', {}, 'total', {}, 'success', {}, 'rate', {});
+    for t = 1:numel(tasks)
+        rows = strcmp(cd.Task, tasks{t});
+        S(t) = struct('Task', tasks{t}, ...
+                      'total',   sum(rows), ...
+                      'success', sum(success & rows), ...
+                      'rate',    mean(success(rows)));
     end
 
     % Sliding-window accuracy across the whole recording, so the curve carries
@@ -216,8 +301,11 @@ function H = plotHitRateMaps(tl, tile, cd)
             imagesc(ax, gx, gy, GZ, 'AlphaData', ~isnan(GZ));
         end
 
-        % Targets on top: circle area grows with how many trials were run there.
-        scatter(ax, xy(:,1), xy(:,2), 20 + 40*nTrial, 'k', 'LineWidth', 1);
+        % Targets on top, marking location only. A fixed small circle: scaling
+        % the area by trial count swamped the map on sessions that ran many
+        % repeats per target, and the counts are in H(g).n for anyone who wants
+        % them.
+        scatter(ax, xy(:,1), xy(:,2), 25, 'k', 'LineWidth', 1);
 
         colormap(ax, parula);  clim(ax, [0 1]);
         cb = colorbar(ax);  cb.Label.String = 'Hit rate';
