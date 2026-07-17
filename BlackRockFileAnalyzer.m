@@ -10,17 +10,118 @@
 close all;
 clear;
 
+%% Check if the path is setup ready
+%% Step 1 - add JLab's own code. The repo root is added non-recursively (for the
+% top-level scripts) and only the ToolsAndFunctions tree is genpath'd (for the
+% BlackrockLoader class + analyze tools). We deliberately do NOT genpath the repo
+% root, so dot-folders at the root (.git, .claude, ...) never end up on the path.
+JLabRoot = fileparts(mfilename('fullpath'));
+addpath(JLabRoot);
+addpath(genpath(fullfile(JLabRoot, 'ToolsAndFunctions')));
+
+
 %% -------------------------------------------------------------------------
-%% 1. CONFIGURE DATA PATH
+%% 2. CONFIGURE DATA PATH
 %% -------------------------------------------------------------------------
 % Set paths and identifiers for the .mat file to load. The file is
 % expected at: main_path/monkey/task_type/folder/data_date/Blackrock_*.mat
 
-monkey = 'Monkey test';
-main_path = '/Users/xuefeiyu/Documents/XuefeiFile/WorkRelated/Data';
-data_date = '2026-06-25';  % Session date in yyyy-mm-dd
-task_type = 'in_lab';
-folder = 'export_data';
+Basic_Path  = '/Users/xuefeiyu/Documents/XuefeiFile/WorkRelated/Data';
+Monkey = 'test';        % bare monkey name; folder is "Monkey <name>"
+Location = 'in_lab';       % editable constant
+DataType = 'export_data';     % editable constant
+
+Folder = '2026-07-15';
+
+%Check all the exported files in the folder
+
+main_path = fullfile(Basic_Path, sprintf('Monkey %s', Monkey), Location, DataType, Folder);
+all_files = dir(main_path);
+all_files = {all_files(~[all_files.isdir]).name};
+
+%Search for comments file
+comments_path = findExportFile(all_files, main_path, 'trials');
+
+%Search for the Eye data/analog file
+analog_path   = findExportFile(all_files, main_path, 'analog');
+
+%Search for online spike file. 'spikes' alone would also catch the waveform
+%file, so it has to be excluded explicitly.
+spike_path    = findExportFile(all_files, main_path, 'spikes', 'spikes_waveform');
+
+%Search for spike waveform file
+waveform_path = findExportFile(all_files, main_path, 'spikes_waveform');
+
+%File Check first
+FileValid = [0,0,0];
+
+if ~isempty(comments_path)
+    comments_data = readtable(comments_path);
+    FileValid(1) = 1; 
+else
+    disp('No parsed trials data found, please parse the data using the loader first')
+
+end
+
+if ~isempty(analog_path)
+    tmp = load(analog_path);
+    eye_data = tmp.analog;
+    FileValid(2) = 1; 
+
+    %Eye calibration 
+
+    task_cal  = 'fixation';
+    PlotCalibratedEyes = 1;%Optional, for plotting
+    caled_eyes = EyeCalibration(comments_data,eye_data,task_cal,[],[], PlotCalibratedEyes); 
+
+    if caled_eyes.cal.applied == false
+        disp('Eye calibration failed!');
+        FileValid(2) = 0; 
+    end
+
+
+else
+    disp('No parsed eye data found');
+end
+
+if ~isempty(spike_path)
+    tmp = load(spike_path);
+    spike_data = tmp.online_spike;
+    FileValid(3) = 1; 
+else
+    disp('No spike data found');
+end
+
+if ~isempty(waveform_path)
+    tmp = load(waveform_path);
+    spikewaveform_data = tmp.online_spike_waveform;
+else
+    disp('No spike waveform found');
+end
+
+
+
+
+
+if sum(FileValid) > 0
+    %Do a first quality check:
+
+    check_data.comments = comments_data;
+    check_data.eyes = caled_eyes;
+    check_data.spike = spike_data;
+    check_data.spikewaveform = spikewaveform_data;
+
+    quality = QualityCheck(check_data,FileValid);
+
+    
+
+
+else
+    disp('Can not do quality check, no exported data file available.')
+end
+
+keyboard
+
 
 % Task name used to filter trials (must match the Task field in expdata)
 %analyze_task = 'time_delay_experiment';
@@ -32,20 +133,12 @@ eye_postMs     = 500;   % ms after  go cue to plot
 angle_bin_deg  = 30;    % round target angle to this grid to form direction groups
 eye_num_sample = 100;    % [] = plot all trials; N = plot only first N traces per direction
 
-% Build full path to the BlackRock export .mat file
-data_trials = sprintf('Blackrock_%s_trials_matlab.csv', data_date);
-data_path = fullfile(main_path, monkey, task_type, folder, data_date, data_trials);
-
-% Segmented analog / eye data lives next to the trials CSV
-data_analog = sprintf('Blackrock_%s_analog_matlab.mat', data_date);
-analog_path = fullfile(main_path, monkey, task_type, folder, data_date, data_analog);
-
 %% -------------------------------------------------------------------------
 %% 2. LOAD AND FILTER TRIALS
 %% -------------------------------------------------------------------------
-if exist(data_path, 'file')
+if exist(comments_path, 'file')
     % Load the parsed BlackRock session file
-    expdata = readtable(data_path);
+    expdata = readtable(comments_path);
     
     
     % Keep only trials that were fully saved (no truncation)
@@ -160,7 +253,7 @@ if exist(data_path, 'file')
         conditions = mod(round(ang/angle_bin_deg)*angle_bin_deg + 180, 360) - 180;
 
         plotAlignedEyeTraces(aligned_eye, rts, conditions, ...
-            sprintf('%s  %s', monkey, data_date), eye_num_sample);
+            sprintf('%s  %s', Monkey, Folder), eye_num_sample);
     else
         disp('No analog (eye) .mat found; run the loader with LoadAnalogData on first.');
     end
@@ -175,42 +268,36 @@ end
 
 %% -------------------------------------------------------------------------
 %% -------------------------------------------------------------------------
-function [aligned_eye, relative_time_seq] = AlignEyeTrace(eye_x, eye_y, eye_time, ...
-        align_marker_time, preMs, postMs)
-% Re-align eye traces to a per-trial marker (e.g. fixation offset / go cue).
-% Resamples every trial onto one shared time axis with 0 at the marker.
+function p = findExportFile(all_files, main_path, pattern, exclude)
+% Resolve one exported product in main_path by a rough name match.
 %
-%   eye_x, eye_y      - nTrials x nSamp eye position (e.g. uV), one row per trial.
-%   eye_time          - 1 x nSamp shared sample times (s), same clock as the marker.
-%   align_marker_time - nTrials x 1 marker time per trial (s, same frame as eye_time).
-%                       NaN -> that trial's aligned rows are all NaN.
-%   preMs / postMs    - window kept before / after the marker (ms).
+%   all_files - cellstr of file names in main_path.
+%   pattern   - substring the name must contain (e.g. 'analog').
+%   exclude   - (optional) substring that disqualifies a match. Needed for
+%               'spikes', which would otherwise also catch 'spikes_waveform'.
 %
-% Returns:
-%   aligned_eye       - struct with .x, .y (nTrials x nOut, marker-aligned,
-%                       NaN outside available data)
-%   relative_time_seq - 1 x nOut time from the marker (s), 0 at the marker,
-%                       sampled at the native step of eye_time.
+% Returns '' when nothing matches, so callers can guard with exist().
 
-    eye_time = eye_time(:).';                       % force 1 x nSamp
-    nT       = size(eye_x, 1);
-
-    step_s = median(diff(eye_time));                % native sample interval (s)
-    nPre   = round((preMs/1000)  / step_s);         % samples before / after marker
-    nPost  = round((postMs/1000) / step_s);
-    relative_time_seq = (-nPre:nPost) * step_s;     % 1 x nOut, 0 = marker
-
-    ax = nan(nT, numel(relative_time_seq));
-    ay = nan(nT, numel(relative_time_seq));
-    for i = 1:nT
-        if isnan(align_marker_time(i));  continue;  end
-        sample_s = align_marker_time(i) + relative_time_seq;   % where to sample eye_time
-        ax(i,:) = interp1(eye_time, eye_x(i,:), sample_s, 'linear', NaN);
-        ay(i,:) = interp1(eye_time, eye_y(i,:), sample_s, 'linear', NaN);
+    hit = all_files(contains(all_files, pattern));
+    if nargin > 3 && ~isempty(exclude)
+        hit = hit(~contains(hit, exclude));
     end
 
-    aligned_eye = struct('x', ax, 'y', ay);
+    if isempty(hit)
+        p = '';
+        return
+    end
+    if numel(hit) > 1
+        error('findExportFile:Ambiguous', ...
+            'Multiple files match "%s" in %s:\n  %s', ...
+            pattern, main_path, strjoin(hit, '\n  '));
+    end
+    p = fullfile(main_path, hit{1});
 end
+
+
+% AlignEyeTrace now lives in ToolsAndFunctions/AnalyzeTools/AlignEyeTrace.m
+% so that EyeCalibration can share it.
 
 
 function plotAlignedEyeTraces(aligned_eye, relative_time_seq, conditions, ttl, num_of_sample)

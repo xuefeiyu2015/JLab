@@ -138,7 +138,7 @@ for fi = 1:numel(FolderList)
     % Spike/SpikeWaveformData/Export) if you want to inspect it afterwards.
 
 
-    %loader.processFolder(DataFolder, OutputPath, BaseName);
+    loader.processFolder(DataFolder, OutputPath, BaseName);
 
     %--- If you want to check raw files one by one--
    
