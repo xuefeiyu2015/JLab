@@ -66,7 +66,7 @@ ExportPath = fullfile(Basic_Path,MonkeyFolder,Location,OutputFolder);
 %   {'2026-06-17','2026-06-18'}    several folders, loaded in order
 %   {}  (or '')                    every YYYY-MM-DD folder under DataTypePath
 %Folder = {'2026-07-15'};
-Folder = {'2026-05-28'};
+Folder = {'2026-07-17'};
 FolderList = BlackrockLoader.resolveFolders(Folder, DataTypePath);
 
 %% Load configuration (passed to the loader; exports reuse the buffers)
@@ -144,11 +144,11 @@ for fi = 1:numel(FolderList)
     %--- If you want to check raw files one by one--
    
     %{
-    C = loader.loadComments(DataFolder); %loaded raw comments
-    A = loader.loadAnalog(DataFolder); %loaded raw analog
-    channels,Optional1, "*.ns2" or "*.ns4","*.ns6",Optional2, preFix:
-    "HUB",'NSP',etc
-    %A = loader.loadAnalog(DataFolder,'*.ns6'); 
+     C = loader.loadComments(DataFolder); %loaded raw comments
+     A = loader.loadAnalog(DataFolder); %loaded raw analog
+   % channels,Optional1, "*.ns2" or "*.ns4","*.ns6",Optional2, preFix:
+   % "HUB",'NSP',etc
+   % A = loader.loadAnalog(DataFolder,'*.ns4'); 
     S = loader.loadSpikes(DataFolder);%load raw online spikes
     %}
 

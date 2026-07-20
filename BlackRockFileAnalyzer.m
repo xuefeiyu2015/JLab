@@ -33,6 +33,13 @@ DataType = 'export_data';     % editable constant
 
 Folder = '2026-07-15';
 
+
+%Toddles to turn quality check plots on
+PlotBehaviorCheck= true; % for visualizing behavior summary
+PlotCalibratedEyes = true;% for plotting eye trace after calibration
+PlotSpikeCheck = true; %turn on the spike navigator interface
+
+
 %Check all the exported files in the folder
 
 main_path = fullfile(Basic_Path, sprintf('Monkey %s', Monkey), Location, DataType, Folder);
@@ -52,34 +59,38 @@ spike_path    = findExportFile(all_files, main_path, 'spikes', 'spikes_waveform'
 %Search for spike waveform file
 waveform_path = findExportFile(all_files, main_path, 'spikes_waveform');
 
-%File Check first
-FileValid = [0,0,0];
+
 
 if ~isempty(comments_path)
     comments_data = readtable(comments_path);
-    FileValid(1) = 1; 
+    BehaviorSummary = behaviorCheck(comments_data, plotBehaviorCheck);
+   
 else
-    disp('No parsed trials data found, please parse the data using the loader first')
-    comments_data = [];
+    
+    error('No parsed trials data found. Please parse the data using the loader first.');
+    
 end
 
+EyeCalibrated = 0;%Flag to indicate whether eye calibration is suceed or not.
 if ~isempty(analog_path)
     tmp = load(analog_path);
     eye_data = tmp.analog;
-    FileValid(2) = 1; 
 
     %Eye calibration 
+    disp('Start eye calibration');
 
     % Candidates in priority order: a session with a dedicated fixation block
     % calibrates off it, otherwise off whichever saccade task it ran.
     task_cal  = {'fixation', 'visual_saccade', 'memory_saccade'};
-    PlotCalibratedEyes = 1;%Optional, for plotting
+    
     caled_eyes = EyeCalibration(comments_data,eye_data,task_cal,[],[], PlotCalibratedEyes); 
 
     if caled_eyes.cal.applied == false
         disp('Eye calibration failed!');
-        FileValid(2) = 0; 
-        eye_data = [];
+        
+    else
+        disp('Eye calibration completed.');
+        EyeCalibrated = 1;
     end
 
 
@@ -91,19 +102,26 @@ end
 if ~isempty(spike_path)
     tmp = load(spike_path);
     spike_data = tmp.online_spike;
-    FileValid(3) = 1; 
+
+    if ~isempty(waveform_path)
+        tmp = load(waveform_path);
+        spikewaveform_data = tmp.online_spike_waveform;
+    else
+        disp('No spike waveform found');
+        spikewaveform_data = [];
+    end
+
+     
+    quality.spike = spikeCheck(spike_data, spikewaveform_data, ...
+                                   comments_data, main_path, PlotSpikeCheck );
+
+    
 else
     disp('No spike data found');
     spike_data = [];
 end
 
-if ~isempty(waveform_path)
-    tmp = load(waveform_path);
-    spikewaveform_data = tmp.online_spike_waveform;
-else
-    disp('No spike waveform found');
-    spikewaveform_data = [];
-end
+
 
 
 
@@ -117,14 +135,28 @@ if sum(FileValid) > 0
     check_data.spike = spike_data;
     check_data.spikewaveform = spikewaveform_data;
 
-    quality = QualityCheck(check_data,FileValid);
+    % main_path is the export folder; the spike QC writes/reads its per-unit
+    % exclusion labels (unit_qc_exclusions.csv) there.
+    quality = QualityCheck(check_data,FileValid,main_path,PlotQualityCheck);
 
+    %After the quality check
+
+    ana_data = check_data;
+    ana_data.quanlity = quality;
+
+
+
+keyboard
     
 
 
 else
     disp('Can not do quality check, no exported data file available.')
 end
+
+
+
+
 
 keyboard
 
