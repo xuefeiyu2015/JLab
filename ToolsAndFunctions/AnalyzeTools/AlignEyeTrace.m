@@ -27,12 +27,21 @@ function [aligned_eye, relative_time_seq] = AlignEyeTrace(eye_x, eye_y, eye_time
 
     ax = nan(nT, numel(relative_time_seq));
     ay = nan(nT, numel(relative_time_seq));
+    
     for i = 1:nT
         if isnan(align_marker_time(i));  continue;  end
+        
         sample_s = align_marker_time(i) + relative_time_seq;   % where to sample eye_time
+
+
+        if length(eye_time) ~= length(eye_x(i,:))
+            keyboard
+        end
         ax(i,:) = interp1(eye_time, eye_x(i,:), sample_s, 'linear', NaN);
         ay(i,:) = interp1(eye_time, eye_y(i,:), sample_s, 'linear', NaN);
+        
     end
-
+    
+    
     aligned_eye = struct('x', ax, 'y', ay);
 end

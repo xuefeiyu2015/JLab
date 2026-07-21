@@ -37,7 +37,7 @@ Folder = '2026-07-15';
 %Toddles to turn quality check plots on
 PlotBehaviorCheck= false; % for visualizing behavior summary
 PlotCalibratedEyes = false;% for plotting eye trace after calibration
-PlotSpikeCheck = true; %turn on the spike navigator interface
+PlotSpikeCheck = false; %turn on the spike navigator interface
 
 
 %Check all the exported files in the folder
@@ -63,7 +63,7 @@ waveform_path = findExportFile(all_files, main_path, 'spikes_waveform');
 
 if ~isempty(comments_path)
     comments_data = readtable(comments_path);
-    BehaviorSummary = behaviorCheck(comments_data, PlotBehaviorCheck);
+    BehaviorSummary = behaviorCheck(comments_data, PlotBehaviorCheck, main_path);
    
 else
     
@@ -71,7 +71,7 @@ else
     
 end
 
-EyeCalibrated = 0;%Flag to indicate whether eye calibration is suceed or not.
+
 if ~isempty(analog_path)
     tmp = load(analog_path);
     eye_data = tmp.analog;
@@ -90,13 +90,13 @@ if ~isempty(analog_path)
         
     else
         disp('Eye calibration completed.');
-        EyeCalibrated = 1;
+        
     end
 
 
 else
     disp('No parsed eye data found');
-    eye_data = [];
+    caled_eyes.cal.applied = false;
 end
 
 if ~isempty(spike_path)
@@ -114,6 +114,9 @@ if ~isempty(spike_path)
      
     SpikeSummary = spikeCheck(spike_data, spikewaveform_data, ...
                                    comments_data, main_path, PlotSpikeCheck );
+    if PlotSpikeCheck
+        disp('Completed spikecheck!')
+    end
    
     
 else
@@ -123,8 +126,25 @@ end
 
 
 %Screen the tasks and spikes according to the behavior and spike check
+excludeTrials = [];
+excludeSpikes = zeros(size(SpikeSummary,1));
 
-%excludeTrials, excludeSpikes = ScreenSession(BehaviorSummary,SpikeSummary);
+[excludeTrials, excludeSpikes] = ScreenSession(BehaviorSummary,SpikeSummary);
+
+%comments_data
+%caled_eyes
+%spike_data
+%spike_waveform_data
+
+%% Preprossing: Add RT to saccade tasks.
+RT = CalculateRT(caled_eyes,comments_data);
+
+
+%% Auto-rounting to it's respective analyze protocol
+
+
+task_lists 
+
 
 
 

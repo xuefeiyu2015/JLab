@@ -8,15 +8,18 @@ function spikesummary = spikeCheck(spike, waveform, cd, savePath, plotFlag)
 %              When empty the waveform-dependent panels show "No waveform file".
 %   cd       - trials table (task, outcome, timing markers per trial).
 %   savePath - (optional) export folder for the exclusion CSV and the QC summary
-%              CSVs (used by the GUI's Export Summary button and, when set, by a
+%              (used by the GUI's Export Summary button and, when set, by a
 %              headless call -- see plotFlag); '' turns persistence/export off.
+%              Export writes this session's spike temp CSV and merges it with the
+%              behavior temp into the per-monkey master via ExportQCSummary.
 %   plotFlag - (optional, default true) draw the GUI. false runs headless: no
 %              figure is created and the function returns spikesummary. When
 %              savePath is set, a headless call also computes every unit's full
-%              metrics (waveform-dependent SNR / width / PCA) and writes the QC
-%              summary CSVs, exactly like the Export Summary button.
+%              metrics (waveform-dependent SNR / width / PCA) and merges the
+%              session into the master QC summary, exactly like the Export Summary
+%              button.
 %
-% Returns spikesummary, a struct of per-unit column vectors: Channel, Unit, AvgFR
+% Returns spikesummary, a table of per-unit column vectors: Channel, Unit, AvgFR
 % (overall firing rate, Hz), ViolationRate (overall ISI-violation rate).
 %
 % Computation is separated from visualization: the per-unit numbers are assembled
@@ -109,19 +112,20 @@ function spikesummary = spikeCheck(spike, waveform, cd, savePath, plotFlag)
             end
         end
     end
-    spikesummary = struct( ...
-        'Channel',       chan, ...
-        'Unit',          unit, ...
-        'AvgFR',         overallRate, ...
-        'ViolationRate', violationRate);
+   
+
+     column_names = {'Channel','Unit','AvgFR','ViolationRate','Excluded'};
+     spikesummary = table(chan, unit, overallRate, violationRate,[S.Excluded]','VariableNames',column_names);
+     
+
 
     if ~plotFlag
         % headless: no figure. With a savePath, also compute every unit's full
-        % metrics and write the QC summary CSVs (same as the Export Summary button).
+        % metrics and merge the session into the master QC summary (same as the
+        % Export Summary button).
         if ~isempty(savePath)
-            [bf, sf] = exportQC();
-            if ~isempty(bf);  fprintf('Exported %s\n', bf);  end
-            if ~isempty(sf);  fprintf('Exported %s\n', sf);  end
+            masterFile = exportQC();
+            if ~isempty(masterFile);  fprintf('Exported %s\n', masterFile);  end
         end
         return
     end
@@ -188,6 +192,19 @@ function spikesummary = spikeCheck(spike, waveform, cd, savePath, plotFlag)
 
     curRow = 1;
     selectRow(1);
+
+    % Block here until the user closes the QC window; ScreenSession downstream
+    % consumes the exclusions decided in the GUI. uiwait returns when fig is
+    % deleted (the window's close button already deletes it), so no custom close
+    % handler is needed, and callbacks keep working while paused.
+    disp('Waiting for spike screening, will continue after close the spike gui...')
+    uiwait(fig);
+
+    % Return the exclusions the user set in the GUI. S is updated live by
+    % onExclusion; spikesummary was built pre-GUI, so refresh its column now.
+    if ~isempty(S)
+        spikesummary.Excluded = [S.Excluded]';
+    end
 
     % ---------------- GUI callbacks --------------------------------------
     function onChannel(~, ~)
@@ -281,29 +298,42 @@ function spikesummary = spikeCheck(spike, waveform, cd, savePath, plotFlag)
             return
         end
         set(fig, 'Pointer', 'watch');  drawnow;
-        [bf, sf] = exportQC();
+        summaryFile = exportQC();
         set(fig, 'Pointer', 'arrow');
 
-        q = struct('spike', S, 'behavior', behaviorCheck(cd, false));
-        summaryFile = ExportQCSummary(q, savePath);
-        if isempty(q.spike)
-            statusTxt.String = 'QC summary exported (no spikes).';
-
+        if isempty(S)
+            msg = 'QC summary exported (no spikes).';
         else
-            statusTxt.String = 'QC summary exported (behavior + spikes).';
+            msg = 'QC summary exported (behavior + spikes).';
         end
-        if ~isempty(summaryFile);  fprintf('Exported %s\n', summaryFile);  end
+        if ~isempty(summaryFile)
+            statusTxt.String = {msg; summaryFile};
+            fprintf('Exported %s\n', summaryFile);
+        else
+            statusTxt.String = msg;
+        end
     end
 
-    % Compute every unit's full metrics and write the QC summary CSVs. Shared by
-    % the Export Summary button and the headless (savePath) path; caller checks
+    % Compute every unit's full metrics, write this session's spike temp CSV, and
+    % merge the two per-session temps into the master QC summary. Shared by the
+    % Export Summary button and the headless (savePath) path; caller checks
     % savePath is non-empty. Fills S via computeUnit (waveform-dependent).
-    function [bf, sf] = exportQC()
+    function masterFile = exportQC()
         for ii = 1:nRow
             storeMetrics(ii, computeUnit(ii));
         end
-        q = struct('spike', S, 'behavior', behaviorCheck(cd, false));
-        [bf, sf] = ExportQCSummary(q, savePath);
+        writeSpikeSummary(S, savePath);
+        % Normal flow: behaviorCheck already wrote the behavior temp for this
+        % session. Standalone use (spikeCheck without a prior behavior check)
+        % falls back to writing it here from cd so behavior still merges in.
+        [monkey, dateStr, dataRoot] = parseSessionPath(savePath);
+        if isempty(monkey);  monkey = 'unknown';  end
+        behaviorTemp = fullfile(dataRoot, 'Summary', 'temp', ...
+            sprintf('%s_%s_behavior.csv', monkey, dateStr));
+        if exist(behaviorTemp, 'file') ~= 2
+            writeBehaviorSummary(behaviorCheck(cd, false), savePath);
+        end
+        masterFile = ExportQCSummary(savePath);
     end
 
     % ---------------- pure per-unit compute (no graphics) ----------------
@@ -483,8 +513,8 @@ function plotFiringPanel(ax, fr, T, cmap, thresh)
 
     xlim(ax, [0.5 nTr+0.5]);
     ylim(ax, [0 yTop*1.30 + eps]);
-    xlabel(ax, 'Trial number   (baseline: fixation onset to next event)');
-    ylabel(ax, 'Baseline firing rate (Hz)');
+    xlabel(ax, 'Trial number');
+    ylabel(ax, {'Average firing rate (Hz)', '(Start to End)'});
     if fr.overall < thresh;  tcol = [0.85 0 0];  else;  tcol = [0 0 0];  end
     title(ax, sprintf('Overall %.2f Hz   (threshold %g Hz)', fr.overall, thresh), 'Color', tcol);
     set(ax, 'LineWidth', 1, 'FontSize', 10);
