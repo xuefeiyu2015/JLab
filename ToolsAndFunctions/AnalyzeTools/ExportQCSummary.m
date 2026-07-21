@@ -1,17 +1,27 @@
-function [behaviorFile, spikeFile] = ExportQCSummary(quality, savePath)
-% Append a quality-check recording to the per-monkey summary CSVs.
+function summaryFile = ExportQCSummary(quality, savePath)
+% Append a quality-check recording to the per-monkey combined summary CSV.
 %
-% Writes two CSVs into a shared Summary folder at the data root, one pair per
-% monkey (monkey name in the filename, recording date as a column so many
-% recordings accumulate in one file):
-%   <Monkey>_behavior_summary.csv - one row per task tested in the recording:
-%       Monkey, Date, Task, TotalValidTrials, MinRep, MinRepCondition
-%   <Monkey>_spike_summary.csv    - one row per isolated unit:
-%       Monkey, Date, Channel, Unit, MeanFiringRate_Hz, BaselineFiringRate_Hz,
-%       SNR, P2V_uV, Width_ms, ISIviolation, PCAratio, Excluded, Reason, Note
+
+% Writes ONE CSV into a shared Summary folder at the data root, one per monkey
+% (monkey name in the filename, recording date as a column so many recordings
+% accumulate in one file):
+%   <Monkey>_qc_summary.csv - one row per isolated unit, carrying both the
+%       per-unit spike metrics and the session's behavior summary. The behavior
+%       summary is pivoted wide by task and repeated onto every unit row, so a
+%       recording's rows all share the same behavior columns:
+%         spike    : Monkey, Date, Channel, Unit, MeanFiringRate_Hz,
+%                    BaselineFiringRate_Hz, SNR, P2V_uV, Width_ms, ISIviolation,
+%                    PCAratio, Excluded, Reason, Note
+%         behavior : four columns per task <T> (from behaviorCheck's condition
+%                    table) - <T> (successful trials), <T>_MinRep,
+%                    <T>_MinRepCond, <T>_SuccessRate
+
 %
-% Re-exporting a recording replaces that date's rows (upsert). A session with no
-% isolated units still updates the behavior CSV but adds nothing to the spike CSV.
+% A session with no isolated units still writes one behavior-only row (the spike
+% columns left NaN/blank). Re-exporting a recording replaces that date's rows
+% (upsert). A task appearing for the first time adds new columns; the rows of
+% earlier recordings are back-filled (NaN for the numeric columns, blank for the
+% min-rep condition string).
 %
 % Input:
 %   quality  - struct from QualityCheck: .spike (per-unit metrics, may be empty)
@@ -20,50 +30,60 @@ function [behaviorFile, spikeFile] = ExportQCSummary(quality, savePath)
 %              monkey, date and data root are parsed from it.
 %
 % Output:
-%   behaviorFile, spikeFile - paths written ('' when nothing was written).
+%   summaryFile - path written ('' when nothing was written).
 %
 % Xuefei Yu Jul 2026
 
-    behaviorFile = '';  spikeFile = '';
+    summaryFile = '';
     if nargin < 2 || isempty(savePath)
         return
     end
 
     [monkey, dateStr, dataRoot] = parseSessionPath(savePath);
     if isempty(monkey);  monkey = 'unknown';  end
-    summaryDir = fullfile(dataRoot, 'Summary');
-    if ~exist(summaryDir, 'dir');  mkdir(summaryDir);  end
 
-    % ---------------- behavior CSV (one row per tested task) --------------
-    behT = behaviorTable(quality, monkey, dateStr);
-    if ~isempty(behT)
-        behaviorFile = fullfile(summaryDir, [monkey '_behavior_summary.csv']);
-        upsertSummary(behaviorFile, behT, {'Monkey', 'Date', 'Task', 'MinRepCondition'});
+    newT = combinedTable(quality, monkey, dateStr);
+    if isempty(newT)
+        return
     end
 
-    % ---------------- spike CSV (one row per unit; skip when none) --------
-    spkT = spikeTable(quality, monkey, dateStr);
-    if ~isempty(spkT)
-        spikeFile = fullfile(summaryDir, [monkey '_spike_summary.csv']);
-        upsertSummary(spikeFile, spkT, {'Monkey', 'Date', 'Reason', 'Note'});
+    summaryDir = fullfile(dataRoot, 'Summary');
+    if ~exist(summaryDir, 'dir');  mkdir(summaryDir);  end
+    summaryFile = fullfile(summaryDir, [monkey '_qc_summary.csv']);
+    upsertSummary(summaryFile, newT);
+end
+
+
+function T = combinedTable(quality, monkey, dateStr)
+% One row per isolated unit (spike metrics) with the session's behavior summary
+% repeated onto each row. A session with no units still yields a single
+% behavior-only row (spike columns blank). Empty when there is neither spike nor
+% behavior data.
+    spk = spikeTable(quality, monkey, dateStr);   % 0..n unit rows
+    beh = behaviorWide(quality);                  % 1-row task columns, or empty
+
+    if isempty(spk) && isempty(beh)
+        T = table();
+        return
+    end
+    if isempty(spk)
+        spk = blankSpikeRow(monkey, dateStr);     % single NaN/blank unit row
+    end
+    if isempty(beh)
+        T = spk;
+    else
+        T = [spk, repmat(beh, height(spk), 1)];
     end
 end
 
 
-function T = behaviorTable(quality, monkey, dateStr)
-% Prepend Monkey/Date to the per-task condition table from behaviorCheck.
-% behaviorCheck returns that condition table directly (quality.behavior IS the
-% table); its exact columns are taken as-is, so a rename there needs no change
-% here. The text columns for the upsert are named in ExportQCSummary's caller.
-    T = table();
-    if ~isfield(quality, 'behavior') || ~istable(quality.behavior) || isempty(quality.behavior)
-        return
-    end
-    C = quality.behavior;
-    n = height(C);
-    meta = table(repmat(string(monkey), n, 1), repmat(string(dateStr), n, 1), ...
-        'VariableNames', {'Monkey', 'Date'});
-    T = [meta, C];
+% -------------------------------------------------------------------------
+% Spike columns (one schema, used by both the unit rows and the blank row)
+% -------------------------------------------------------------------------
+function names = spikeVarNames()
+    names = {'Monkey', 'Date', 'Channel', 'Unit', 'MeanFiringRate_Hz', ...
+        'BaselineFiringRate_Hz', 'SNR', 'P2V_uV', 'Width_ms', 'ISIviolation', ...
+        'PCAratio', 'Excluded', 'Reason', 'Note'};
 end
 
 
@@ -82,20 +102,73 @@ function T = spikeTable(quality, monkey, dateStr)
         round(col('overallRate'), 3), round(col('baselineMeanRate'), 3), ...
         round(col('snr'), 3), round(col('peakToValley'), 2), round(col('widthMs'), 4), ...
         round(col('violationRate'), 5), round(col('pcaRatio'), 3), ...
-        double([sp.Excluded]'), string({sp.Reason}'), string({sp.Note}'), ...
-        'VariableNames', {'Monkey', 'Date', 'Channel', 'Unit', 'MeanFiringRate_Hz', ...
-            'BaselineFiringRate_Hz', 'SNR', 'P2V_uV', 'Width_ms', 'ISIviolation', ...
-            'PCAratio', 'Excluded', 'Reason', 'Note'});
+        double([sp.Excluded]'), string({sp.Reason}'), string({sp.Comment}'), ...
+        'VariableNames', spikeVarNames());
+
 end
 
 
-function upsertSummary(file, newT, textVars)
-% Append newT to file, first dropping any existing rows for the same Monkey+Date.
+function T = blankSpikeRow(monkey, dateStr)
+% A single unit row for a session with no isolated units: spike metrics NaN,
+% text columns blank, only Monkey/Date filled in.
+    names = spikeVarNames();
+    vals  = cell(1, numel(names));
+    for i = 1:numel(names)
+        if isTextVar(names{i})
+            vals{i} = string(missing);
+        else
+            vals{i} = NaN;
+        end
+    end
+    T = table(vals{:}, 'VariableNames', names);
+    T.Monkey = string(monkey);
+    T.Date   = string(dateStr);
+end
+
+
+% -------------------------------------------------------------------------
+% Behavior columns: the per-task condition table pivoted into one wide row
+% -------------------------------------------------------------------------
+function T = behaviorWide(quality)
+% Pivot behaviorCheck's per-task condition table into a single row: four columns
+% per task -- <task> (successful trials), <task>_MinRep, <task>_MinRepCond,
+% <task>_SuccessRate. Empty table when there is no behavior data.
+    T = table();
+    if ~isfield(quality, 'behavior') || ~istable(quality.behavior) || isempty(quality.behavior)
+        return
+    end
+    C     = quality.behavior;
+    vals  = {};
+    names = {};
+    for i = 1:height(C)
+        tok = matlab.lang.makeValidName(regexprep(char(C.Task(i)), '\W', '_'));
+        vals(end+1)  = { double(C.SuccessfulTrials(i)) };         %#ok<AGROW>
+        names(end+1) = { tok };                                   %#ok<AGROW>
+        vals(end+1)  = { double(C.MinRep(i)) };                   %#ok<AGROW>
+        names(end+1) = { [tok '_MinRep'] };                       %#ok<AGROW>
+        vals(end+1)  = { string(C.MinRepCondition(i)) };          %#ok<AGROW>
+        names(end+1) = { [tok '_MinRepCond'] };                   %#ok<AGROW>
+        vals(end+1)  = { round(double(C.SuccessfulRate(i)), 3) }; %#ok<AGROW>
+        names(end+1) = { [tok '_SuccessRate'] };                  %#ok<AGROW>
+    end
+    T = table(vals{:}, 'VariableNames', names);
+end
+
+
+% -------------------------------------------------------------------------
+% Upsert with a growing column set
+% -------------------------------------------------------------------------
+function upsertSummary(file, newT)
+% Append newT to file after dropping any rows already recorded for this
+% Monkey+Date. Columns for a task not seen before are appended; the rows of
+% earlier recordings are back-filled (NaN for numeric, blank for string columns).
     if exist(file, 'file') == 2
-        old = readExisting(file, textVars);
-        old = alignColumns(old, newT.Properties.VariableNames);
-        keep = ~(old.Monkey == newT.Monkey(1) & old.Date == newT.Date(1));
-        combined = [old(keep, :); newT];
+        old = readExisting(file);
+        vn  = unionVarNames(old.Properties.VariableNames, newT.Properties.VariableNames);
+        old = reindexColumns(old, vn);
+        new = reindexColumns(newT, vn);
+        keep = ~(old.Monkey == new.Monkey(1) & old.Date == new.Date(1));
+        combined = [old(keep, :); new];
     else
         combined = newT;
     end
@@ -103,26 +176,51 @@ function upsertSummary(file, newT, textVars)
 end
 
 
-function T = readExisting(file, textVars)
-% Read an existing summary CSV with stable types: the named text columns as
-% string (so '2026-07-15' is not auto-parsed to datetime), everything else double.
-    opts = detectImportOptions(file, 'Delimiter', ',');
-    tv = intersect(textVars, opts.VariableNames);
-    if ~isempty(tv);  opts = setvartype(opts, tv, 'string');  end
-    nv = setdiff(opts.VariableNames, textVars);
-    if ~isempty(nv);  opts = setvartype(opts, nv, 'double');  end
-    T = readtable(file, opts);
+function vn = unionVarNames(oldNames, newNames)
+% Existing columns keep their order; genuinely new columns are appended.
+    extra = newNames(~ismember(newNames, oldNames));
+    vn    = [oldNames, extra];
 end
 
 
-function old = alignColumns(old, vn)
-% Make old carry exactly the columns vn (same order); fill any new column blank.
+function T = reindexColumns(T, vn)
+% Give T exactly the columns vn, in that order, adding any it lacks. A missing
+% column is filled blank for the string columns (Monkey/Date/Reason/Note and the
+% per-task *_MinRepCond), NaN for every numeric column.
     for i = 1:numel(vn)
-        if ~ismember(vn{i}, old.Properties.VariableNames)
-            old.(vn{i}) = repmat(string(missing), height(old), 1);
+        name = vn{i};
+        if ~ismember(name, T.Properties.VariableNames)
+            if isTextVar(name)
+                T.(name) = repmat(string(missing), height(T), 1);
+            else
+                T.(name) = nan(height(T), 1);
+            end
         end
     end
-    old = old(:, vn);
+    T = T(:, vn);
+end
+
+
+function tf = isTextVar(name)
+% The string columns of the combined table: the fixed spike text columns plus
+% every per-task min-rep condition label.
+    tf = ismember(name, {'Monkey', 'Date', 'Reason', 'Note'}) || ...
+         endsWith(name, '_MinRepCond');
+end
+
+
+function T = readExisting(file)
+% Read an existing summary CSV with stable types: the string columns
+% (Monkey/Date/Reason/Note and the per-task *_MinRepCond) as string so labels and
+% dates are not auto-parsed to datetime, every other column as double. Header
+% tokens are preserved verbatim so they round-trip through the upsert.
+    opts   = detectImportOptions(file, 'Delimiter', ',', 'VariableNamingRule', 'preserve');
+    isText = cellfun(@isTextVar, opts.VariableNames);
+    tv     = opts.VariableNames(isText);
+    nv     = opts.VariableNames(~isText);
+    if ~isempty(tv);  opts = setvartype(opts, tv, 'string');  end
+    if ~isempty(nv);  opts = setvartype(opts, nv, 'double');  end
+    T = readtable(file, opts);
 end
 
 

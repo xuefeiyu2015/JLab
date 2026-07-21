@@ -283,13 +283,16 @@ function spikesummary = spikeCheck(spike, waveform, cd, savePath, plotFlag)
         set(fig, 'Pointer', 'watch');  drawnow;
         [bf, sf] = exportQC();
         set(fig, 'Pointer', 'arrow');
-        if isempty(sf)
-            statusTxt.String = 'Behavior summary exported (no spikes).';
+
+        q = struct('spike', S, 'behavior', behaviorCheck(cd, false));
+        summaryFile = ExportQCSummary(q, savePath);
+        if isempty(q.spike)
+            statusTxt.String = 'QC summary exported (no spikes).';
+
         else
-            statusTxt.String = 'Summary exported (behavior + spikes).';
+            statusTxt.String = 'QC summary exported (behavior + spikes).';
         end
-        if ~isempty(bf);  fprintf('Exported %s\n', bf);  end
-        if ~isempty(sf);  fprintf('Exported %s\n', sf);  end
+        if ~isempty(summaryFile);  fprintf('Exported %s\n', summaryFile);  end
     end
 
     % Compute every unit's full metrics and write the QC summary CSVs. Shared by
