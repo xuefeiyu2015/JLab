@@ -24,7 +24,7 @@ function quality = QualityCheck(data, FileValid, savePath, plotFlag)
 %                               MinRepCondition)
 %                  .spike     - struct array, one per (channel,unit), with the
 %                               numbers behind the spike GUI: baseline firing
-%                               rate, ISI violation / Fano, waveform SNR / width,
+%                               rate, ISI violation, waveform SNR / width,
 %                               PCA cluster-separation ratio
 %
 % The behavior check itself lives in the standalone behaviorCheck.m (callable

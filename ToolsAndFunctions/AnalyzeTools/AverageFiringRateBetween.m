@@ -22,11 +22,16 @@ function [rate, count, dur] = AverageFiringRateBetween(seq, window)
 % Xuefei Yu Jul 2026
 
     data = seq.data;
+    %
     if isfield(seq, 'time')
         tvec = seq.time(:).';
+        disp('Use the raw time');
     else
         tvec = seq.timeseq.relative_time(:).';
+        disp('Calculate based on the relative time');
     end
+   
+    
     binW = 1 / seq.info.samplingrate;
 
     [nUnit, nTr, ~] = size(data);

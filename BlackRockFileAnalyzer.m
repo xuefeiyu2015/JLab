@@ -35,8 +35,8 @@ Folder = '2026-07-15';
 
 
 %Toddles to turn quality check plots on
-PlotBehaviorCheck= true; % for visualizing behavior summary
-PlotCalibratedEyes = true;% for plotting eye trace after calibration
+PlotBehaviorCheck= false; % for visualizing behavior summary
+PlotCalibratedEyes = false;% for plotting eye trace after calibration
 PlotSpikeCheck = true; %turn on the spike navigator interface
 
 
@@ -63,7 +63,7 @@ waveform_path = findExportFile(all_files, main_path, 'spikes_waveform');
 
 if ~isempty(comments_path)
     comments_data = readtable(comments_path);
-    BehaviorSummary = behaviorCheck(comments_data, plotBehaviorCheck);
+    BehaviorSummary = behaviorCheck(comments_data, PlotBehaviorCheck);
    
 else
     
@@ -112,9 +112,9 @@ if ~isempty(spike_path)
     end
 
      
-    quality.spike = spikeCheck(spike_data, spikewaveform_data, ...
+    SpikeSummary = spikeCheck(spike_data, spikewaveform_data, ...
                                    comments_data, main_path, PlotSpikeCheck );
-
+   
     
 else
     disp('No spike data found');
@@ -122,37 +122,9 @@ else
 end
 
 
+%Screen the tasks and spikes according to the behavior and spike check
 
-
-
-
-
-if sum(FileValid) > 0
-    %Do a first quality check:
-
-    check_data.comments = comments_data;
-    check_data.eyes = caled_eyes;
-    check_data.spike = spike_data;
-    check_data.spikewaveform = spikewaveform_data;
-
-    % main_path is the export folder; the spike QC writes/reads its per-unit
-    % exclusion labels (unit_qc_exclusions.csv) there.
-    quality = QualityCheck(check_data,FileValid,main_path,PlotQualityCheck);
-
-    %After the quality check
-
-    ana_data = check_data;
-    ana_data.quanlity = quality;
-
-
-
-keyboard
-    
-
-
-else
-    disp('Can not do quality check, no exported data file available.')
-end
+%excludeTrials, excludeSpikes = ScreenSession(BehaviorSummary,SpikeSummary);
 
 
 
@@ -426,16 +398,3 @@ function plotAlignedEyeTraces(aligned_eye, relative_time_seq, conditions, ttl, n
 end
 
 
-function A = subsetAnalogTrials(analog, sel)
-% Subset a segmented analog product along the trial dimension.
-%   sel - logical/index over trials (dim 2 of analog.data, 1:1 with CSV rows).
-% Per-trial fields (data, info.Session/Trial_number, timeseq.alignedrawtime) are
-% sliced; shared fields (relative_time, samplingrate, ...) are left untouched.
-    A = analog;
-    A.data              = analog.data(:, sel, :);
-    A.info.Session      = analog.info.Session(sel);
-    A.info.Trial_number = analog.info.Trial_number(sel);
-    if isfield(analog.timeseq, 'alignedrawtime')
-        A.timeseq.alignedrawtime = analog.timeseq.alignedrawtime(sel);
-    end
-end

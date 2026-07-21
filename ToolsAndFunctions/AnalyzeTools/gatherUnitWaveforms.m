@@ -7,7 +7,7 @@ function W = gatherUnitWaveforms(waveform, T, r, trialMask)
 % Input:
 %   waveform  - online_spike_waveform product: .waveform (units x trials x maxSpk
 %               x nSamp, uV, NaN-padded).
-%   T         - struct from alignSpikeTrials (uses .valid to skip unmatched trials).
+%   T         - struct from SpikeTrialAlignmentCheck (uses .valid to skip unmatched trials).
 %   r         - raster row (unit) index.
 %   trialMask - logical / index over trials selecting which trials to gather.
 %

@@ -57,6 +57,7 @@ classdef BlackrockLoader < handle
         Segment_PreBuffer  = 500   % ms kept before each trial's Start marker
         Segment_PostBuffer = 500   % ms kept after  each trial's End  marker
         Segment_BinWidth   = 1     % spike raster bin width (ms)
+        Spike_ISIViolationMs = 1   % ms; refractory window for info.ViolationRate
     end
 
     properties (SetAccess = private)
@@ -839,7 +840,8 @@ classdef BlackrockLoader < handle
             if L.LoadOnlineSpikeData
                 obj.Spike = BlackrockLoader.segmentSpikes(obj.Trials, S.TimeSec, ...
                     S.Channel, S.Unit, ...
-                    obj.Segment_PreBuffer, obj.Segment_PostBuffer, obj.Segment_BinWidth);
+                    obj.Segment_PreBuffer, obj.Segment_PostBuffer, obj.Segment_BinWidth, ...
+                    obj.Spike_ISIViolationMs);
             end
             if L.LoadOnlineSpikeWaveform && ~isempty(S.Waveform)
                 obj.SpikeWaveformData = BlackrockLoader.segmentSpikeWaveforms(obj.Trials, ...
@@ -1122,7 +1124,7 @@ classdef BlackrockLoader < handle
             A.info.Trial_number = [trials.Trial_number]';   % nTrials x 1
         end
 
-        function R = segmentSpikes(trials, spikeTimes, spikeElectrode, spikeUnit, preMs, postMs, binMs)
+        function R = segmentSpikes(trials, spikeTimes, spikeElectrode, spikeUnit, preMs, postMs, binMs, violMs)
         % Rasterize online spikes into one binary slice per trial.
         % For each trial the window is [Start - preMs, End + postMs] (ms buffers),
         % matched against spikeTimes (seconds, NSP/HUB clock). Time is binned at
@@ -1133,12 +1135,16 @@ classdef BlackrockLoader < handle
         % Rows are one per (electrode, unit) pair, so NtotalUnit is the total
         % isolated units summed across channels (a channel with 2 units -> 2 rows);
         % info.Channel_Number / info.Unit_No record the IDs per row.
+        % info.ViolationRate carries each unit's overall ISI-violation rate
+        % (fraction of ISIs < violMs, default 1 ms) over its full continuous spike
+        % train -- a timing-only QC metric that needs no waveform product.
         % A trial whose Start/End is NaN gets an all-NaN slice so the trial
         % dimension stays index-aligned with trials.
         % (Per-spike waveforms are a separate product: see segmentSpikeWaveforms.)
             if nargin < 5 || isempty(preMs);  preMs  = 500; end   % default buffer (ms)
             if nargin < 6 || isempty(postMs); postMs = 500; end
             if nargin < 7 || isempty(binMs);  binMs  = 1;   end   % bin width (ms)
+            if nargin < 8 || isempty(violMs); violMs = 1;   end   % ISI-violation window (ms)
 
             pre    = preMs  / 1000;   % seconds
             post   = postMs / 1000;
@@ -1155,6 +1161,19 @@ classdef BlackrockLoader < handle
             nChan     = size(chanKeys, 1);
             % map each spike to its channel row
             [~, spikeRow] = ismember([spikeElectrode, spikeUnit], chanKeys, 'rows');
+
+            % --- overall ISI-violation rate per unit (row-aligned to chanKeys) ---
+            % Fraction of ISIs < violMs over each unit's FULL continuous spike train
+            % (not per-trial): a pure timing metric, independent of the raster and
+            % of the waveform product. NaN for a unit with fewer than 2 spikes.
+            violSec  = violMs / 1000;
+            violRate = nan(nChan, 1);
+            for r = 1:nChan
+                tr = sort(spikeTimes(spikeRow == r));
+                if numel(tr) >= 2
+                    violRate(r) = mean(diff(tr) < violSec);
+                end
+            end
 
             nTrials = numel(trials);
 
@@ -1213,6 +1232,7 @@ classdef BlackrockLoader < handle
             R.info.Trial_number   = [trials.Trial_number]';% nTrials x 1
             R.info.Channel_Number = electrode;             % NtotalUnit x 1, electrode per row
             R.info.Unit_No        = unit;                  % NtotalUnit x 1, unit per row
+            R.info.ViolationRate  = violRate;              % NtotalUnit x 1, frac ISIs < violMs (full train)
         end
 
         function W = segmentSpikeWaveforms(trials, spikeTimes, spikeElectrode, spikeUnit, spikeWaveform, preMs, postMs)

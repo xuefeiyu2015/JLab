@@ -1,4 +1,4 @@
-function S = spikeCheck(spike, waveform, cd, savePath, plotFlag)
+function spikesummary = spikeCheck(spike, waveform, cd, savePath, plotFlag)
 % Spike quality check: an interactive per-unit browser, standalone and callable
 % right after loading the spike raster (and optionally the waveform product).
 %
@@ -11,12 +11,12 @@ function S = spikeCheck(spike, waveform, cd, savePath, plotFlag)
 %   plotFlag - (optional, default true) draw the GUI. false runs headless: every
 %              unit's metrics are computed into S and NO figure is created.
 %
-% Returns S, a per-(channel,unit) struct array of metrics + exclusion labels.
+% Returns spikesummary, a per-(channel,unit) struct array of metrics + exclusion labels.
 %
 % Computation is separated from visualization: the per-unit numbers are assembled
 % by computeUnit (pure, no graphics) from the reusable spike-computation functions
-% (alignSpikeTrials, spikeBaselineWindow, AlignSpikeSequence,
-% AverageFiringRateBetween, gatherUnitSpikeTimes, computeISI, fano,
+% (SpikeTrialAlignmentCheck, spikeAvgWindow, AlignSpikeSequence,
+% AverageFiringRateBetween, gatherUnitSpikeTimes, computeISI,
 % gatherUnitWaveforms, extractWaveformFeatures, spikeWaveformPCA). The panels
 % (plotFiringPanel / plotISIPanel / plotWaveformPanel / plotPCAPanel) only render.
 % The firing + ISI panels rely on the spike binary raster; the waveform + PCA
@@ -42,7 +42,8 @@ function S = spikeCheck(spike, waveform, cd, savePath, plotFlag)
     nRow     = numel(chan);
     channels = unique(chan, 'stable');
     relTime  = spike.timeseq.relative_time(:).';   % 1 x maxBins, s from Start
-    T        = alignSpikeTrials(spike, cd);
+    AveMarker = {'Start', 'End'};
+    T        = SpikeTrialAlignmentCheck(spike, cd, AveMarker); %Check the alignment between spikes and trials.
 
     % Shared per-unit task palette so a task means one colour across panels.
     present = T.valid & ~cellfun(@isempty, T.task);
@@ -50,19 +51,21 @@ function S = spikeCheck(spike, waveform, cd, savePath, plotFlag)
     cmap    = lines(max(numel(utasks), 1));
 
     % --- RASTER GROUP: baseline firing (units x trials), computed once ------
-    % Align every trial to fixation onset, average the rate over the fixation-to-
-    % next-event window (variable-length -> rate); overallRate pools the raster.
-    [bMarker, bWin] = spikeBaselineWindow(T);
+    % Average trials between start and end.
+    bMarker = T.(AveMarker{1});
+    bWin = [zeros(size(bMarker,1),1), T.(AveMarker{2}) - T.(AveMarker{1})];
+
     alignedBase = AlignSpikeSequence(spike, bMarker, [0 max([bWin(:,2); 0])]);
     baseRate    = AverageFiringRateBetween(alignedBase, bWin);
-    % Fano counts come from a FIXED sub-window [0, minGap] shared by every trial,
-    % so the count variance reflects firing variability, not window-length.
-    fanoWinSec = min(bWin(:, 2), [], 'omitnan');
-    if isempty(fanoWinSec) || isnan(fanoWinSec);  fanoWinSec = 0;  end
-    [~, fanoCount] = AverageFiringRateBetween(alignedBase, [0 fanoWinSec]);
     [~, allCount, allDur] = AverageFiringRateBetween(spike, ...
         [relTime(1), relTime(end) + 1/spike.info.samplingrate]);
     overallRate = sum(allCount, 2, 'omitnan') ./ sum(allDur, 2, 'omitnan');   % units x 1
+
+    % Overall ISI-violation rate: prefer the value precomputed by the loader
+    % (spike.info.ViolationRate, a full-train timing metric that needs no
+    % waveform). haveViol=false falls back to the waveform-based path below.
+    haveViol = isfield(spike.info, 'ViolationRate') && numel(spike.info.ViolationRate) == nRow;
+    if haveViol;  overallViol = spike.info.ViolationRate(:);  else;  overallViol = nan(nRow, 1);  end
 
     % --- exclusion labels + per-unit metric store --------------------------
     if isempty(savePath)
@@ -71,24 +74,43 @@ function S = spikeCheck(spike, waveform, cd, savePath, plotFlag)
         exclFile = fullfile(savePath, 'unit_qc_exclusions.csv');
     end
     S = repmat(struct('Channel', NaN, 'Unit', NaN, 'overallRate', NaN, ...
-        'baselineMeanRate', NaN, 'violationRate', NaN, 'fano', NaN, ...
+        'baselineMeanRate', NaN, 'violationRate', NaN, ...
         'snr', NaN, 'widthMs', NaN, 'peakToValley', NaN, 'pcaRatio', NaN, ...
-        'Excluded', false, 'Reason', '', 'Comment', ''), nRow, 1);
+        'Excluded', false, 'Reason', '', 'Note', ''), nRow, 1);
     excl = loadExclusions(exclFile, chan, unit);
     for k = 1:nRow
         S(k).Channel  = chan(k);
         S(k).Unit     = unit(k);
         S(k).Excluded = excl(k).excluded;
         S(k).Reason   = excl(k).reason;
-        S(k).Comment  = excl(k).comment;
+        S(k).Note     = excl(k).note;
     end
 
-    % --- headless: compute every unit, no figure ---------------------------
-    if ~plotFlag
-        for rr = 1:nRow
-            storeMetrics(rr, computeUnit(rr));
+    % --- returned summary: cheap, no waveform / feature / PCA work ----------
+    % overallRate is already vectorised over all units (computed above), so
+    % AvgFR needs no loop. The overall violation rate comes from the loader's
+    % precomputed value (no waveform touched); the legacy fallback below only
+    % runs for older spike products, and then only when waveforms are present
+    % (raster-quantised times give a meaningless violation).
+    if haveViol
+        violationRate = overallViol;
+    else
+        violationRate = nan(nRow, 1);
+        if haveWave
+            for rr = 1:nRow
+                tc = gatherUnitSpikeTimes(spike, waveform, rr);
+                [~, violationRate(rr)] = computeISI(tc, 0.001);
+            end
         end
-        return
+    end
+    spikesummary = struct( ...
+        'Channel',       chan, ...
+        'Unit',          unit, ...
+        'AvgFR',         overallRate, ...
+        'ViolationRate', violationRate);
+
+    if ~plotFlag
+        return           % headless: summary only, no figure
     end
 
     % =====================================================================
@@ -124,7 +146,7 @@ function S = spikeCheck(spike, waveform, cd, savePath, plotFlag)
     uicontrol(fig, 'Style', 'text', 'Units', 'normalized', ...
         'Position', [0.01 0.565 0.14 0.025], 'String', 'Note', ...
         'BackgroundColor', 'w', 'HorizontalAlignment', 'left');
-    commentEdit = uicontrol(fig, 'Style', 'edit', 'Units', 'normalized', ...
+    noteEdit = uicontrol(fig, 'Style', 'edit', 'Units', 'normalized', ...
         'Position', [0.01 0.49 0.14 0.075], 'String', '', 'Max', 2, 'Min', 0, ...
         'HorizontalAlignment', 'left', 'Callback', @(~,~) onExclusion());
 
@@ -144,7 +166,7 @@ function S = spikeCheck(spike, waveform, cd, savePath, plotFlag)
     axPCA = axes('Parent', pnl, 'Position', [0.58 0.08 0.38 0.42]);
     featTable = uitable('Parent', pnl, 'Units', 'normalized', ...
         'Position', [0.08 0.05 0.40 0.19], 'Data', {}, ...
-        'ColumnName', {'nSpk', 'Rate(Hz)', 'Fano', 'Viol', 'SNR', 'Width(ms)', 'P2V(uV)'});
+        'ColumnName', {'nSpk', 'Rate(Hz)', 'Viol', 'SNR', 'Width(ms)', 'P2V(uV)'});
 
     exclBanner = uicontrol(fig, 'Style', 'text', 'Units', 'normalized', ...
         'Position', [0.17 0.955 0.82 0.035], 'String', '', ...
@@ -191,8 +213,8 @@ function S = spikeCheck(spike, waveform, cd, savePath, plotFlag)
         plotPCAPanel(axPCA,    st.pca, cmap);
         fillSummaryTable(featTable, utasks, st);
         storeMetrics(curRow, st);
-        statusTxt.String = sprintf('Ch %d  Unit %d\n(%d / %d units)\nOverall %.2f Hz', ...
-            chan(curRow), unit(curRow), curRow, nRow, st.firing.overall);
+        statusTxt.String = sprintf('Ch %d/%d  Unit %d\n(%d / %d units)\nOverall %.2f Hz', ...
+            chan(curRow), numel(channels), unit(curRow), curRow, nRow, st.firing.overall);
     end
 
     function syncExclusionControls(r)
@@ -200,7 +222,7 @@ function S = spikeCheck(spike, waveform, cd, savePath, plotFlag)
         ri = find(strcmp(REASONS, S(r).Reason), 1);
         if isempty(ri);  ri = 1;  end
         reasonPop.Value    = ri;
-        commentEdit.String = S(r).Comment;
+        noteEdit.String    = S(r).Note;
         setExclusionEnable(S(r).Excluded);
         refreshBanner(r);
     end
@@ -209,27 +231,29 @@ function S = spikeCheck(spike, waveform, cd, savePath, plotFlag)
         r = curRow;
         S(r).Excluded = logical(exclChk.Value);
         S(r).Reason   = REASONS{reasonPop.Value};
-        cmt = commentEdit.String;
-        if iscell(cmt);            cmt = strjoin(cmt, ' ');
-        elseif size(cmt, 1) > 1;   cmt = strjoin(cellstr(cmt), ' ');  end
-        S(r).Comment  = strtrim(regexprep(cmt, '\s+', ' '));
+        nt = noteEdit.String;
+        if iscell(nt);            nt = strjoin(nt, ' ');
+        elseif size(nt, 1) > 1;   nt = strjoin(cellstr(nt), ' ');  end
+        S(r).Note     = strtrim(regexprep(nt, '\s+', ' '));
         setExclusionEnable(S(r).Excluded);
         refreshBanner(r);
         saveExclusions(exclFile, chan, unit, S);
     end
 
     function setExclusionEnable(on)
+        % Reason is an exclusion reason, gated by the checkbox; the note box is
+        % always editable so a unit can be annotated without being excluded.
         if on;  st = 'on';  else;  st = 'off';  end
         reasonPop.Enable   = st;
-        commentEdit.Enable = st;
+        noteEdit.Enable    = 'on';
     end
 
     function refreshBanner(r)
         if S(r).Excluded
-            if isempty(S(r).Comment)
+            if isempty(S(r).Note)
                 msg = sprintf('EXCLUDED  -  %s', S(r).Reason);
             else
-                msg = sprintf('EXCLUDED  -  %s: %s', S(r).Reason, S(r).Comment);
+                msg = sprintf('EXCLUDED  -  %s: %s', S(r).Reason, S(r).Note);
             end
             exclBanner.String  = msg;
             exclBanner.Visible = 'on';
@@ -305,7 +329,6 @@ function S = spikeCheck(spike, waveform, cd, savePath, plotFlag)
 
     function is = isiStats(r)
         tc = gatherUnitSpikeTimes(spike, waveform, r);   % precise if waveform present
-        fc = fanoCount(r, :).';
 
         isiByTask    = cell(numel(utasks), 1);
         countsByTask = zeros(numel(utasks), 1);
@@ -321,10 +344,16 @@ function S = spikeCheck(spike, waveform, cd, savePath, plotFlag)
         is.isiByTask     = isiByTask;
         is.countsByTask  = countsByTask;
         is.totalSpikes   = sum(cellfun(@numel, tc));
-        is.fanoByTask    = arrayfun(@(t) fano(fc(strcmp(T.task, utasks{t}))), 1:numel(utasks)).';
-        is.fanoAll       = fano(fc);
         is.violationByTask = violByTask;
-        if haveWave;  is.violationRate = violAll;  else;  is.violationRate = NaN;  end
+        % Overall violation: the loader's precomputed value when present, else the
+        % waveform-based fallback. Per-task violation stays waveform-based (above).
+        if haveViol
+            is.violationRate = overallViol(r);
+        elseif haveWave
+            is.violationRate = violAll;
+        else
+            is.violationRate = NaN;
+        end
 
         % Stacked histogram data (raster or waveform_time, whichever tc used).
         is.hasData = ~isempty(allIsi);
@@ -380,12 +409,12 @@ function S = spikeCheck(spike, waveform, cd, savePath, plotFlag)
         S(r).overallRate      = st.firing.overall;
         S(r).baselineMeanRate = st.firing.meanRateAll;
         S(r).violationRate    = st.isi.violationRate;
-        S(r).fano             = st.isi.fanoAll;
         S(r).snr              = st.waveform.overall.snr;
         S(r).widthMs          = st.waveform.overall.widthMs;
         S(r).peakToValley     = st.waveform.overall.peakToValley;
         S(r).pcaRatio         = st.pca.ratio;
     end
+
 end
 
 
@@ -531,26 +560,26 @@ end
 
 
 function fillSummaryTable(featTable, utasks, st)
-% Per-task summary table (one row per task + 'All'): counts / rate / Fano /
+% Per-task summary table (one row per task + 'All'): counts / rate /
 % violation from the raster group, SNR / width / P2V from the waveform group.
-    tbl   = cell(0, 7);
+    tbl   = cell(0, 6);
     rowNm = {};
     for t = 1:numel(utasks)
         w = findByTask(st.waveform.byTask, utasks{t});
         tbl(end+1,:) = {st.isi.countsByTask(t), sigOrNa(rateByTask(st.firing, utasks{t})), ...
-            sigOrNa(st.isi.fanoByTask(t)), violCell(st.isi.violationByTask(t)), ...
+            violCell(st.isi.violationByTask(t)), ...
             wfCell(w, 'snr', 2), wfCell(w, 'widthMs', 3), wfCell(w, 'peakToValley', 1)}; %#ok<AGROW>
         rowNm{end+1} = strrep(utasks{t}, '_', ' '); %#ok<AGROW>
     end
     tbl(end+1,:) = {st.isi.totalSpikes, sigOrNa(st.firing.meanRateAll), ...
-        sigOrNa(st.isi.fanoAll), violCell(st.isi.violationRate), ...
+        violCell(st.isi.violationRate), ...
         wfCell(st.waveform.overall, 'snr', 2), wfCell(st.waveform.overall, 'widthMs', 3), ...
         wfCell(st.waveform.overall, 'peakToValley', 1)};
     rowNm{end+1} = 'All';
 
     featTable.Data      = tbl;
     featTable.RowName    = rowNm;
-    featTable.ColumnName = {'nSpk', 'Rate(Hz)', 'Fano', 'Viol', 'SNR', 'Width(ms)', 'P2V(uV)'};
+    featTable.ColumnName = {'nSpk', 'Rate(Hz)', 'Viol', 'SNR', 'Width(ms)', 'P2V(uV)'};
 end
 
 
@@ -595,12 +624,16 @@ end
 
 
 % =========================================================================
-% Exclusion-label persistence (unit_qc_exclusions.csv)
+% Per-unit QC label persistence (unit_qc_exclusions.csv)
 % =========================================================================
 function excl = loadExclusions(exclFile, chan, unit)
-% Seed per-unit exclusion state from the saved CSV, matched by (Channel, Unit).
+% Seed per-unit exclusion + note state from the saved CSV, matched by
+% (Channel, Unit). The Excluded column lets a note-only row load un-excluded; a
+% legacy file with no Excluded column is read as all rows excluded (the old
+% "listed == excluded" convention). Both the new 'Note' column and the legacy
+% 'Comment' column are accepted for the note text.
     n    = numel(chan);
-    excl = repmat(struct('excluded', false, 'reason', '', 'comment', ''), n, 1);
+    excl = repmat(struct('excluded', false, 'reason', '', 'note', ''), n, 1);
     if isempty(exclFile) || exist(exclFile, 'file') ~= 2
         return
     end
@@ -613,24 +646,34 @@ function excl = loadExclusions(exclFile, chan, unit)
         return
     end
     [tf, loc] = ismember([chan, unit], [Tb.Channel, Tb.Unit], 'rows');
-    hasReason  = ismember('Reason',  Tb.Properties.VariableNames);
-    hasComment = ismember('Comment', Tb.Properties.VariableNames);
+    hasReason   = ismember('Reason',   Tb.Properties.VariableNames);
+    hasExcluded = ismember('Excluded', Tb.Properties.VariableNames);
+    if     ismember('Note',    Tb.Properties.VariableNames);  noteVar = 'Note';
+    elseif ismember('Comment', Tb.Properties.VariableNames);  noteVar = 'Comment';
+    else;                                                     noteVar = '';
+    end
     for k = find(tf(:).')
-        excl(k).excluded = true;
-        if hasReason;   excl(k).reason  = safeStr(Tb.Reason(loc(k)));   end
-        if hasComment;  excl(k).comment = safeStr(Tb.Comment(loc(k)));  end
+        if hasExcluded
+            excl(k).excluded = logical(Tb.Excluded(loc(k)));
+        else
+            excl(k).excluded = true;   % legacy file: every listed row was excluded
+        end
+        if hasReason;         excl(k).reason = safeStr(Tb.Reason(loc(k)));       end
+        if ~isempty(noteVar); excl(k).note   = safeStr(Tb.(noteVar)(loc(k)));    end
     end
 end
 
 
 function saveExclusions(exclFile, chan, unit, S)
-% Write the currently-excluded units to the CSV, overwriting so an unchecked unit
-% disappears. No-op when persistence is off.
+% Persist units that are excluded OR carry a note, overwriting so a unit that is
+% neither excluded nor annotated disappears. The Excluded column distinguishes a
+% note-only row from an exclusion. No-op when persistence is off.
     if isempty(exclFile);  return;  end
-    sel = logical([S.Excluded]);
-    Tb  = table(chan(sel), unit(sel), string({S(sel).Reason})', ...
-        string({S(sel).Comment})', ...
-        'VariableNames', {'Channel', 'Unit', 'Reason', 'Comment'});
+    hasNote = ~cellfun(@isempty, {S.Note});
+    sel     = logical([S.Excluded]) | hasNote;
+    Tb  = table(chan(sel), unit(sel), double([S(sel).Excluded])', ...
+        string({S(sel).Reason})', string({S(sel).Note})', ...
+        'VariableNames', {'Channel', 'Unit', 'Excluded', 'Reason', 'Note'});
     try
         writetable(Tb, exclFile);
     catch ME
