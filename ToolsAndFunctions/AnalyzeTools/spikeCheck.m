@@ -7,11 +7,17 @@ function spikesummary = spikeCheck(spike, waveform, cd, savePath, plotFlag)
 %   waveform - online_spike_waveform product (same row order), or [] / omitted.
 %              When empty the waveform-dependent panels show "No waveform file".
 %   cd       - trials table (task, outcome, timing markers per trial).
-%   savePath - (optional) export folder for the exclusion / summary CSVs; '' off.
-%   plotFlag - (optional, default true) draw the GUI. false runs headless: every
-%              unit's metrics are computed into S and NO figure is created.
+%   savePath - (optional) export folder for the exclusion CSV and the QC summary
+%              CSVs (used by the GUI's Export Summary button and, when set, by a
+%              headless call -- see plotFlag); '' turns persistence/export off.
+%   plotFlag - (optional, default true) draw the GUI. false runs headless: no
+%              figure is created and the function returns spikesummary. When
+%              savePath is set, a headless call also computes every unit's full
+%              metrics (waveform-dependent SNR / width / PCA) and writes the QC
+%              summary CSVs, exactly like the Export Summary button.
 %
-% Returns spikesummary, a per-(channel,unit) struct array of metrics + exclusion labels.
+% Returns spikesummary, a struct of per-unit column vectors: Channel, Unit, AvgFR
+% (overall firing rate, Hz), ViolationRate (overall ISI-violation rate).
 %
 % Computation is separated from visualization: the per-unit numbers are assembled
 % by computeUnit (pure, no graphics) from the reusable spike-computation functions
@@ -110,7 +116,14 @@ function spikesummary = spikeCheck(spike, waveform, cd, savePath, plotFlag)
         'ViolationRate', violationRate);
 
     if ~plotFlag
-        return           % headless: summary only, no figure
+        % headless: no figure. With a savePath, also compute every unit's full
+        % metrics and write the QC summary CSVs (same as the Export Summary button).
+        if ~isempty(savePath)
+            [bf, sf] = exportQC();
+            if ~isempty(bf);  fprintf('Exported %s\n', bf);  end
+            if ~isempty(sf);  fprintf('Exported %s\n', sf);  end
+        end
+        return
     end
 
     % =====================================================================
@@ -268,12 +281,8 @@ function spikesummary = spikeCheck(spike, waveform, cd, savePath, plotFlag)
             return
         end
         set(fig, 'Pointer', 'watch');  drawnow;
-        for ii = 1:nRow
-            storeMetrics(ii, computeUnit(ii));   % fill every unit's metrics
-        end
+        [bf, sf] = exportQC();
         set(fig, 'Pointer', 'arrow');
-        q = struct('spike', S, 'behavior', behaviorCheck(cd, false));
-        [bf, sf] = ExportQCSummary(q, savePath);
         if isempty(sf)
             statusTxt.String = 'Behavior summary exported (no spikes).';
         else
@@ -281,6 +290,17 @@ function spikesummary = spikeCheck(spike, waveform, cd, savePath, plotFlag)
         end
         if ~isempty(bf);  fprintf('Exported %s\n', bf);  end
         if ~isempty(sf);  fprintf('Exported %s\n', sf);  end
+    end
+
+    % Compute every unit's full metrics and write the QC summary CSVs. Shared by
+    % the Export Summary button and the headless (savePath) path; caller checks
+    % savePath is non-empty. Fills S via computeUnit (waveform-dependent).
+    function [bf, sf] = exportQC()
+        for ii = 1:nRow
+            storeMetrics(ii, computeUnit(ii));
+        end
+        q = struct('spike', S, 'behavior', behaviorCheck(cd, false));
+        [bf, sf] = ExportQCSummary(q, savePath);
     end
 
     % ---------------- pure per-unit compute (no graphics) ----------------
