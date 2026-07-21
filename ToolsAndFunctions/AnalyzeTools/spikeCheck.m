@@ -249,14 +249,13 @@ function S = spikeCheck(spike, waveform, cd, savePath, plotFlag)
         end
         set(fig, 'Pointer', 'arrow');
         q = struct('spike', S, 'behavior', behaviorCheck(cd, false));
-        [bf, sf] = ExportQCSummary(q, savePath);
-        if isempty(sf)
-            statusTxt.String = 'Behavior summary exported (no spikes).';
+        summaryFile = ExportQCSummary(q, savePath);
+        if isempty(q.spike)
+            statusTxt.String = 'QC summary exported (no spikes).';
         else
-            statusTxt.String = 'Summary exported (behavior + spikes).';
+            statusTxt.String = 'QC summary exported (behavior + spikes).';
         end
-        if ~isempty(bf);  fprintf('Exported %s\n', bf);  end
-        if ~isempty(sf);  fprintf('Exported %s\n', sf);  end
+        if ~isempty(summaryFile);  fprintf('Exported %s\n', summaryFile);  end
     end
 
     % ---------------- pure per-unit compute (no graphics) ----------------
