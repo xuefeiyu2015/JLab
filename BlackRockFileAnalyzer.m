@@ -33,6 +33,13 @@ DataType = 'export_data';     % editable constant
 
 Folder = '2026-07-15';
 
+
+%Toddles to turn quality check plots on
+PlotBehaviorCheck= false; % for visualizing behavior summary
+PlotCalibratedEyes = false;% for plotting eye trace after calibration
+PlotSpikeCheck = false; %turn on the spike navigator interface
+
+
 %Check all the exported files in the folder
 
 main_path = fullfile(Basic_Path, sprintf('Monkey %s', Monkey), Location, DataType, Folder);
@@ -52,79 +59,96 @@ spike_path    = findExportFile(all_files, main_path, 'spikes', 'spikes_waveform'
 %Search for spike waveform file
 waveform_path = findExportFile(all_files, main_path, 'spikes_waveform');
 
-%File Check first
-FileValid = [0,0,0];
+
 
 if ~isempty(comments_path)
     comments_data = readtable(comments_path);
-    FileValid(1) = 1; 
+    BehaviorSummary = behaviorCheck(comments_data, PlotBehaviorCheck, main_path);
+   
 else
-    disp('No parsed trials data found, please parse the data using the loader first')
-    comments_data = [];
+    
+    error('No parsed trials data found. Please parse the data using the loader first.');
+    
 end
+
 
 if ~isempty(analog_path)
     tmp = load(analog_path);
     eye_data = tmp.analog;
-    FileValid(2) = 1; 
 
     %Eye calibration 
+    disp('Start eye calibration');
 
     % Candidates in priority order: a session with a dedicated fixation block
     % calibrates off it, otherwise off whichever saccade task it ran.
     task_cal  = {'fixation', 'visual_saccade', 'memory_saccade'};
-    PlotCalibratedEyes = 1;%Optional, for plotting
+    
     caled_eyes = EyeCalibration(comments_data,eye_data,task_cal,[],[], PlotCalibratedEyes); 
 
     if caled_eyes.cal.applied == false
         disp('Eye calibration failed!');
-        FileValid(2) = 0; 
-        eye_data = [];
+        
+    else
+        disp('Eye calibration completed.');
+        
     end
 
 
 else
     disp('No parsed eye data found');
-    eye_data = [];
+    caled_eyes.cal.applied = false;
 end
 
 if ~isempty(spike_path)
     tmp = load(spike_path);
     spike_data = tmp.online_spike;
-    FileValid(3) = 1; 
+
+    if ~isempty(waveform_path)
+        tmp = load(waveform_path);
+        spikewaveform_data = tmp.online_spike_waveform;
+    else
+        disp('No spike waveform found');
+        spikewaveform_data = [];
+    end
+
+     
+    SpikeSummary = spikeCheck(spike_data, spikewaveform_data, ...
+                                   comments_data, main_path, PlotSpikeCheck );
+    if PlotSpikeCheck
+        disp('Completed spikecheck!')
+    end
+   
+    
 else
     disp('No spike data found');
     spike_data = [];
 end
 
-if ~isempty(waveform_path)
-    tmp = load(waveform_path);
-    spikewaveform_data = tmp.online_spike_waveform;
-else
-    disp('No spike waveform found');
-    spikewaveform_data = [];
-end
+
+%Screen the tasks and spikes according to the behavior and spike check
+excludeTrials = [];
+excludeSpikes = zeros(size(SpikeSummary,1));
+
+[excludeTrials, excludeSpikes] = ScreenSession(BehaviorSummary,SpikeSummary);
+
+%comments_data
+%caled_eyes
+%spike_data
+%spike_waveform_data
+
+%% Preprossing: Add RT to saccade tasks.
+RT = CalculateRT(caled_eyes,comments_data);
+
+
+%% Auto-rounting to it's respective analyze protocol
+
+
+task_lists 
 
 
 
 
 
-if sum(FileValid) > 0
-    %Do a first quality check:
-
-    check_data.comments = comments_data;
-    check_data.eyes = caled_eyes;
-    check_data.spike = spike_data;
-    check_data.spikewaveform = spikewaveform_data;
-
-    quality = QualityCheck(check_data,FileValid);
-
-    
-
-
-else
-    disp('Can not do quality check, no exported data file available.')
-end
 
 keyboard
 
@@ -394,16 +418,3 @@ function plotAlignedEyeTraces(aligned_eye, relative_time_seq, conditions, ttl, n
 end
 
 
-function A = subsetAnalogTrials(analog, sel)
-% Subset a segmented analog product along the trial dimension.
-%   sel - logical/index over trials (dim 2 of analog.data, 1:1 with CSV rows).
-% Per-trial fields (data, info.Session/Trial_number, timeseq.alignedrawtime) are
-% sliced; shared fields (relative_time, samplingrate, ...) are left untouched.
-    A = analog;
-    A.data              = analog.data(:, sel, :);
-    A.info.Session      = analog.info.Session(sel);
-    A.info.Trial_number = analog.info.Trial_number(sel);
-    if isfield(analog.timeseq, 'alignedrawtime')
-        A.timeseq.alignedrawtime = analog.timeseq.alignedrawtime(sel);
-    end
-end
