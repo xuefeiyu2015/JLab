@@ -838,10 +838,14 @@ classdef BlackrockLoader < handle
             L = obj.Loaded;
             S = L.online_spike;   % source-agnostic spikeContainer (TimeSec/Channel/Unit/Waveform)
             if L.LoadOnlineSpikeData
+                wfForMean = [];
+                if L.LoadOnlineSpikeWaveform && ~isempty(S.Waveform)
+                    wfForMean = S.Waveform;   % [nSamp x nSpikes] uV, aligned to S.TimeSec/Channel/Unit
+                end
                 obj.Spike = BlackrockLoader.segmentSpikes(obj.Trials, S.TimeSec, ...
                     S.Channel, S.Unit, ...
                     obj.Segment_PreBuffer, obj.Segment_PostBuffer, obj.Segment_BinWidth, ...
-                    obj.Spike_ISIViolationMs);
+                    obj.Spike_ISIViolationMs, wfForMean);
             end
             if L.LoadOnlineSpikeWaveform && ~isempty(S.Waveform)
                 obj.SpikeWaveformData = BlackrockLoader.segmentSpikeWaveforms(obj.Trials, ...
@@ -1124,7 +1128,7 @@ classdef BlackrockLoader < handle
             A.info.Trial_number = [trials.Trial_number]';   % nTrials x 1
         end
 
-        function R = segmentSpikes(trials, spikeTimes, spikeElectrode, spikeUnit, preMs, postMs, binMs, violMs)
+        function R = segmentSpikes(trials, spikeTimes, spikeElectrode, spikeUnit, preMs, postMs, binMs, violMs, spikeWaveform)
         % Rasterize online spikes into one binary slice per trial.
         % For each trial the window is [Start - preMs, End + postMs] (ms buffers),
         % matched against spikeTimes (seconds, NSP/HUB clock). Time is binned at
@@ -1138,6 +1142,9 @@ classdef BlackrockLoader < handle
         % info.ViolationRate carries each unit's overall ISI-violation rate
         % (fraction of ISIs < violMs, default 1 ms) over its full continuous spike
         % train -- a timing-only QC metric that needs no waveform product.
+        % info.MeanWaveform carries each unit's average waveform (uV, one row per
+        % unit x nSamp) over its FULL set of spikes when spikeWaveform is supplied
+        % ([nSamp x nSpikes], columns aligned to spikeTimes); [] otherwise.
         % A trial whose Start/End is NaN gets an all-NaN slice so the trial
         % dimension stays index-aligned with trials.
         % (Per-spike waveforms are a separate product: see segmentSpikeWaveforms.)
@@ -1145,6 +1152,7 @@ classdef BlackrockLoader < handle
             if nargin < 6 || isempty(postMs); postMs = 500; end
             if nargin < 7 || isempty(binMs);  binMs  = 1;   end   % bin width (ms)
             if nargin < 8 || isempty(violMs); violMs = 1;   end   % ISI-violation window (ms)
+            if nargin < 9 || isempty(spikeWaveform); spikeWaveform = []; end   % [nSamp x nSpikes] uV, or []
 
             pre    = preMs  / 1000;   % seconds
             post   = postMs / 1000;
@@ -1173,6 +1181,22 @@ classdef BlackrockLoader < handle
                 if numel(tr) >= 2
                     violRate(r) = mean(diff(tr) < violSec);
                 end
+            end
+
+            % --- overall mean waveform per unit (uV, row-aligned to chanKeys) ---
+            % Mean over the unit's FULL set of spikes (all trials), or [] when no
+            % waveform product was loaded. NaN row for a unit with no waveform columns.
+            if ~isempty(spikeWaveform)
+                nSamp  = size(spikeWaveform, 1);
+                meanWf = nan(nChan, nSamp);
+                for r = 1:nChan
+                    cols = spikeWaveform(:, spikeRow == r);
+                    if ~isempty(cols)
+                        meanWf(r, :) = mean(cols, 2, 'omitnan').';
+                    end
+                end
+            else
+                meanWf = [];
             end
 
             nTrials = numel(trials);
@@ -1233,6 +1257,8 @@ classdef BlackrockLoader < handle
             R.info.Channel_Number = electrode;             % NtotalUnit x 1, electrode per row
             R.info.Unit_No        = unit;                  % NtotalUnit x 1, unit per row
             R.info.ViolationRate  = violRate;              % NtotalUnit x 1, frac ISIs < violMs (full train)
+            R.info.MeanWaveform     = meanWf;              % NtotalUnit x nSamp (uV), or []
+            R.info.MeanWaveformUnit = 'microVolts';
         end
 
         function W = segmentSpikeWaveforms(trials, spikeTimes, spikeElectrode, spikeUnit, spikeWaveform, preMs, postMs)

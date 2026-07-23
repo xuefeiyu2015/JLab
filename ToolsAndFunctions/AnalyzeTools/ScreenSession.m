@@ -12,7 +12,9 @@ RemoveTaskLessThanTrials = 3; %Remove tasks with less than 3 successful trials
 RemoveAvgFRLessThan = 1; %in Hz Remove neurons with average firing rate less than 1Hz
 
 excludeTask = BehaviorSummary.Task(BehaviorSummary.SuccessfulTrials <RemoveTaskLessThanTrials);
-excludeSpikes = SpikeSummary.AvgFR < RemoveAvgFRLessThan | SpikeSummary.Excluded == true;
+if ~isempty(SpikeSummary)
+    excludeSpikes = SpikeSummary.AvgFR < RemoveAvgFRLessThan | SpikeSummary.Excluded == true;
+end
 
 
 

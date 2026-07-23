@@ -31,7 +31,7 @@ function spikesummary = spikeCheck(spike, waveform, cd, savePath, plotFlag)
 % The firing + ISI panels rely on the spike binary raster; the waveform + PCA
 % panels rely on the waveform file.
 %
-% Xuefei Yu Jul 2026
+% Xuefei Jul 2026
 
     if nargin < 4;  savePath = '';  end
     if nargin < 5 || isempty(plotFlag);  plotFlag = true;  end

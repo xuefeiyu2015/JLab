@@ -28,9 +28,11 @@ addpath(genpath(fullfile(JLabRoot, 'ToolsAndFunctions')));
 
 Basic_Path  = '/Users/xuefeiyu/Documents/XuefeiFile/WorkRelated/Data';
 Monkey = 'test';        % bare monkey name; folder is "Monkey <name>"
+%Monkey = 'Athos'; 
 Location = 'in_lab';       % editable constant
 DataType = 'export_data';     % editable constant
 
+%Folder = '2026-07-17';
 Folder = '2026-07-15';
 
 
@@ -111,9 +113,16 @@ if ~isempty(spike_path)
         spikewaveform_data = [];
     end
 
-     
+    
     SpikeSummary = spikeCheck(spike_data, spikewaveform_data, ...
                                    comments_data, main_path, PlotSpikeCheck );
+
+    % Surface the loader's precomputed per-unit average waveform (uV). Rows of
+    % SpikeSummary align 1:1 with spike_data.info (one row per unit, same order).
+    if ~isempty(SpikeSummary) && isfield(spike_data.info, 'MeanWaveform') ...
+            && ~isempty(spike_data.info.MeanWaveform)
+        SpikeSummary.AverageWaveform = spike_data.info.MeanWaveform;  % nRow x nSamp (uV)
+    end
     if PlotSpikeCheck
         disp('Completed spikecheck!')
     end
@@ -122,6 +131,7 @@ if ~isempty(spike_path)
 else
     disp('No spike data found');
     spike_data = [];
+    SpikeSummary = []; 
 end
 
 
@@ -137,13 +147,14 @@ excludeSpikes = zeros(size(SpikeSummary,1));
 %spike_waveform_data
 
 %% Preprossing: Add RT to saccade tasks.
-RT = CalculateRT(caled_eyes,comments_data);
+PlotRTCheck = true;
+RT = CalculateRT(caled_eyes,comments_data,PlotRTCheck );
 
 
 %% Auto-rounting to it's respective analyze protocol
 
 
-task_lists 
+%task_lists 
 
 
 

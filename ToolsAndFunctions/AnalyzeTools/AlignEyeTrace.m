@@ -15,7 +15,7 @@ function [aligned_eye, relative_time_seq] = AlignEyeTrace(eye_x, eye_y, eye_time
 %   relative_time_seq - 1 x nOut time from the marker (s), 0 at the marker,
 %                       sampled at the native step of eye_time.
 %
-% Xuefei Yu Mar 6, 2026
+% Xuefei Mar 6, 2026
 
     eye_time = eye_time(:).';                       % force 1 x nSamp
     nT       = size(eye_x, 1);
