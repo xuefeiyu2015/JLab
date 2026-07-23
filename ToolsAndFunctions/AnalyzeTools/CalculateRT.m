@@ -1067,10 +1067,17 @@ function drawEndpointMap(ax, M, posUnit, style)
     if isempty(anchor);  anchor = M.endPts;  end
     r = max(abs(anchor(:)), [], 'omitnan') + 4;
     if isempty(r) || ~isfinite(r) || r <= 0;  r = 15;  end
-    edges = linspace(-r, r, 60);
+
+    % Bin count adapts to the number of endpoints: a fixed fine grid leaves
+    % each bin holding 0-1 trials on sparse sessions (a discrete, speckled map),
+    % so coarsen the grid when there are few trials and refine it when there are
+    % many. Clamped to [8, 30] bins.
+    pts   = M.endPts(all(~isnan(M.endPts), 2), :);
+    nPts  = size(pts, 1);
+    nBins = min(30, max(8, round(2 * sqrt(nPts))));
+    edges = linspace(-r, r, nBins + 1);
     ctrs  = edges(1:end-1) + diff(edges(1:2)) / 2;
 
-    pts = M.endPts(all(~isnan(M.endPts), 2), :);
     if ~isempty(pts)
         counts = histcounts2(pts(:,1), pts(:,2), edges, edges);   % X by Y
         total  = sum(counts(:));
