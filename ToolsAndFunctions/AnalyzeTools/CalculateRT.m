@@ -1026,6 +1026,15 @@ function plotSaccadeMapsFigure(maps, units, opts)
     posUnit = strrep(units, '/s', '');          % 'deg'
     nTask   = numel(maps);
 
+    % Shared peak-velocity color range across all task columns, so the bottom-row
+    % colors are comparable between tasks (a fast target in one task looks the
+    % same as an equally fast target in another).
+    allPV = vertcat(maps.targPV);
+    pvClim = [min(allPV, [], 'omitnan'), max(allPV, [], 'omitnan')];
+    if ~all(isfinite(pvClim)) || pvClim(1) == pvClim(2)
+        pvClim = [];                            % degenerate -> let each panel autoscale
+    end
+
     fig = figure('Name', 'Saccade endpoint & peak-velocity maps', 'Color', 'w');
     tl  = tiledlayout(fig, 2, nTask, 'TileSpacing', 'compact', 'Padding', 'compact');
 
@@ -1039,7 +1048,7 @@ function plotSaccadeMapsFigure(maps, units, opts)
 
         % ---- bottom: peak velocity per target location ------------------
         ax = nexttile(tl, nTask + c);
-        drawPeakVelMap(ax, M, posUnit, units, opts.PeakVelStyle);
+        drawPeakVelMap(ax, M, posUnit, units, opts.PeakVelStyle, pvClim);
     end
 
     title(tl, 'Saccade endpoints (top) & peak velocity by target (bottom)');
@@ -1064,6 +1073,8 @@ function drawEndpointMap(ax, M, posUnit, style)
     pts = M.endPts(all(~isnan(M.endPts), 2), :);
     if ~isempty(pts)
         counts = histcounts2(pts(:,1), pts(:,2), edges, edges);   % X by Y
+        total  = sum(counts(:));
+        if total > 0;  counts = counts / total;  end             % -> proportion
         dens   = counts.';                                        % rows=Y for imagesc
         if strcmp(style, 'kde')
             dens = smoothDensity(dens);
@@ -1072,8 +1083,7 @@ function drawEndpointMap(ax, M, posUnit, style)
         set(him, 'AlphaData', dens > 0);                          % empty bins clear
     end
     colormap(ax, parula);
-    cb = colorbar(ax);
-    if strcmp(style, 'kde');  cb.Label.String = 'Density';  else;  cb.Label.String = 'Count';  end
+    cb = colorbar(ax);  cb.Label.String = 'Proportion';
 
     % Overlays: targets (o), fixation (square), mean start point (x).
     h = gobjects(0);  lbl = {};
@@ -1107,10 +1117,13 @@ function drawEndpointMap(ax, M, posUnit, style)
 end
 
 
-function drawPeakVelMap(ax, M, posUnit, units, style)
+function drawPeakVelMap(ax, M, posUnit, units, style, pvClim)
 % One peak-velocity-per-target panel: color = mean peak velocity at each target
 % location, as a griddata surface ('surface') or discrete colored dots ('dots').
 % Falls back to dots when there are too few targets to interpolate.
+% pvClim (optional [lo hi]) fixes the color range so every task shares one scale;
+% [] lets the panel autoscale.
+    if nargin < 6;  pvClim = [];  end
     hold(ax, 'on');
 
     xy = M.targets;  pv = M.targPV;
@@ -1143,6 +1156,7 @@ function drawPeakVelMap(ax, M, posUnit, units, style)
     end
 
     colormap(ax, parula);
+    if ~isempty(pvClim);  clim(ax, pvClim);  end     % shared range across tasks
     cb = colorbar(ax);  cb.Label.String = sprintf('Peak velocity (%s)', units);
     axis(ax, 'equal');
     r = max(abs(xy(:)), [], 'omitnan') + 4;
