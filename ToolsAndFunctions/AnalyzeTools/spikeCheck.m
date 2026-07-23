@@ -1,4 +1,4 @@
-function spikesummary = spikeCheck(spike, waveform, cd, savePath, plotFlag)
+function spikesummary = spikeCheck(spike, waveform, cd, savePath, plotFlag, reCompute)
 % Spike quality check: an interactive per-unit browser, standalone and callable
 % right after loading the spike raster (and optionally the waveform product).
 %
@@ -18,6 +18,12 @@ function spikesummary = spikeCheck(spike, waveform, cd, savePath, plotFlag)
 %              metrics (waveform-dependent SNR / width / PCA) and merges the
 %              session into the master QC summary, exactly like the Export Summary
 %              button.
+%   reCompute- (optional, default true) when true, compute the per-unit metrics
+%              and refresh the AnalysisCache. When false and savePath is set, the
+%              per-unit scalar metrics are seeded from
+%              <savePath>/AnalysisCache/SpikeSummary.mat, so a headless call
+%              skips the expensive waveform/PCA fill. Exclusions always come from
+%              unit_qc_exclusions.csv; GUI edits re-save the cache on close.
 %
 % Returns spikesummary, a table of per-unit column vectors: Channel, Unit, AvgFR
 % (overall firing rate, Hz), ViolationRate (overall ISI-violation rate).
@@ -35,6 +41,7 @@ function spikesummary = spikeCheck(spike, waveform, cd, savePath, plotFlag)
 
     if nargin < 4;  savePath = '';  end
     if nargin < 5 || isempty(plotFlag);  plotFlag = true;  end
+    if nargin < 6 || isempty(reCompute);  reCompute = true;  end
     RATE_THRESH = 5;      % Hz; baseline / overall firing below this is flagged
     WAVE_FS     = 30000;  % Hz; Blackrock NEV online waveform sample rate
     REASONS     = {'ISI violation', 'Unit Loss', 'Bad Isolation', 'Noise', 'Other'};
@@ -77,10 +84,20 @@ function spikesummary = spikeCheck(spike, waveform, cd, savePath, plotFlag)
     if haveViol;  overallViol = spike.info.ViolationRate(:);  else;  overallViol = nan(nRow, 1);  end
 
     % --- exclusion labels + per-unit metric store --------------------------
+    % The per-unit exclusion CSV lives in the session AnalysisCache alongside the
+    % other cached products. A legacy file at the old location (directly under the
+    % session folder) is migrated into AnalysisCache on first open so earlier
+    % manual labels are not orphaned.
     if isempty(savePath)
         exclFile = '';
     else
-        exclFile = fullfile(savePath, 'unit_qc_exclusions.csv');
+        exclFile = fullfile(savePath, 'AnalysisCache', 'unit_qc_exclusions.csv');
+        legacyExcl = fullfile(savePath, 'unit_qc_exclusions.csv');
+        if exist(exclFile, 'file') ~= 2 && exist(legacyExcl, 'file') == 2
+            cacheDir = fileparts(exclFile);
+            if ~exist(cacheDir, 'dir');  mkdir(cacheDir);  end
+            movefile(legacyExcl, exclFile);
+        end
     end
     S = repmat(struct('Channel', NaN, 'Unit', NaN, 'overallRate', NaN, ...
         'baselineMeanRate', NaN, 'violationRate', NaN, ...
@@ -93,6 +110,21 @@ function spikesummary = spikeCheck(spike, waveform, cd, savePath, plotFlag)
         S(k).Excluded = excl(k).excluded;
         S(k).Reason   = excl(k).reason;
         S(k).Note     = excl(k).note;
+    end
+
+    % --- AnalysisCache: seed the per-unit metrics so a cached run skips the
+    % expensive waveform / PCA fill. Exclusions still come from the CSV above
+    % (authoritative); only the computed scalar metrics are overlaid from cache.
+    % metricsFilled tracks which units already hold real metrics (from the cache
+    % or, later, from computeUnit), so nothing is recomputed needlessly.
+    if isempty(savePath)
+        cacheFile = '';
+    else
+        cacheFile = fullfile(savePath, 'AnalysisCache', 'SpikeSummary.mat');
+    end
+    metricsFilled = false(nRow, 1);
+    if ~reCompute && ~isempty(cacheFile) && exist(cacheFile, 'file')
+        metricsFilled = seedMetricsFromCache(cacheFile);
     end
 
     % --- returned summary: cheap, no waveform / feature / PCA work ----------
@@ -120,9 +152,9 @@ function spikesummary = spikeCheck(spike, waveform, cd, savePath, plotFlag)
 
 
     if ~plotFlag
-        % headless: no figure. With a savePath, also compute every unit's full
-        % metrics and merge the session into the master QC summary (same as the
-        % Export Summary button).
+        % headless: no figure. With a savePath, fill every unit's full metrics
+        % (skipping any seeded from cache), merge the session into the master QC
+        % summary, and refresh the AnalysisCache (all inside exportQC).
         if ~isempty(savePath)
             masterFile = exportQC();
             if ~isempty(masterFile);  fprintf('Exported %s\n', masterFile);  end
@@ -204,6 +236,17 @@ function spikesummary = spikeCheck(spike, waveform, cd, savePath, plotFlag)
     % onExclusion; spikesummary was built pre-GUI, so refresh its column now.
     if ~isempty(S)
         spikesummary.Excluded = [S.Excluded]';
+    end
+
+    % Persist the navigator's result to the AnalysisCache so a later
+    % reCompute=false run loads it -- including the exclusions just edited --
+    % instead of recomputing. Fill any units the user never viewed first so the
+    % cache is complete (this is the compute the cache is meant to avoid next
+    % time). The master QC CSV is left to the Export Summary button / headless
+    % path; only the cache is refreshed here.
+    if ~isempty(savePath)
+        fillAllMetrics();
+        saveSpikeCache();
     end
 
     % ---------------- GUI callbacks --------------------------------------
@@ -319,9 +362,8 @@ function spikesummary = spikeCheck(spike, waveform, cd, savePath, plotFlag)
     % Export Summary button and the headless (savePath) path; caller checks
     % savePath is non-empty. Fills S via computeUnit (waveform-dependent).
     function masterFile = exportQC()
-        for ii = 1:nRow
-            storeMetrics(ii, computeUnit(ii));
-        end
+        fillAllMetrics();
+        saveSpikeCache();
         writeSpikeSummary(S, savePath);
         % Normal flow: behaviorCheck already wrote the behavior temp for this
         % session. Standalone use (spikeCheck without a prior behavior check)
@@ -334,6 +376,52 @@ function spikesummary = spikeCheck(spike, waveform, cd, savePath, plotFlag)
             writeBehaviorSummary(behaviorCheck(cd, false), savePath);
         end
         masterFile = ExportQCSummary(savePath);
+    end
+
+    % Fill every unit's metrics that are not already present (seeded from cache
+    % or computed earlier in this session), so the expensive per-unit compute
+    % runs at most once per unit.
+    function fillAllMetrics()
+        for ii = 1:nRow
+            if ~metricsFilled(ii)
+                storeMetrics(ii, computeUnit(ii));
+            end
+        end
+    end
+
+    % Write the per-unit metrics + summary table to the AnalysisCache. Small: the
+    % scalar metrics and exclusions only, not the raster / waveform panel data.
+    function saveSpikeCache()
+        if isempty(cacheFile);  return;  end
+        cacheDir = fileparts(cacheFile);
+        if ~exist(cacheDir, 'dir');  mkdir(cacheDir);  end
+        payload = struct('spikesummary', spikesummary, 'S', S);
+        save(cacheFile, 'payload');
+    end
+
+    % Overlay cached per-unit scalar metrics onto S, matched by Channel/Unit.
+    % Returns a logical mask of the units that were found in the cache.
+    function filled = seedMetricsFromCache(cf)
+        filled = false(nRow, 1);
+        L = load(cf);
+        if ~isfield(L, 'payload') || ~isfield(L.payload, 'S') || isempty(L.payload.S)
+            return
+        end
+        Sc   = L.payload.S;
+        cChan = [Sc.Channel].';
+        cUnit = [Sc.Unit].';
+        for r = 1:nRow
+            j = find(cChan == chan(r) & cUnit == unit(r), 1);
+            if isempty(j);  continue;  end
+            S(r).overallRate      = Sc(j).overallRate;
+            S(r).baselineMeanRate = Sc(j).baselineMeanRate;
+            S(r).violationRate    = Sc(j).violationRate;
+            S(r).snr              = Sc(j).snr;
+            S(r).widthMs          = Sc(j).widthMs;
+            S(r).peakToValley     = Sc(j).peakToValley;
+            S(r).pcaRatio         = Sc(j).pcaRatio;
+            filled(r) = true;
+        end
     end
 
     % ---------------- pure per-unit compute (no graphics) ----------------
@@ -466,6 +554,7 @@ function spikesummary = spikeCheck(spike, waveform, cd, savePath, plotFlag)
         S(r).widthMs          = st.waveform.overall.widthMs;
         S(r).peakToValley     = st.waveform.overall.peakToValley;
         S(r).pcaRatio         = st.pca.ratio;
+        metricsFilled(r)      = true;
     end
 
 end
@@ -728,6 +817,8 @@ function saveExclusions(exclFile, chan, unit, S)
         string({S(sel).Reason})', string({S(sel).Note})', ...
         'VariableNames', {'Channel', 'Unit', 'Excluded', 'Reason', 'Note'});
     try
+        exclDir = fileparts(exclFile);
+        if ~isempty(exclDir) && ~exist(exclDir, 'dir');  mkdir(exclDir);  end
         writetable(Tb, exclFile);
     catch ME
         warning('spikeCheck:saveExclusions', 'Could not write %s: %s', exclFile, ME.message);

@@ -1,5 +1,5 @@
 function caled_eyes = EyeCalibration(comments_data, eye_data, task_cal, holdWinMs, ...
-        eyeChans, plotCal, calSessions, nCalTrials)
+        eyeChans, plotCal, calSessions, nCalTrials, savePath, reCompute)
 %Function for eye calibration
 % Select out correct trials from comments, eye_data for the task for
 % calibration
@@ -61,6 +61,13 @@ function caled_eyes = EyeCalibration(comments_data, eye_data, task_cal, holdWinM
 %                   calibration block), min(50, available) for the saccade task.
 %                   When it bites, trials are picked round-robin over target
 %                   locations so the spatial spread is kept. Inf = use all.
+%   savePath      - (optional) session export folder. When set, the fitted
+%                   coefficients are cached to <savePath>/AnalysisCache/
+%                   EyeCalibration.txt (a readable text file). '' disables caching.
+%   reCompute     - (optional, default true) when true, re-fit and refresh the
+%                   text cache. When false, load the coefficients from the cached
+%                   text file if it exists and skip the fit; they are still applied
+%                   to the eye trace, so downstream stages get calibrated degrees.
 %
 % Returns:
 %   caled_eyes    - eye_data with .data on the eye channels converted to deg,
@@ -81,6 +88,8 @@ function caled_eyes = EyeCalibration(comments_data, eye_data, task_cal, holdWinM
     if nargin < 6 || isempty(plotCal);     plotCal     = false;    end
     if nargin < 7;                         calSessions = [];       end
     if nargin < 8;                         nCalTrials  = [];       end
+    if nargin < 9;                         savePath    = '';       end
+    if nargin < 10 || isempty(reCompute);  reCompute   = true;     end
     % nCalTrials stays empty here: its default depends on the task, which is
     % only known once task_cal has been resolved below.
 
@@ -92,30 +101,53 @@ function caled_eyes = EyeCalibration(comments_data, eye_data, task_cal, holdWinM
 
     task_list = cellstr(task_cal);
 
+    calFile = '';
+    if ~isempty(savePath)
+        calFile = fullfile(char(savePath), 'AnalysisCache', 'EyeCalibration.txt');
+    end
+
     % ---------------------------------------------------------------------
-    % 1. Try each task in the order asked for; the first one that fits wins
+    % 1. Obtain the fit: from the cached text file, or by fitting the session
     % ---------------------------------------------------------------------
-    % Every way a task can turn out unusable -- absent from the session, no
-    % correct trials, too few conditions, a degenerate grid -- falls through to
-    % the next, so a session with no fixation block still calibrates off the
-    % saccade task it did run. Each attempt gets the untouched cal template, so
-    % nothing a failed attempt computed can leak into the next one.
-    fitpts = [];
-    for c = 1:numel(task_list)
-        [cal_c, pts_c] = fitOneTask(comments_data, eye_data, task_list{c}, cal, ...
-            holdWinMs, eyeChans, calSessions, nCalTrials);
-        if cal_c.applied
-            cal    = cal_c;
-            fitpts = pts_c;
-            break
+    % fitpts (the raw points behind the fit) only exists on the compute path; a
+    % cached load has just the coefficients, so the fitted-points QC plot is
+    % skipped there (see section 3).
+    fitpts   = [];
+    fromCache = false;
+    if ~reCompute && ~isempty(calFile) && exist(calFile, 'file')
+        cal = readCalibration(calFile);
+        fromCache = true;
+    end
+
+    if ~fromCache
+        % Every way a task can turn out unusable -- absent from the session, no
+        % correct trials, too few conditions, a degenerate grid -- falls through
+        % to the next, so a session with no fixation block still calibrates off
+        % the saccade task it did run. Each attempt gets the untouched cal
+        % template, so nothing a failed attempt computed can leak into the next.
+        for c = 1:numel(task_list)
+            [cal_c, pts_c] = fitOneTask(comments_data, eye_data, task_list{c}, cal, ...
+                holdWinMs, eyeChans, calSessions, nCalTrials);
+            if cal_c.applied
+                cal    = cal_c;
+                fitpts = pts_c;
+                break
+            end
         end
     end
 
     if ~cal.applied
-        warning('EyeCalibration:NoCalibration', ...
-            'None of (%s) could calibrate this session; eye data left in uV.', ...
-            strjoin(task_list, ', '));
+        if ~fromCache
+            warning('EyeCalibration:NoCalibration', ...
+                'None of (%s) could calibrate this session; eye data left in uV.', ...
+                strjoin(task_list, ', '));
+        end
         caled_eyes.cal = cal;  return
+    end
+
+    % Persist the fresh fit so later runs can load it instead of re-fitting.
+    if ~fromCache && ~isempty(calFile)
+        writeCalibration(cal, calFile);
     end
 
     fprintf('Eye calibration: using "%s" (R^2 x=%.3f y=%.3f).\n', ...
@@ -137,10 +169,14 @@ function caled_eyes = EyeCalibration(comments_data, eye_data, task_cal, holdWinM
     % 3. Optional QC plots
     % ---------------------------------------------------------------------
     if plotCal
-        % (a) the calibrated points the fit was built from, against their grid
-        gaze_x = applyAxis(fitpts.xv, fitpts.yv, cal.coef_x);
-        gaze_y = applyAxis(fitpts.yv, fitpts.xv, cal.coef_y);
-        plotCalibratedGaze(gaze_x, gaze_y, fitpts.tx, fitpts.ty, cal);
+        % (a) the calibrated points the fit was built from, against their grid.
+        % Only available on the compute path: a cached load has the coefficients
+        % but not fitpts, so this fit-quality figure is skipped there.
+        if ~isempty(fitpts)
+            gaze_x = applyAxis(fitpts.xv, fitpts.yv, cal.coef_x);
+            gaze_y = applyAxis(fitpts.yv, fitpts.xv, cal.coef_y);
+            plotCalibratedGaze(gaze_x, gaze_y, fitpts.tx, fitpts.ty, cal);
+        end
 
         % (b) eye traces for the tasks the fit was NOT built from
         plotCalibratedEyes(caled_eyes, comments_data, eyeChans, cal.task_cal);

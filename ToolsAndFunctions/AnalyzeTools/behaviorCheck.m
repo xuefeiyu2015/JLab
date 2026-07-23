@@ -1,15 +1,20 @@
-function summary = behaviorCheck(cd, plotFlag, savePath)
+function summary = behaviorCheck(cd, plotFlag, savePath, reCompute)
 % Behavior quality check: standalone, callable right after loading the trials
 % table (no spike/analog data needed).
 %
-%   cd       - trials table (one row per trial).
-%   plotFlag - (optional, default true) draw the figure. false runs headless:
-%              no figure is ever created, only the numbers are computed.
-%   savePath - (optional) export folder (.../Monkey <name>/.../export_data/<date>).
-%              When set, the per-task condition table is also written to this
-%              session's behavior temp CSV (writeBehaviorSummary), which
-%              ExportQCSummary later merges into the master summary. '' turns the
-%              export off.
+%   cd        - trials table (one row per trial).
+%   plotFlag  - (optional, default true) draw the figure. false runs headless:
+%               no figure is ever created, only the numbers are computed.
+%   savePath  - (optional) export folder (.../Monkey <name>/.../export_data/<date>).
+%               When set, the per-task condition table is also written to this
+%               session's behavior temp CSV (writeBehaviorSummary), which
+%               ExportQCSummary later merges into the master summary, and the full
+%               stats struct B is cached under <savePath>/AnalysisCache. '' turns
+%               both the export and the cache off.
+%   reCompute - (optional, default true) when true, recompute the stats and
+%               refresh the cache. When false, load the cached B from
+%               <savePath>/AnalysisCache/BehaviorSummary.mat if it exists (the plot
+%               then redraws from the cached numbers, no recomputation).
 %
 % Returns summary, the behavior summary about the task conditions
 %   summary = B.condition    - table, one row per task: TotalValidTrials/MinRep/MinRepCondition
@@ -17,9 +22,14 @@ function summary = behaviorCheck(cd, plotFlag, savePath)
 
 % Xuefei Yu Jul 2026
 
-    if nargin < 2 || isempty(plotFlag);  plotFlag = true;  end
-    if nargin < 3;  savePath = '';  end
-    B = behaviorStats(cd);
+    if nargin < 2 || isempty(plotFlag);   plotFlag  = true;  end
+    if nargin < 3;                        savePath  = '';    end
+    if nargin < 4 || isempty(reCompute);  reCompute = true;  end
+
+    % Cache the full stats struct B (its .conditions is what we return), so a
+    % cached run can both return the summary and redraw the panels via
+    % plotBehaviorStats without recomputing.
+    B = getCachedPayload(savePath, 'BehaviorSummary', reCompute, @() behaviorStats(cd));
     if plotFlag
         plotBehaviorStats(B);
     end
