@@ -1,4 +1,4 @@
-function RT = CalculateRT(caled_eyes, comments_data, plotFlag, plotN, errorCheck, savePath, reCompute)
+function RT = CalculateRT(caled_eyes, comments_data, plotFlag, plotN, errorCheck, savePath, reCompute, varargin)
 % Detect the saccadic reaction time (RT) of each trial from the eye trace.
 %
 % For every saccade-task trial the eye trace is aligned to the go cue
@@ -20,30 +20,33 @@ function RT = CalculateRT(caled_eyes, comments_data, plotFlag, plotN, errorCheck
 %   plotN         - number of detected trials to draw, randomly sampled and
 %                   colored by task (default 50; NaN = draw all detected).
 %   errorCheck    - true to also draw the error-check figure of outlier saccades
-%                   (default true). RT.outliers is populated regardless.
-%   savePath      - (optional) session export folder. When set, the RT payload
-%                   (RT plus the per-trial detection data the QC plots need) is
-%                   cached to <savePath>/AnalysisCache/RT.mat. '' disables caching.
+%                   (default true). Only used on the plot path.
+%   savePath      - (optional) session export folder. When set, the per-trial RT
+%                   table is written to <savePath>/AnalysisCache/RT.csv (the
+%                   lightweight, always-available product). The full plot payload
+%                   is cached to <savePath>/AnalysisCache/RT.mat only on the plot
+%                   path (plotFlag true), since only the QC figures need it.
+%                   '' disables all caching / export.
 %   reCompute     - (optional, default true) when true, recompute RT and refresh
-%                   the cache. When false, load the cached payload if it exists;
-%                   the QC plots then redraw from it without recomputing.
+%                   the export/cache. When false, reuse the cached result: the
+%                   plot path redraws from RT.mat, the return-only path reads
+%                   RT.csv, neither recomputing.
+%   varargin      - (optional) name/value flags controlling only the saccade-map
+%                   QC figure (plot path, calibrated data):
+%                     'EndpointStyle' : 'hist' (default) | 'kde'  -- endpoint
+%                                       density as a binned 2-D histogram or a
+%                                       gaussian-smoothed density.
+%                     'PeakVelStyle'  : 'surface' (default) | 'dots' -- peak
+%                                       velocity per target as a griddata surface
+%                                       or discrete colored markers.
 %
-% Returns RT, a struct:
-%   .data     - nTrials x 1 RT (s from go cue); NaN where not detected / invalid.
-%   .realRT   - true when RT came from the eye trace, false when it fell back to
-%               the FixationExit marker (no eye data).
-%   .units    - velocity units the threshold used: 'deg/s', 'uV/s', or 'marker'.
-%   .table    - nTrials x 1 table of saccade details:
-%               Trial, RTtime, SaccadeAmplitude, PeakVelocity,
-%               StartX, StartY, EndX, EndY, SaccadeDuration.
-%   .outliers - struct of abnormal trial indices (into comments_data rows):
-%               .trials (all), .amplitude (>3 SD from mean amplitude),
-%               .duration (< 20 ms or > 90 ms).
-%   noiseTrials - trial indices rejected as noise (RT NaN): either a
-%               tracker-noise spike (speed > 1500 deg/s) fell inside the
-%               detected saccade, or the saccade start point was already
-%               > 20 deg from the baseline gaze (corrupted trace).
-%
+% Returns RT, an nTrials x 9 table of per-trial saccade metrics (one row per trial
+% in comments_data, in order):
+%   Trial, RTtime (s from go cue), SaccadeAmplitude, PeakVelocity,
+%   StartX, StartY, EndX, EndY, SaccadeDuration.
+% Every RT comes from the eye trace; trials that were invalid or where no saccade
+% was detected are NaN rows.
+% Note: The detector is not optimized for uncalibrated eye data.
 % Xuefei Jul 2026
 
     if nargin < 3 || isempty(plotFlag);    plotFlag   = false;  end
@@ -52,16 +55,62 @@ function RT = CalculateRT(caled_eyes, comments_data, plotFlag, plotN, errorCheck
     if nargin < 6;                         savePath   = '';     end
     if nargin < 7 || isempty(reCompute);   reCompute  = true;   end
 
-    % Compute-or-load the RT payload (RT plus the per-trial data the QC plots
-    % need), then render from it, so the plots look identical on the compute and
-    % cache paths. computeRTPayload is pure; plotRTFigures only draws.
-    payload = getCachedPayload(savePath, 'RT', reCompute, ...
-        @() computeRTPayload(caled_eyes, comments_data));
-    RT = payload.RT;
+    % Style flags for the saccade-map QC figure only (see plotSaccadeMapsFigure).
+    p = inputParser;
 
-    if plotFlag && payload.hasTrace
-        plotRTFigures(payload, plotN, errorCheck);
+    p.addParameter('EndpointStyle', 'kde', ...
+        @(s) any(strcmpi(s, {'hist', 'kde'})));
+    p.addParameter('PeakVelStyle',  'surface', ...
+        @(s) any(strcmpi(s, {'surface', 'dots'})));
+    p.parse(varargin{:});
+    plotOpts = struct('EndpointStyle', lower(p.Results.EndpointStyle), ...
+                      'PeakVelStyle',  lower(p.Results.PeakVelStyle));
+
+    if plotFlag
+        % Plot path: the QC figures need the full payload (traces, per-trial
+        % detection cells), so compute-or-load it from the RT.mat cache and render
+        % from it, so the plots look identical on the compute and cache paths.
+        % computeRTPayload is pure; plotRTFigures only draws.
+        payload = getCachedPayload(savePath, 'RT', reCompute, ...
+            @() computeRTPayload(caled_eyes, comments_data));
+        RT = payload.RT;
+        exportRTtable(RT, savePath);          % refresh the lightweight CSV
+        if payload.hasTrace
+            plotRTFigures(payload, plotN, errorCheck, plotOpts);
+        end
+    else
+        % Return-only path: never touch the heavy RT.mat. Reuse the small RT.csv
+        % when allowed, otherwise recompute and refresh it.
+        csvFile = rtCsvPath(savePath);
+        if ~reCompute && ~isempty(csvFile) && exist(csvFile, 'file')
+            RT = readtable(csvFile);
+        else
+            payload = computeRTPayload(caled_eyes, comments_data);
+            RT = payload.RT;
+            exportRTtable(RT, savePath);
+        end
     end
+end
+
+
+function csvFile = rtCsvPath(savePath)
+% Path of the per-trial RT table export, or '' when caching is disabled.
+    csvFile = '';
+    if ~isempty(savePath)
+        csvFile = fullfile(char(savePath), 'AnalysisCache', 'RT.csv');
+    end
+end
+
+
+function exportRTtable(RT, savePath)
+% Write the per-trial RT table to <savePath>/AnalysisCache/RT.csv (no-op when
+% savePath is empty). This is the lightweight product read back by the
+% return-only path; it is far smaller than the RT.mat plot payload.
+    csvFile = rtCsvPath(savePath);
+    if isempty(csvFile);  return;  end
+    cacheDir = fileparts(csvFile);
+    if ~exist(cacheDir, 'dir');  mkdir(cacheDir);  end
+    writetable(RT, csvFile);
 end
 
 
@@ -113,51 +162,15 @@ function payload = computeRTPayload(caled_eyes, comments_data)
     endY     = nan(nTrials, 1);
     durSac   = nan(nTrials, 1);
 
-    % =====================================================================
-    % Branch 1: no eye data at all -> approximate RT from the FixExit marker
-    % =====================================================================
-    
-    if isempty(caled_eyes)
-        disp('No eye data found; approximating RT / saccade from the markers.');
-        marker_rt = comments_data.Fixation_exited - comments_data.Fixation_point_off;
-        marker_rt(~isValid) = NaN;
-        RTtime = marker_rt;
-
-        % No eye trace, so the saccade span is taken from the behavioral markers:
-        % start = fixation location, end = Target 1 location, duration from the
-        % FixExit -> Choicetime(+pad) interval, peak velocity undefined.
-        durSac = comments_data.Choicetime - comments_data.Fixation_exited;
-        durSac(~isValid) = NaN;
-        
-        % peakVel stays NaN (undefined without a velocity trace).
-
-        fprintf('%d approximate RT computed from FixExit marker.\n', ...
-            sum(~isnan(RTtime)));
-
-       % RT.data   = RTtime;
-        RT.realRT = false;
-        RT.units  = 'marker';
-        RT.data  = buildTable(nTrials, RTtime, ampl, peakVel, ...
-                               startX, startY, endX, endY, durSac);
-
-        % No eye trace -> nothing to draw; keep the payload shape consistent.
-        payload = struct('RT', RT, 't', [], 'dets', {{}}, ...
-            'ampOut', [], 'durOut', [], 'taskLabels', {comments_data.Task}, ...
-            'hasTrace', false);
-        return
-    end
-
-    % =====================================================================
-    % Branch 2: eye data present -> detect the saccade from the trace
-    % =====================================================================
+   
     % Calibrated traces are in degrees, so the 30 deg/s threshold applies.
     % Uncalibrated traces are still in uV, where 30 deg/s is meaningless, so
     % only the baseline + 3*SD criterion is used.
     useDegThr = caled_eyes.cal.applied;
     if useDegThr
-        RT.units = 'deg/s';
+        units = 'deg/s';
     else
-        RT.units = 'uV/s';
+        units = 'uV/s';
         disp('Eye trace is uncalibrated (uV); using baseline + 3*SD criterion.');
     end
 
@@ -202,10 +215,8 @@ function payload = computeRTPayload(caled_eyes, comments_data)
     fprintf('%d real RT detected from the eye trace (of %d valid trials).\n', ...
         sum(~isnan(RTtime)), sum(isValid));
 
-    %RT.data   = RTtime;
-    RT.realRT = true;
-    RT.data  = buildTable(nTrials, RTtime, ampl, peakVel, ...
-                           startX, startY, endX, endY, durSac);
+    RTtable = buildTable(nTrials, RTtime, ampl, peakVel, ...
+                         startX, startY, endX, endY, durSac);
 
     % Trials rejected because tracker noise landed inside the detected saccade
     % (RT already NaN for these).
@@ -228,13 +239,22 @@ function payload = computeRTPayload(caled_eyes, comments_data)
         numel(outliers.trials), numel(outliers.amplitude), numel(outliers.duration));
 
     hasTrace = any(cellfun(@(d) ~isempty(d) && ~isempty(d.tv), dets));
-    payload  = struct('RT', RT, 't', t, 'dets', {dets}, ...
+
+    % Per-trial target / fixation location (deg), for the saccade-map QC figure.
+    % Only meaningful when calibrated (endpoints and targets share the deg frame).
+    targetXY = positionColumns(comments_data, 'Target_1_position');
+    fixXY    = positionColumns(comments_data, 'Fixation_position');
+    maps     = computeSaccadeMaps(RTtable, comments_data.Task, targetXY, fixXY, ...
+                                  tasks_for_RT);
+
+    payload  = struct('RT', RTtable, 'units', units, 't', t, 'dets', {dets}, ...
         'ampOut', ampOut, 'durOut', durOut, ...
-        'taskLabels', {comments_data.Task}, 'hasTrace', hasTrace);
+        'taskLabels', {comments_data.Task}, 'hasTrace', hasTrace, ...
+        'calApplied', useDegThr, 'maps', {maps});
 end
 
 
-function plotRTFigures(payload, plotN, errorCheck)
+function plotRTFigures(payload, plotN, errorCheck, plotOpts)
 % Render-only: draw the RT QC figures from a computeRTPayload payload.
     t       = payload.t;
     dets    = payload.dets;
@@ -259,11 +279,26 @@ function plotRTFigures(payload, plotN, errorCheck)
         dev_all(i, :)   = dets{i}.dev;
         speed_all(i, :) = dets{i}.speed;
     end
-    plotSaccadeFigure(t, tv, dev_all, speed_all, dets, payload.RT.data, ...
-        payload.taskLabels, plotN, payload.RT.units);
+    plotSaccadeFigure(t, tv, dev_all, speed_all, dets, payload.RT, ...
+        payload.taskLabels, plotN, payload.units);
     if errorCheck
         plotErrorCheck(t, tv, dev_all, speed_all, dets, ...
-            payload.ampOut, payload.durOut, payload.RT.units);
+            payload.ampOut, payload.durOut, payload.units);
+    end
+
+    % Saccade endpoint / peak-velocity maps. Requires the enriched payload
+    % (older cached RT.mat lacks these fields) and calibrated deg data (targets
+    % and endpoints only align in the deg frame).
+    if ~isfield(payload, 'maps') || ~isfield(payload, 'calApplied')
+        warning(['CalculateRT: cached RT.mat predates the saccade-map figure; ' ...
+            'rerun with ReComputeRT = true to enable it.']);
+    elseif ~payload.calApplied
+        warning(['CalculateRT: saccade-endpoint maps need calibrated (deg) eye ' ...
+            'data; skipping (trace is uncalibrated).']);
+    elseif isempty(payload.maps)
+        warning('CalculateRT: no saccade-task targets to map; skipping.');
+    else
+        plotSaccadeMapsFigure(payload.maps, payload.units, plotOpts);
     end
 end
 
@@ -625,6 +660,77 @@ function [ampOut, durOut] = flagOutliers(amp, dur_ms, det)
 end
 
 
+function xy = positionColumns(comments_data, base)
+% Per-trial [x y] (deg) from the <base>_x / <base>_y columns of comments_data,
+% e.g. base = 'Target_1_position'. Returns an nTrials x 2 all-NaN matrix when
+% either column is absent, so callers never have to special-case a missing field
+% (guarded exactly like markerLocations in EyeCalibration.m).
+    n  = height(comments_data);
+    xy = nan(n, 2);
+    cx = [base '_x'];  cy = [base '_y'];
+    if all(ismember({cx, cy}, comments_data.Properties.VariableNames))
+        xy = [comments_data.(cx)(:), comments_data.(cy)(:)];
+    end
+end
+
+
+function maps = computeSaccadeMaps(RT, taskLabels, targetXY, fixXY, tasks_for_RT)
+% Aggregate, per RT-saccade task, the data the saccade-map QC figure needs.
+% Pure: bins nothing for display (that is the draw function's job) -- it only
+% selects detected trials, pools endpoints, and averages peak velocity per
+% distinct target location. Returns a struct array with one entry per task that
+% has at least one detected saccade, each with fields:
+%   task        - task name (char)
+%   endPts      - m x 2 saccade end points (deg) of detected trials
+%   startCenter - 1 x 2 mean saccade start point (deg) over detected trials
+%   fixPt       - k x 2 distinct fixation locations (deg) used by these trials
+%   targets     - g x 2 distinct target locations (deg)
+%   targPV      - g x 1 mean peak velocity at each target location
+%   targN       - g x 1 detected-trial count at each target location
+
+    maps = struct('task', {}, 'endPts', {}, 'startCenter', {}, ...
+                  'fixPt', {}, 'targets', {}, 'targPV', {}, 'targN', {});
+
+    detected = ~isnan(RT.RTtime);
+    for c = 1:numel(tasks_for_RT)
+        task = tasks_for_RT{c};
+        sel  = detected & strcmp(taskLabels, task);
+        if ~any(sel);  continue;  end
+
+        endPts      = [RT.EndX(sel),   RT.EndY(sel)];
+        startCenter = [mean(RT.StartX(sel), 'omitnan'), ...
+                       mean(RT.StartY(sel), 'omitnan')];
+        fixPt       = uniqueXY(fixXY(sel, :));
+
+        % Mean peak velocity per distinct target location.
+        tgt = targetXY(sel, :);
+        pv  = RT.PeakVelocity(sel);
+        [targets, ~, grp] = unique(tgt(all(~isnan(tgt), 2), :), 'rows');
+        pvValid = pv(all(~isnan(tgt), 2));
+        g       = size(targets, 1);
+        targPV  = nan(g, 1);
+        targN   = zeros(g, 1);
+        for k = 1:g
+            inK       = grp == k;
+            targPV(k) = mean(pvValid(inK), 'omitnan');
+            targN(k)  = sum(inK);
+        end
+
+        maps(end+1) = struct('task', task, 'endPts', endPts, ...
+            'startCenter', startCenter, 'fixPt', fixPt, ...
+            'targets', targets, 'targPV', targPV, 'targN', targN);  %#ok<AGROW>
+    end
+end
+
+
+function u = uniqueXY(xy)
+% Distinct rows of xy (deg) with any-NaN rows dropped; [] when nothing remains.
+    u = [];
+    if isempty(xy);  return;  end
+    u = unique(xy(all(~isnan(xy), 2), :), 'rows');
+end
+
+
 % =========================================================================
 % Visualization subfunction (rendering only; no computation)
 % =========================================================================
@@ -639,7 +745,7 @@ function plotSaccadeFigure(t, tv, dev_all, speed_all, dets, rtTable, taskLabels,
 %   bottom mid   - saccade amplitude vs peak velocity (the "main sequence")
 %   bottom right - saccade amplitude vs duration
 % Everything is pre-computed: trace matrices are indexed and the scatter/hist
-% come straight off RT.data -- nothing is recomputed here.
+% come straight off the RT table -- nothing is recomputed here.
 
     tt_ms = t  * 1000;
     tv_ms = tv * 1000;
@@ -825,7 +931,7 @@ function plotErrorCheck(t, tv, dev_all, speed_all, dets, ampOut, durOut, units)
         return
     end
 
-    RED = [1 0 0];   BLUE = [0 0 1];
+    RED = [1 0 0];   BLUE = [0 0 1]; GREEN = [0,1,0];
 
     figure('Name', 'Saccade error check', 'Color', 'w');
 
@@ -849,26 +955,26 @@ function plotErrorCheck(t, tv, dev_all, speed_all, dets, ampOut, durOut, units)
 
     % ===== Column 2: amplitude outliers ==================================
     subplot(2, 3, 2); hold on;
-    drawErrTraces(tt_ms, dev_all, ampIdx, RED, dets, 'onset_dev', 'offset_dev');
+    drawErrTraces(tt_ms, dev_all, ampIdx, GREEN, dets, 'onset_dev', 'offset_dev');
     finishErrPanel(tt_ms, 'Time from go cue (ms)', sprintf('Deviation (%s)', posUnit), ...
         sprintf('Amplitude outliers  (n=%d)', numel(ampIdx)));
     hold off;
 
     subplot(2, 3, 5); hold on;
-    drawErrTraces(tv_ms, speed_all, ampIdx, RED, dets, 'onset_speed', 'offset_speed');
+    drawErrTraces(tv_ms, speed_all, ampIdx, GREEN, dets, 'onset_speed', 'offset_speed');
     finishErrPanel(tv_ms, 'Time from go cue (ms)', sprintf('Speed (%s)', units), ...
         'Amplitude outliers: speed profile');
     hold off;
 
     % ===== Column 3: duration outliers ===================================
     subplot(2, 3, 3); hold on;
-    drawErrTraces(tt_ms, dev_all, durIdx, BLUE, dets, 'onset_dev', 'offset_dev');
+    drawErrTraces(tt_ms, dev_all, durIdx, GREEN, dets, 'onset_dev', 'offset_dev');
     finishErrPanel(tt_ms, 'Time from go cue (ms)', sprintf('Deviation (%s)', posUnit), ...
         sprintf('Duration outliers  (n=%d)', numel(durIdx)));
     hold off;
 
     subplot(2, 3, 6); hold on;
-    drawErrTraces(tv_ms, speed_all, durIdx, BLUE, dets, 'onset_speed', 'offset_speed');
+    drawErrTraces(tv_ms, speed_all, durIdx, GREEN, dets, 'onset_speed', 'offset_speed');
     finishErrPanel(tv_ms, 'Time from go cue (ms)', sprintf('Speed (%s)', units), ...
         'Duration outliers: speed profile');
     hold off;
@@ -904,4 +1010,191 @@ function finishErrPanel(xms, xlab, ylab, ttl)
     xlim([xms(1) xms(end)]);
     xlabel(xlab);  ylabel(ylab);  title(ttl);
     set(gca, 'LineWidth', 1, 'FontSize', 10);
+end
+
+
+function plotSaccadeMapsFigure(maps, units, opts)
+% Render-only saccade-map QC figure, laid out as 2 rows x nTask columns (each
+% RT-saccade task in its own column). All data is pre-aggregated in
+% computeSaccadeMaps; only the display binning / interpolation happens here.
+%   Top row    - 2-D heatmap of the saccade-endpoint distribution, with the
+%                target locations (o), fixation point (square) and the mean
+%                saccade start point (x) overlaid.
+%   Bottom row - 2-D heatmap of mean peak velocity per target location.
+% opts.EndpointStyle : 'hist' (binned counts) | 'kde' (gaussian-smoothed).
+% opts.PeakVelStyle  : 'surface' (griddata) | 'dots' (colored markers).
+
+    posUnit = strrep(units, '/s', '');          % 'deg'
+    nTask   = numel(maps);
+
+    % Shared peak-velocity color range across all task columns, so the bottom-row
+    % colors are comparable between tasks (a fast target in one task looks the
+    % same as an equally fast target in another).
+    allPV = vertcat(maps.targPV);
+    pvClim = [min(allPV, [], 'omitnan'), max(allPV, [], 'omitnan')];
+    if ~all(isfinite(pvClim)) || pvClim(1) == pvClim(2)
+        pvClim = [];                            % degenerate -> let each panel autoscale
+    end
+
+    fig = figure('Name', 'Saccade endpoint & peak-velocity maps', 'Color', 'w');
+    tl  = tiledlayout(fig, 2, nTask, 'TileSpacing', 'compact', 'Padding', 'compact');
+
+    for c = 1:nTask
+        M = maps(c);
+
+        % ---- top: endpoint distribution heatmap -------------------------
+        ax = nexttile(tl, c);
+        drawEndpointMap(ax, M, posUnit, opts.EndpointStyle);
+        title(ax, sprintf('%s  (n=%d)', strrep(M.task, '_', ' '), size(M.endPts, 1)));
+
+        % ---- bottom: peak velocity per target location ------------------
+        ax = nexttile(tl, nTask + c);
+        drawPeakVelMap(ax, M, posUnit, units, opts.PeakVelStyle, pvClim);
+    end
+
+    title(tl, 'Saccade endpoints (top) & peak velocity by target (bottom)');
+end
+
+
+function drawEndpointMap(ax, M, posUnit, style)
+% One endpoint-distribution panel: a 2-D density heatmap of M.endPts with the
+% targets (o), fixation (square) and mean start point (x) drawn on top.
+    hold(ax, 'on');
+
+    % Frame the panel on the targets/fixation (the region of interest); endpoints
+    % that stray far on bad trials are clipped rather than allowed to shrink it.
+    anchor = [M.targets; M.fixPt; M.startCenter];
+    anchor = anchor(all(~isnan(anchor), 2), :);
+    if isempty(anchor);  anchor = M.endPts;  end
+    r = max(abs(anchor(:)), [], 'omitnan') + 4;
+    if isempty(r) || ~isfinite(r) || r <= 0;  r = 15;  end
+
+    % Bin count adapts to the number of endpoints: a fixed fine grid leaves
+    % each bin holding 0-1 trials on sparse sessions (a discrete, speckled map),
+    % so coarsen the grid when there are few trials and refine it when there are
+    % many. Clamped to [8, 30] bins.
+    pts   = M.endPts(all(~isnan(M.endPts), 2), :);
+    nPts  = size(pts, 1);
+    nBins = min(30, max(8, round(2 * sqrt(nPts))));
+    edges = linspace(-r, r, nBins + 1);
+    ctrs  = edges(1:end-1) + diff(edges(1:2)) / 2;
+
+    if ~isempty(pts)
+        counts = histcounts2(pts(:,1), pts(:,2), edges, edges);   % X by Y
+        total  = sum(counts(:));
+        if total > 0;  counts = counts / total;  end             % -> proportion
+        dens   = counts.';                                        % rows=Y for imagesc
+        if strcmp(style, 'kde')
+            %SIGMA = 5; 
+            %dens = smoothDensity(dens,SIGMA);
+            dens = smoothDensity(dens);
+        end
+        him = imagesc(ax, ctrs, ctrs, dens);
+        set(him, 'AlphaData', dens > 0);                          % empty bins clear
+    end
+    colormap(ax, parula);
+    cb = colorbar(ax);  cb.Label.String = 'Proportion';
+
+    % Overlays: targets (o), fixation (square), mean start point (x).
+    h = gobjects(0);  lbl = {};
+    if ~isempty(M.targets)
+        h(end+1) = plot(ax, M.targets(:,1), M.targets(:,2), 'o', ...
+            'MarkerEdgeColor', 'r', 'MarkerSize', 5, 'LineWidth', 1.5);
+        lbl{end+1} = 'target';
+    end
+    if ~isempty(M.fixPt)
+        h(end+1) = plot(ax, M.fixPt(:,1), M.fixPt(:,2), 's', ...
+            'MarkerEdgeColor', 'k', 'MarkerSize', 5, 'LineWidth', 1.5);
+        lbl{end+1} = 'fixation';
+    end
+    if all(~isnan(M.startCenter))
+        % Magenta so the start marker reads on both the white empty-bin
+        % background (near fixation, where endpoint density is ~0) and the
+        % parula density fill.
+        h(end+1) = plot(ax, M.startCenter(1), M.startCenter(2), 'x', ...
+            'MarkerEdgeColor', [1 0 1], 'MarkerSize', 14, 'LineWidth', 2.5);
+        lbl{end+1} = 'start (mean)';
+    end
+
+    axis(ax, 'equal');
+    xlim(ax, [-r r]);  ylim(ax, [-r r]);
+    xlabel(ax, sprintf('Eye X (%s)', posUnit));
+    ylabel(ax, sprintf('Eye Y (%s)', posUnit));
+    if ~isempty(h);  legend(ax, h, lbl, 'Location', 'southoutside', ...
+            'Orientation', 'horizontal', 'FontSize', 8);  end
+    set(ax, 'LineWidth', 1, 'FontSize', 10, 'YDir', 'normal');
+    hold(ax, 'off');
+end
+
+
+function drawPeakVelMap(ax, M, posUnit, units, style, pvClim)
+% One peak-velocity-per-target panel: color = mean peak velocity at each target
+% location, as a griddata surface ('surface') or discrete colored dots ('dots').
+% Falls back to dots when there are too few targets to interpolate.
+% pvClim (optional [lo hi]) fixes the color range so every task shares one scale;
+% [] lets the panel autoscale.
+    if nargin < 6;  pvClim = [];  end
+    hold(ax, 'on');
+
+    xy = M.targets;  pv = M.targPV;
+    ok = all(~isnan(xy), 2) & ~isnan(pv);
+    xy = xy(ok, :);  pv = pv(ok);
+
+    if isempty(xy)
+        text(ax, 0.5, 0.5, 'no targets', 'Units', 'normalized', ...
+            'HorizontalAlignment', 'center');
+        axis(ax, 'square');  set(ax, 'LineWidth', 1, 'FontSize', 10);
+        hold(ax, 'off');  return
+    end
+
+    useSurface = strcmp(style, 'surface') && size(xy, 1) >= 3;
+    if useSurface
+        % Display-only interpolation over the sampled target space (the same
+        % pattern as drawHitRateMaps in behaviorCheck.m); NaN outside the convex
+        % hull leaves unexplored screen blank rather than extrapolated.
+        pad = 2;
+        gx  = linspace(min(xy(:,1))-pad, max(xy(:,1))+pad, 120);
+        gy  = linspace(min(xy(:,2))-pad, max(xy(:,2))+pad, 120);
+        [GX, GY] = meshgrid(gx, gy);
+        GZ  = griddata(xy(:,1), xy(:,2), pv, GX, GY, 'linear');
+        him = imagesc(ax, gx, gy, GZ);
+        set(him, 'AlphaData', ~isnan(GZ));
+        scatter(ax, xy(:,1), xy(:,2), 15, 'k', 'LineWidth', 1);   % target markers
+    else
+        scatter(ax, xy(:,1), xy(:,2), 100, pv, 'filled', ...
+            'MarkerEdgeColor', 'k', 'LineWidth', 0.75);
+    end
+
+    colormap(ax, parula);
+    if ~isempty(pvClim);  clim(ax, pvClim);  end     % shared range across tasks
+    cb = colorbar(ax);  cb.Label.String = sprintf('Peak velocity (%s)', units);
+    axis(ax, 'equal');
+    r = max(abs(xy(:)), [], 'omitnan') + 4;
+    xlim(ax, [-r r]);  ylim(ax, [-r r]);
+    xlabel(ax, sprintf('Target X (%s)', posUnit));
+    ylabel(ax, sprintf('Target Y (%s)', posUnit));
+    set(ax, 'LineWidth', 1, 'FontSize', 10, 'YDir', 'normal');
+    hold(ax, 'off');
+end
+
+
+function out = smoothDensity(dens,sigma)
+% Gaussian-smooth a 2-D density for the 'kde' endpoint style. Uses imgaussfilt
+% when the Image Processing Toolbox is available, else a small separable
+% gaussian via conv2 so the plot never hard-depends on that toolbox.
+    if nargin < 2
+        sigma = 1.5; %default
+    end
+
+    if exist('imgaussfilt', 'file') == 2
+        out = imgaussfilt(dens, sigma);
+        return
+    end
+
+    radius = ceil(3 * sigma);
+    x = -radius:radius;
+
+    g = exp(-(x.^2) / (2 * sigma^2));
+    g = g / sum(g);
+    out = conv2(g, g, dens, 'same');
 end
