@@ -20,30 +20,25 @@ function RT = CalculateRT(caled_eyes, comments_data, plotFlag, plotN, errorCheck
 %   plotN         - number of detected trials to draw, randomly sampled and
 %                   colored by task (default 50; NaN = draw all detected).
 %   errorCheck    - true to also draw the error-check figure of outlier saccades
-%                   (default true). RT.outliers is populated regardless.
-%   savePath      - (optional) session export folder. When set, the RT payload
-%                   (RT plus the per-trial detection data the QC plots need) is
-%                   cached to <savePath>/AnalysisCache/RT.mat. '' disables caching.
+%                   (default true). Only used on the plot path.
+%   savePath      - (optional) session export folder. When set, the per-trial RT
+%                   table is written to <savePath>/AnalysisCache/RT.csv (the
+%                   lightweight, always-available product). The full plot payload
+%                   is cached to <savePath>/AnalysisCache/RT.mat only on the plot
+%                   path (plotFlag true), since only the QC figures need it.
+%                   '' disables all caching / export.
 %   reCompute     - (optional, default true) when true, recompute RT and refresh
-%                   the cache. When false, load the cached payload if it exists;
-%                   the QC plots then redraw from it without recomputing.
+%                   the export/cache. When false, reuse the cached result: the
+%                   plot path redraws from RT.mat, the return-only path reads
+%                   RT.csv, neither recomputing.
 %
-% Returns RT, a struct:
-%   .data     - nTrials x 1 RT (s from go cue); NaN where not detected / invalid.
-%   .realRT   - true when RT came from the eye trace, false when it fell back to
-%               the FixationExit marker (no eye data).
-%   .units    - velocity units the threshold used: 'deg/s', 'uV/s', or 'marker'.
-%   .table    - nTrials x 1 table of saccade details:
-%               Trial, RTtime, SaccadeAmplitude, PeakVelocity,
-%               StartX, StartY, EndX, EndY, SaccadeDuration.
-%   .outliers - struct of abnormal trial indices (into comments_data rows):
-%               .trials (all), .amplitude (>3 SD from mean amplitude),
-%               .duration (< 20 ms or > 90 ms).
-%   noiseTrials - trial indices rejected as noise (RT NaN): either a
-%               tracker-noise spike (speed > 1500 deg/s) fell inside the
-%               detected saccade, or the saccade start point was already
-%               > 20 deg from the baseline gaze (corrupted trace).
-%
+% Returns RT, an nTrials x 9 table of per-trial saccade metrics (one row per trial
+% in comments_data, in order):
+%   Trial, RTtime (s from go cue), SaccadeAmplitude, PeakVelocity,
+%   StartX, StartY, EndX, EndY, SaccadeDuration.
+% Every RT comes from the eye trace; trials that were invalid or where no saccade
+% was detected are NaN rows.
+% Note: The detector is not optimized for uncalibrated eye data.
 % Xuefei Jul 2026
 
     if nargin < 3 || isempty(plotFlag);    plotFlag   = false;  end
@@ -52,16 +47,51 @@ function RT = CalculateRT(caled_eyes, comments_data, plotFlag, plotN, errorCheck
     if nargin < 6;                         savePath   = '';     end
     if nargin < 7 || isempty(reCompute);   reCompute  = true;   end
 
-    % Compute-or-load the RT payload (RT plus the per-trial data the QC plots
-    % need), then render from it, so the plots look identical on the compute and
-    % cache paths. computeRTPayload is pure; plotRTFigures only draws.
-    payload = getCachedPayload(savePath, 'RT', reCompute, ...
-        @() computeRTPayload(caled_eyes, comments_data));
-    RT = payload.RT;
-
-    if plotFlag && payload.hasTrace
-        plotRTFigures(payload, plotN, errorCheck);
+    if plotFlag
+        % Plot path: the QC figures need the full payload (traces, per-trial
+        % detection cells), so compute-or-load it from the RT.mat cache and render
+        % from it, so the plots look identical on the compute and cache paths.
+        % computeRTPayload is pure; plotRTFigures only draws.
+        payload = getCachedPayload(savePath, 'RT', reCompute, ...
+            @() computeRTPayload(caled_eyes, comments_data));
+        RT = payload.RT;
+        exportRTtable(RT, savePath);          % refresh the lightweight CSV
+        if payload.hasTrace
+            plotRTFigures(payload, plotN, errorCheck);
+        end
+    else
+        % Return-only path: never touch the heavy RT.mat. Reuse the small RT.csv
+        % when allowed, otherwise recompute and refresh it.
+        csvFile = rtCsvPath(savePath);
+        if ~reCompute && ~isempty(csvFile) && exist(csvFile, 'file')
+            RT = readtable(csvFile);
+        else
+            payload = computeRTPayload(caled_eyes, comments_data);
+            RT = payload.RT;
+            exportRTtable(RT, savePath);
+        end
     end
+end
+
+
+function csvFile = rtCsvPath(savePath)
+% Path of the per-trial RT table export, or '' when caching is disabled.
+    csvFile = '';
+    if ~isempty(savePath)
+        csvFile = fullfile(char(savePath), 'AnalysisCache', 'RT.csv');
+    end
+end
+
+
+function exportRTtable(RT, savePath)
+% Write the per-trial RT table to <savePath>/AnalysisCache/RT.csv (no-op when
+% savePath is empty). This is the lightweight product read back by the
+% return-only path; it is far smaller than the RT.mat plot payload.
+    csvFile = rtCsvPath(savePath);
+    if isempty(csvFile);  return;  end
+    cacheDir = fileparts(csvFile);
+    if ~exist(cacheDir, 'dir');  mkdir(cacheDir);  end
+    writetable(RT, csvFile);
 end
 
 
@@ -113,51 +143,15 @@ function payload = computeRTPayload(caled_eyes, comments_data)
     endY     = nan(nTrials, 1);
     durSac   = nan(nTrials, 1);
 
-    % =====================================================================
-    % Branch 1: no eye data at all -> approximate RT from the FixExit marker
-    % =====================================================================
-    
-    if isempty(caled_eyes)
-        disp('No eye data found; approximating RT / saccade from the markers.');
-        marker_rt = comments_data.Fixation_exited - comments_data.Fixation_point_off;
-        marker_rt(~isValid) = NaN;
-        RTtime = marker_rt;
-
-        % No eye trace, so the saccade span is taken from the behavioral markers:
-        % start = fixation location, end = Target 1 location, duration from the
-        % FixExit -> Choicetime(+pad) interval, peak velocity undefined.
-        durSac = comments_data.Choicetime - comments_data.Fixation_exited;
-        durSac(~isValid) = NaN;
-        
-        % peakVel stays NaN (undefined without a velocity trace).
-
-        fprintf('%d approximate RT computed from FixExit marker.\n', ...
-            sum(~isnan(RTtime)));
-
-       % RT.data   = RTtime;
-        RT.realRT = false;
-        RT.units  = 'marker';
-        RT.data  = buildTable(nTrials, RTtime, ampl, peakVel, ...
-                               startX, startY, endX, endY, durSac);
-
-        % No eye trace -> nothing to draw; keep the payload shape consistent.
-        payload = struct('RT', RT, 't', [], 'dets', {{}}, ...
-            'ampOut', [], 'durOut', [], 'taskLabels', {comments_data.Task}, ...
-            'hasTrace', false);
-        return
-    end
-
-    % =====================================================================
-    % Branch 2: eye data present -> detect the saccade from the trace
-    % =====================================================================
+   
     % Calibrated traces are in degrees, so the 30 deg/s threshold applies.
     % Uncalibrated traces are still in uV, where 30 deg/s is meaningless, so
     % only the baseline + 3*SD criterion is used.
     useDegThr = caled_eyes.cal.applied;
     if useDegThr
-        RT.units = 'deg/s';
+        units = 'deg/s';
     else
-        RT.units = 'uV/s';
+        units = 'uV/s';
         disp('Eye trace is uncalibrated (uV); using baseline + 3*SD criterion.');
     end
 
@@ -202,10 +196,8 @@ function payload = computeRTPayload(caled_eyes, comments_data)
     fprintf('%d real RT detected from the eye trace (of %d valid trials).\n', ...
         sum(~isnan(RTtime)), sum(isValid));
 
-    %RT.data   = RTtime;
-    RT.realRT = true;
-    RT.data  = buildTable(nTrials, RTtime, ampl, peakVel, ...
-                           startX, startY, endX, endY, durSac);
+    RTtable = buildTable(nTrials, RTtime, ampl, peakVel, ...
+                         startX, startY, endX, endY, durSac);
 
     % Trials rejected because tracker noise landed inside the detected saccade
     % (RT already NaN for these).
@@ -228,7 +220,7 @@ function payload = computeRTPayload(caled_eyes, comments_data)
         numel(outliers.trials), numel(outliers.amplitude), numel(outliers.duration));
 
     hasTrace = any(cellfun(@(d) ~isempty(d) && ~isempty(d.tv), dets));
-    payload  = struct('RT', RT, 't', t, 'dets', {dets}, ...
+    payload  = struct('RT', RTtable, 'units', units, 't', t, 'dets', {dets}, ...
         'ampOut', ampOut, 'durOut', durOut, ...
         'taskLabels', {comments_data.Task}, 'hasTrace', hasTrace);
 end
@@ -259,11 +251,11 @@ function plotRTFigures(payload, plotN, errorCheck)
         dev_all(i, :)   = dets{i}.dev;
         speed_all(i, :) = dets{i}.speed;
     end
-    plotSaccadeFigure(t, tv, dev_all, speed_all, dets, payload.RT.data, ...
-        payload.taskLabels, plotN, payload.RT.units);
+    plotSaccadeFigure(t, tv, dev_all, speed_all, dets, payload.RT, ...
+        payload.taskLabels, plotN, payload.units);
     if errorCheck
         plotErrorCheck(t, tv, dev_all, speed_all, dets, ...
-            payload.ampOut, payload.durOut, payload.RT.units);
+            payload.ampOut, payload.durOut, payload.units);
     end
 end
 
@@ -639,7 +631,7 @@ function plotSaccadeFigure(t, tv, dev_all, speed_all, dets, rtTable, taskLabels,
 %   bottom mid   - saccade amplitude vs peak velocity (the "main sequence")
 %   bottom right - saccade amplitude vs duration
 % Everything is pre-computed: trace matrices are indexed and the scatter/hist
-% come straight off RT.data -- nothing is recomputed here.
+% come straight off the RT table -- nothing is recomputed here.
 
     tt_ms = t  * 1000;
     tv_ms = tv * 1000;
