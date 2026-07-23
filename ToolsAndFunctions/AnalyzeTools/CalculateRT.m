@@ -57,7 +57,8 @@ function RT = CalculateRT(caled_eyes, comments_data, plotFlag, plotN, errorCheck
 
     % Style flags for the saccade-map QC figure only (see plotSaccadeMapsFigure).
     p = inputParser;
-    p.addParameter('EndpointStyle', 'kde', ...
+
+    p.addParameter('EndpointStyle', 'hist', ...
         @(s) any(strcmpi(s, {'hist', 'kde'})));
     p.addParameter('PeakVelStyle',  'surface', ...
         @(s) any(strcmpi(s, {'surface', 'dots'})));
