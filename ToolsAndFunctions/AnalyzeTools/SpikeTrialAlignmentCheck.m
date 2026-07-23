@@ -19,6 +19,9 @@ function T = SpikeTrialAlignmentCheck(spike, cd, markers)
 %   .valid   - logical, trial matched a trials-table row
 %   .task    - task string ('' when unmatched)
 %   .success - logical, outcome is 'correct' or 'wrong'
+%   .outcome - raw trial outcome string ('' when unmatched), so callers that need
+%              the specific outcome (e.g. 'correct' only) are not limited to the
+%              correct-or-wrong .success collapse
 %   .<marker> - one field per requested marker, marker time (abs s), NaN if the
 %               column or value is absent
 %
@@ -39,6 +42,7 @@ function T = SpikeTrialAlignmentCheck(spike, cd, markers)
     oc        = repmat({''}, ns, 1);
     oc(valid) = cellstr(string(cd.Trialoutcome(loc(valid))));
     T.success = strcmp(oc, 'correct') | strcmp(oc, 'wrong');
+    T.outcome = oc;
 
     % Timing markers (abs seconds), one like-named field each; NaN where a column
     % or value is missing.

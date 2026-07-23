@@ -18,6 +18,13 @@ clear;
 JLabRoot = fileparts(mfilename('fullpath'));
 addpath(JLabRoot);
 addpath(genpath(fullfile(JLabRoot, 'ToolsAndFunctions')));
+% Per-task analysis protocols: add Protocol/ and every subfolder (e.g.
+% Protocol/VisualSaccadeTask/RFPlot.m), but only when the tree is not already on
+% the path, so re-running the script does not keep re-adding it.
+protocolRoot = fullfile(JLabRoot, 'Protocol');
+if isfolder(protocolRoot) && ~contains([pathsep path pathsep], [pathsep protocolRoot pathsep])
+    addpath(genpath(protocolRoot));
+end
 
 
 %% -------------------------------------------------------------------------
@@ -27,29 +34,34 @@ addpath(genpath(fullfile(JLabRoot, 'ToolsAndFunctions')));
 % expected at: main_path/monkey/task_type/folder/data_date/Blackrock_*.mat
 
 Basic_Path  = '/Users/xuefeiyu/Documents/XuefeiFile/WorkRelated/Data';
-%Monkey = 'test';        % bare monkey name; folder is "Monkey <name>"
-Monkey = 'Athos'; 
+Monkey = 'test';        % bare monkey name; folder is "Monkey <name>"
+%Monkey = 'Athos'; 
 Location = 'in_lab';       % editable constant
 DataType = 'export_data';     % editable constant
 
-Folder = '2026-07-17';
-%Folder = '2026-07-15';
+%Folder = '2026-07-17';
+Folder = '2026-07-15';
 
 
 %Toddles to turn quality check plots on
 PlotBehaviorCheck= false; % for visualizing behavior summary
 PlotCalibratedEyes = false;% for plotting eye trace after calibration
 PlotSpikeCheck = false; %turn on the spike navigator interface
+PlotSaccadeCheck = false; %turn on the plots for saccade detection and saccade related visualizations
+TaskRouter = true; %turn on the task rounter for individual task based analysis
 
 % ReCompute flags: default true recomputes and refreshes the AnalysisCache
 % (<main_path>/AnalysisCache). Set one false to load that product from cache
 % instead of recomputing (the plots still redraw from the cached data). The eye
 % calibration is cached as a readable text file; the others as .mat.
-ReComputeBehavior = true;
-ReComputeCal      = true;
-ReComputeSpike    = true;
-ReComputeRT       = true;
 
+%
+ReComputeBehavior = false;
+ReComputeCal      = false;
+ReComputeSpike    = false;
+ReComputeRT       = false;
+ReComputeRF       = false;
+%
 
 %Check all the exported files in the folder
 
@@ -145,10 +157,6 @@ end
 
 
 %Screen the tasks and spikes according to the behavior and spike check.
-%Not cached: ScreenSession is a trivial threshold over the (already cached)
-%behavior and spike summaries, so it is recomputed live each run. The persisted
-%exclusion truth stays CSV-based: AnalysisCache/unit_qc_exclusions.csv (manual
-%per-unit labels) and Summary/<Monkey>_qc_summary.csv (per-unit metrics + labels).
 [excludeTasks, excludeSpikes] = ScreenSession(BehaviorSummary, SpikeSummary);
 
 %comments_data
@@ -157,11 +165,58 @@ end
 %spike_waveform_data
 
 %% Preprossing: Add RT to saccade tasks.
-PlotRTCheck = true;
-RT = CalculateRT(caled_eyes, comments_data, PlotRTCheck, [], [], main_path, ReComputeRT);
+RT = CalculateRT(caled_eyes, comments_data, PlotSaccadeCheck, [], [], main_path, ReComputeRT);
 
-
+if TaskRouter
 %% Auto-rounting to it's respective analyze protocol
+
+tasklist  = BehaviorSummary.Task(~contains(BehaviorSummary.Task,excludeTasks));
+
+filtered_spike_data = [];
+if ~isempty(spike_data)
+    %Screen spike_data
+    filtered_spike_data = ScreenSpikeData(spike_data, excludeSpikes);
+end
+
+
+data_ana = struct('comments',comments_data,'RT',RT,'eyes',caled_eyes,'spike',filtered_spike_data);
+data_extra =[]; %returned data from another task
+plotFlag = 1; %Flag of whether to turn the plot on;
+%No need the raw waveform for now, may be extend later
+cfg = [];%Reserved for future, for selection for batch analysis
+
+%Now loop over tasks to rount data into their task-related protocols
+for i = 1:length(tasklist)
+    task = tasklist(i);
+    switch task 
+        case 'visual_saccades_experiment'
+            vse_result = RFPlot(data_ana,data_extra,plotFlag,main_path,ReComputeRF);
+        case 'memory_saccades_experiment'
+            mse_result = FunctionSubtypeIdentify(data_ana,cfg,plotFlag);
+        case 'time_delay_experiment'
+            tde_result = TimeDiscriminationBehavior(data_ana,cfg,plotFlag);
+        otherwise
+            fprintf('No analyze protocol for %s yet\n',task);
+     
+    end
+
+
+end
+
+end %End of the task rounter
+
+% RFPlot now lives in Protocol/VisualSaccadeTask/RFPlot.m (on the path via genpath),
+% so the routing call above resolves to that file.
+
+function result = FunctionSubtypeIdentify(data,cfg,plotFlag);
+    result = 1;
+end
+
+% TimeDiscriminationBehavior now lives in
+% ToolsAndFunctions/AnalyzeTools/TimeDiscriminationBehavior.m (on the path via
+% genpath), so the routing call at the top resolves to that file.
+
+
 
 
 
@@ -171,150 +226,6 @@ RT = CalculateRT(caled_eyes, comments_data, PlotRTCheck, [], [], main_path, ReCo
 
 
 keyboard
-
-
-% Task name used to filter trials (must match the Task field in expdata)
-%analyze_task = 'time_delay_experiment';
-analyze_task = 'visual_saccades_experiment';
-
-% Eye-trace plot settings (see section 4)
-eye_preMs      = 300;   % ms before go cue (fixation offset) to plot
-eye_postMs     = 500;   % ms after  go cue to plot
-angle_bin_deg  = 30;    % round target angle to this grid to form direction groups
-eye_num_sample = 100;    % [] = plot all trials; N = plot only first N traces per direction
-
-%% -------------------------------------------------------------------------
-%% 2. LOAD AND FILTER TRIALS
-%% -------------------------------------------------------------------------
-if exist(comments_path, 'file')
-    % Load the parsed BlackRock session file
-    expdata = readtable(comments_path);
-    
-    
-    % Keep only trials that were fully saved (no truncation)
-    complete_saved = [expdata.Save_complete] == 1;
-
-    % Keep only trials from the task we want to analyze
-    task_sel = strcmp([expdata.Task], analyze_task);
-   
-
-    % Keep only trials with a valid choice (Choose_target is not NaN)
-    trial_sel = ~isnan([expdata.Choose_target]);
-
-    % Combine all criteria: complete, correct task, valid choice
-    selected_data = complete_saved & task_sel & trial_sel;
-
-    % Subset of trials used for psychometric analysis
-    task_data = expdata(selected_data,:);
-
-    TotalTrials = sum(selected_data);
-
-    %% ---------------------------------------------------------------------
-    %% 3. BUILD PSYCHOMETRIC INPUT MATRIX
-    %% ---------------------------------------------------------------------
-    % Extract trial-level variables for psychometric function fitting.
-    % VisPsychometricFunction expects columns: [stimulus, direction, choice].
-
-    stimulus = [task_data.Requested_target_2_time_offset];  % Requested time delay (ms)
-
-    %{
-    stimulus_real = ([task_data.Target_2_presented] - [task_data.Target_1_presented]) * 1000;  % Actual delay in ms
-    
-   fixation_on = [task_data.Fixation_point_on ];
-   fixation_acquired = [task_data.Fixation_acquired ];
-
-   diff_fix = fixation_acquired-fixation_on;
-
-
-    target1_position_x =[task_data.Target_1_position_x];
-    target1_position_y =[task_data.Target_1_position_y];
-
-    target2_position_x = [task_data.Target_2_position_x];
-    target2_position_y = [task_data.Target_2_position_y];
-
-    %}
-   
-
-
-    %RT
-    reactiont_time = [task_data.Choicetime] - [task_data.Fixation_point_off];
-
-    direction = [task_data.Stimulus_direction];   % Stimulus order (e.g. left-first vs right-first)
-    choice_response = [task_data.Choose_leftright] == 1;  % 0 = left, 1 = right
-
-    % Matrix passed to psychometric visualization: [stimulus, direction, choice]
-    Psymatrix = [stimulus, direction, choice_response];
-
-    % Plot psychometric curve and return point of subjective equality (PSE) and threshold
-   % [pse, threshold] = VisPsychometricFunction(Psymatrix);
-
-
-
-    % Optional: uncomment to plot requested vs actual delay (calibration check)
-    %{
-    figure
-    scatter(stimulus, stimulus_real, 'or');
-    axis equal;
-    hold on
-    plot([0:250], [0:250], '--k');
-    xlabel('Requested delay');
-    ylabel('Actual delay');
-    xlim([-0.1, max(stimulus_real)+30]);
-    ylim([-0.1, max(stimulus_real)+30]);
-    title('InLab Trainer');
-    keyboard
-    %}
-
-    %% ---------------------------------------------------------------------
-    %% 4. PLOT EYE TRACES ALIGNED TO GO CUE (fixation offset)
-    %% ---------------------------------------------------------------------
-    % Load the segmented analog/eye product and plot raw eye traces in a
-    % window around the go cue, grouped by the chosen target's direction.
-    if exist(analog_path, 'file')
-        L = load(analog_path);
-        analog = L.analog;
-
-        % Keep the same trials the psychometric fit used (successful trials).
-      %  eyedata = subsetAnalogTrials(analog, selected_data);
-      eyedata = analog;
-      task_data = expdata;
-     
-
-        % Pull eye X/Y (uV) and the shared sample time base (s, from Start).
-        nTr      = size(eyedata.data, 2);
-        eye_x    = reshape(eyedata.data(1,:,:), nTr, []);   % nTrials x nSamp
-        eye_y    = reshape(eyedata.data(2,:,:), nTr, []);
-        eye_time = eyedata.timeseq.relative_time;           % 1 x nSamp, s from Start
-
-        % Go cue (fixation offset) time in the same frame as eye_time.
-        marker_time = task_data.Fixation_point_off - task_data.Start;   % nTrials x 1, s
-
-        % Align every trace to the go cue over [-preMs, +postMs].
-        [aligned_eye, rts] = AlignEyeTrace(eye_x, eye_y, eye_time, ...
-             marker_time, eye_preMs, eye_postMs);
-
-        aligned_eye.marker = 'fixation off';%to indicate it on the plot.
-
-        % Choice conditions = binned chosen-target direction (one per trial).
-        choose = task_data.Choose_target;
-        ang = nan(nTr, 1);
-        ang(choose==1) = task_data.Target_1_angle(choose==1);
-        ang(choose==2) = task_data.Target_2_angle(choose==2);
-        conditions = mod(round(ang/angle_bin_deg)*angle_bin_deg + 180, 360) - 180;
-
-        plotAlignedEyeTraces(aligned_eye, rts, conditions, ...
-            sprintf('%s  %s', Monkey, Folder), eye_num_sample);
-    else
-        disp('No analog (eye) .mat found; run the loader with LoadAnalogData on first.');
-    end
-
-else
-    % File missing: run the BlackRock parser on raw data first, then re-run this script
-    disp('No data found, please parse the raw data first.')
-end
-
-%keyboard
-
 
 %% -------------------------------------------------------------------------
 %% -------------------------------------------------------------------------
@@ -345,96 +256,32 @@ function p = findExportFile(all_files, main_path, pattern, exclude)
     p = fullfile(main_path, hit{1});
 end
 
+function filtered = ScreenSpikeData(spike, exclude);
 
-% AlignEyeTrace now lives in ToolsAndFunctions/AnalyzeTools/AlignEyeTrace.m
-% so that EyeCalibration can share it.
+% Filter spike data
+sel = ~exclude;
+filtered = spike;
+filtered.data = spike.data(sel,:,:);   
 
+fields = fieldnames(spike.info);
+keep_fields = {'samplingrate','Session','Trial_number','MeanWaveformUnit'};
 
-function plotAlignedEyeTraces(aligned_eye, relative_time_seq, conditions, ttl, num_of_sample)
-% Plot marker-aligned eye traces grouped by a per-trial condition.
-%
-%   aligned_eye       - struct from AlignEyeTrace: .x, .y (nTrials x nOut) and
-%                       .marker (label for the alignment event).
-%   relative_time_seq - 1 x nOut time from the marker (s); 0 at the marker.
-%   conditions        - nTrials x 1 grouping value per trial (e.g. binned chosen
-%                       target direction, deg). NaN -> trial skipped.
-%   ttl               - figure super-title (e.g. 'Monkey X  YYYY-MM-DD').
-%   num_of_sample     - (optional) max traces to draw per condition; [] or omitted
-%                       plots all. The first num_of_sample trials of each condition
-%                       are used (same trials in both figures).
-%
-% Produces two figures: (1) X (solid) & Y (dashed) vs time, one subplot per
-% condition; (2) 2D gaze trajectory (X vs Y), one color per condition.
+for i = 1:numel(fields)
 
-    if nargin < 5;  num_of_sample = [];  end
+    field = fields{i};
+    value = spike.info.(field);
 
-    Xall   = aligned_eye.x;
-    Yall   = aligned_eye.y;
-    marker = aligned_eye.marker;
-    tt_ms  = relative_time_seq * 1000;              % display axis in ms
+    if contains(field,keep_fields)
+        filtered.info.(field) = value;    
 
-    % Keep trials with a defined condition and some data.
-    keep = ~isnan(conditions(:)) & any(~isnan(Xall), 2);
-    if ~any(keep)
-        warning('plotAlignedEyeTraces: no trials with a valid condition / data.');
-        return
+    else
+        filtered.info.(field) = value(sel,:);
     end
-    Xall = Xall(keep,:);  Yall = Yall(keep,:);  cond = conditions(keep);
 
-    grps = unique(cond);
-    nGrp = numel(grps);
-    cmap = hsv(nGrp);            % condition -> hue; swap for lines(nGrp) if preferred
-
-    % ---------------------------------------------------------------------
-    % Figure 1: X (solid) & Y (dashed) vs time, one subplot per condition
-    % ---------------------------------------------------------------------
-    figure('Name', 'Eye traces vs time');
-    nc = ceil(sqrt(nGrp));
-    nr = ceil(nGrp / nc);
-    for d = 1:nGrp
-        idx = find(cond == grps(d));
-        if ~isempty(num_of_sample)
-            idx = idx(1:min(num_of_sample, numel(idx)));   % first N of this condition
-        end
-        subplot(nr, nc, d); hold on;
-        plot(tt_ms, Xall(idx,:)', '-',  'Color', cmap(d,:), 'LineWidth', 0.5);
-        plot(tt_ms, Yall(idx,:)', '--', 'Color', cmap(d,:), 'LineWidth', 0.5);
-        yl = ylim;  plot([0 0], yl, 'k:');  ylim(yl);   % marker at t=0
-        xlim([tt_ms(1) tt_ms(end)]);
-        xlabel(sprintf('Time from %s (ms)', marker));
-        ylabel('Eye position (\muV)');
-        title(sprintf('%.0f\\circ  (n=%d)', grps(d), numel(idx)));
-        % legend via dummy handles (solid=X, dashed=Y)
-        hx = plot(nan, nan, '-k');  hy = plot(nan, nan, '--k');
-        legend([hx hy], {'X', 'Y'}, 'Location', 'best');
-        hold off;
-    end
-    sgtitle(sprintf('%s  |  eye traces aligned to %s', ttl, marker));
-
-    % ---------------------------------------------------------------------
-    % Figure 2: 2D gaze trajectory (X vs Y), one color per condition
-    % ---------------------------------------------------------------------
-    figure('Name', '2D gaze trajectory'); hold on;
-    hleg = gobjects(nGrp, 1);
-    for d = 1:nGrp
-        idx = find(cond == grps(d));
-        if ~isempty(num_of_sample)
-            idx = idx(1:min(num_of_sample, numel(idx)));   % first N of this condition
-        end
-        for k = 1:numel(idx)
-            h = plot(Xall(idx(k),:), Yall(idx(k),:), '-', ...
-                'Color', cmap(d,:), 'LineWidth', 0.5);
-            if k == 1;  hleg(d) = h;  end     % one handle per group for legend
-        end
-    end
-    axis equal;
-    xlabel('Eye X (\muV)');
-    ylabel('Eye Y (\muV)');
-    title(sprintf('%s  |  2D gaze (%.0f to %.0f ms around %s)', ...
-        ttl, tt_ms(1), tt_ms(end), marker));
-    legend(hleg, arrayfun(@(a) sprintf('%.0f\\circ', a), grps, 'UniformOutput', false), ...
-        'Location', 'bestoutside');
-    hold off;
 end
 
+
+
+
+end
 
