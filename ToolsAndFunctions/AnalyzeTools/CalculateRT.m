@@ -58,7 +58,7 @@ function RT = CalculateRT(caled_eyes, comments_data, plotFlag, plotN, errorCheck
     % Style flags for the saccade-map QC figure only (see plotSaccadeMapsFigure).
     p = inputParser;
 
-    p.addParameter('EndpointStyle', 'hist', ...
+    p.addParameter('EndpointStyle', 'kde', ...
         @(s) any(strcmpi(s, {'hist', 'kde'})));
     p.addParameter('PeakVelStyle',  'surface', ...
         @(s) any(strcmpi(s, {'surface', 'dots'})));
@@ -931,7 +931,7 @@ function plotErrorCheck(t, tv, dev_all, speed_all, dets, ampOut, durOut, units)
         return
     end
 
-    RED = [1 0 0];   BLUE = [0 0 1];
+    RED = [1 0 0];   BLUE = [0 0 1]; GREEN = [0,1,0];
 
     figure('Name', 'Saccade error check', 'Color', 'w');
 
@@ -955,26 +955,26 @@ function plotErrorCheck(t, tv, dev_all, speed_all, dets, ampOut, durOut, units)
 
     % ===== Column 2: amplitude outliers ==================================
     subplot(2, 3, 2); hold on;
-    drawErrTraces(tt_ms, dev_all, ampIdx, RED, dets, 'onset_dev', 'offset_dev');
+    drawErrTraces(tt_ms, dev_all, ampIdx, GREEN, dets, 'onset_dev', 'offset_dev');
     finishErrPanel(tt_ms, 'Time from go cue (ms)', sprintf('Deviation (%s)', posUnit), ...
         sprintf('Amplitude outliers  (n=%d)', numel(ampIdx)));
     hold off;
 
     subplot(2, 3, 5); hold on;
-    drawErrTraces(tv_ms, speed_all, ampIdx, RED, dets, 'onset_speed', 'offset_speed');
+    drawErrTraces(tv_ms, speed_all, ampIdx, GREEN, dets, 'onset_speed', 'offset_speed');
     finishErrPanel(tv_ms, 'Time from go cue (ms)', sprintf('Speed (%s)', units), ...
         'Amplitude outliers: speed profile');
     hold off;
 
     % ===== Column 3: duration outliers ===================================
     subplot(2, 3, 3); hold on;
-    drawErrTraces(tt_ms, dev_all, durIdx, BLUE, dets, 'onset_dev', 'offset_dev');
+    drawErrTraces(tt_ms, dev_all, durIdx, GREEN, dets, 'onset_dev', 'offset_dev');
     finishErrPanel(tt_ms, 'Time from go cue (ms)', sprintf('Deviation (%s)', posUnit), ...
         sprintf('Duration outliers  (n=%d)', numel(durIdx)));
     hold off;
 
     subplot(2, 3, 6); hold on;
-    drawErrTraces(tv_ms, speed_all, durIdx, BLUE, dets, 'onset_speed', 'offset_speed');
+    drawErrTraces(tv_ms, speed_all, durIdx, GREEN, dets, 'onset_speed', 'offset_speed');
     finishErrPanel(tv_ms, 'Time from go cue (ms)', sprintf('Speed (%s)', units), ...
         'Duration outliers: speed profile');
     hold off;
@@ -1085,6 +1085,8 @@ function drawEndpointMap(ax, M, posUnit, style)
         if total > 0;  counts = counts / total;  end             % -> proportion
         dens   = counts.';                                        % rows=Y for imagesc
         if strcmp(style, 'kde')
+            %SIGMA = 5; 
+            %dens = smoothDensity(dens,SIGMA);
             dens = smoothDensity(dens);
         end
         him = imagesc(ax, ctrs, ctrs, dens);
@@ -1097,12 +1099,12 @@ function drawEndpointMap(ax, M, posUnit, style)
     h = gobjects(0);  lbl = {};
     if ~isempty(M.targets)
         h(end+1) = plot(ax, M.targets(:,1), M.targets(:,2), 'o', ...
-            'MarkerEdgeColor', 'r', 'MarkerSize', 10, 'LineWidth', 1.5);
+            'MarkerEdgeColor', 'r', 'MarkerSize', 5, 'LineWidth', 1.5);
         lbl{end+1} = 'target';
     end
     if ~isempty(M.fixPt)
         h(end+1) = plot(ax, M.fixPt(:,1), M.fixPt(:,2), 's', ...
-            'MarkerEdgeColor', 'k', 'MarkerSize', 10, 'LineWidth', 1.5);
+            'MarkerEdgeColor', 'k', 'MarkerSize', 5, 'LineWidth', 1.5);
         lbl{end+1} = 'fixation';
     end
     if all(~isnan(M.startCenter))
@@ -1157,9 +1159,9 @@ function drawPeakVelMap(ax, M, posUnit, units, style, pvClim)
         GZ  = griddata(xy(:,1), xy(:,2), pv, GX, GY, 'linear');
         him = imagesc(ax, gx, gy, GZ);
         set(him, 'AlphaData', ~isnan(GZ));
-        scatter(ax, xy(:,1), xy(:,2), 25, 'k', 'LineWidth', 1);   % target markers
+        scatter(ax, xy(:,1), xy(:,2), 15, 'k', 'LineWidth', 1);   % target markers
     else
-        scatter(ax, xy(:,1), xy(:,2), 120, pv, 'filled', ...
+        scatter(ax, xy(:,1), xy(:,2), 100, pv, 'filled', ...
             'MarkerEdgeColor', 'k', 'LineWidth', 0.75);
     end
 
@@ -1176,15 +1178,23 @@ function drawPeakVelMap(ax, M, posUnit, units, style, pvClim)
 end
 
 
-function out = smoothDensity(dens)
+function out = smoothDensity(dens,sigma)
 % Gaussian-smooth a 2-D density for the 'kde' endpoint style. Uses imgaussfilt
 % when the Image Processing Toolbox is available, else a small separable
 % gaussian via conv2 so the plot never hard-depends on that toolbox.
+    if nargin < 2
+        sigma = 1.5; %default
+    end
+
     if exist('imgaussfilt', 'file') == 2
-        out = imgaussfilt(dens, 1.5);
+        out = imgaussfilt(dens, sigma);
         return
     end
-    g = exp(-((-3:3).^2) / (2 * 1.5^2));
+
+    radius = ceil(3 * sigma);
+    x = -radius:radius;
+
+    g = exp(-(x.^2) / (2 * sigma^2));
     g = g / sum(g);
     out = conv2(g, g, dens, 'same');
 end

@@ -34,34 +34,41 @@ end
 % expected at: main_path/monkey/task_type/folder/data_date/Blackrock_*.mat
 
 Basic_Path  = '/Users/xuefeiyu/Documents/XuefeiFile/WorkRelated/Data';
-Monkey = 'test';        % bare monkey name; folder is "Monkey <name>"
-%Monkey = 'Athos'; 
+%Monkey = 'test';        % bare monkey name; folder is "Monkey <name>"
+Monkey = 'Athos'; 
 Location = 'in_lab';       % editable constant
 DataType = 'export_data';     % editable constant
 
-%Folder = '2026-07-17';
-Folder = '2026-07-15';
+Folder = '2026-07-17';
+%Folder = '2026-07-15';
 
 
 %Toddles to turn quality check plots on
 PlotBehaviorCheck= false; % for visualizing behavior summary
 PlotCalibratedEyes = false;% for plotting eye trace after calibration
 PlotSpikeCheck = false; %turn on the spike navigator interface
-PlotSaccadeCheck = false; %turn on the plots for saccade detection and saccade related visualizations
-TaskRouter = true; %turn on the task rounter for individual task based analysis
+PlotSaccadeCheck = true; %turn on the plots for saccade detection and saccade related visualizations
+TaskRouter = false; %turn on the task rounter for individual task based analysis
 
 % ReCompute flags: default true recomputes and refreshes the AnalysisCache
 % (<main_path>/AnalysisCache). Set one false to load that product from cache
 % instead of recomputing (the plots still redraw from the cached data). The eye
 % calibration is cached as a readable text file; the others as .mat.
 
-%
+%{
 ReComputeBehavior = false;
 ReComputeCal      = false;
 ReComputeSpike    = false;
 ReComputeRT       = false;
 ReComputeRF       = false;
+%}
 %
+ReComputeBehavior = true;
+ReComputeCal      = true;
+ReComputeSpike    = true;
+ReComputeRT       = true;
+ReComputeRF       = true;
+%}
 
 %Check all the exported files in the folder
 
@@ -225,6 +232,7 @@ end
 
 
 
+%% 
 keyboard
 
 %% -------------------------------------------------------------------------
