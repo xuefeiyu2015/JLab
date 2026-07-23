@@ -27,19 +27,28 @@ addpath(genpath(fullfile(JLabRoot, 'ToolsAndFunctions')));
 % expected at: main_path/monkey/task_type/folder/data_date/Blackrock_*.mat
 
 Basic_Path  = '/Users/xuefeiyu/Documents/XuefeiFile/WorkRelated/Data';
-Monkey = 'test';        % bare monkey name; folder is "Monkey <name>"
-%Monkey = 'Athos'; 
+%Monkey = 'test';        % bare monkey name; folder is "Monkey <name>"
+Monkey = 'Athos'; 
 Location = 'in_lab';       % editable constant
 DataType = 'export_data';     % editable constant
 
-%Folder = '2026-07-17';
-Folder = '2026-07-15';
+Folder = '2026-07-17';
+%Folder = '2026-07-15';
 
 
 %Toddles to turn quality check plots on
 PlotBehaviorCheck= false; % for visualizing behavior summary
 PlotCalibratedEyes = false;% for plotting eye trace after calibration
 PlotSpikeCheck = false; %turn on the spike navigator interface
+
+% ReCompute flags: default true recomputes and refreshes the AnalysisCache
+% (<main_path>/AnalysisCache). Set one false to load that product from cache
+% instead of recomputing (the plots still redraw from the cached data). The eye
+% calibration is cached as a readable text file; the others as .mat.
+ReComputeBehavior = true;
+ReComputeCal      = true;
+ReComputeSpike    = true;
+ReComputeRT       = true;
 
 
 %Check all the exported files in the folder
@@ -65,7 +74,7 @@ waveform_path = findExportFile(all_files, main_path, 'spikes_waveform');
 
 if ~isempty(comments_path)
     comments_data = readtable(comments_path);
-    BehaviorSummary = behaviorCheck(comments_data, PlotBehaviorCheck, main_path);
+    BehaviorSummary = behaviorCheck(comments_data, PlotBehaviorCheck, main_path, ReComputeBehavior);
    
 else
     
@@ -85,7 +94,7 @@ if ~isempty(analog_path)
     % calibrates off it, otherwise off whichever saccade task it ran.
     task_cal  = {'fixation', 'visual_saccade', 'memory_saccade'};
     
-    caled_eyes = EyeCalibration(comments_data,eye_data,task_cal,[],[], PlotCalibratedEyes); 
+    caled_eyes = EyeCalibration(comments_data,eye_data,task_cal,[],[], PlotCalibratedEyes,[],[], main_path, ReComputeCal);
 
     if caled_eyes.cal.applied == false
         disp('Eye calibration failed!');
@@ -115,7 +124,7 @@ if ~isempty(spike_path)
 
     
     SpikeSummary = spikeCheck(spike_data, spikewaveform_data, ...
-                                   comments_data, main_path, PlotSpikeCheck );
+                                   comments_data, main_path, PlotSpikeCheck, ReComputeSpike );
 
     % Surface the loader's precomputed per-unit average waveform (uV). Rows of
     % SpikeSummary align 1:1 with spike_data.info (one row per unit, same order).
@@ -135,11 +144,12 @@ else
 end
 
 
-%Screen the tasks and spikes according to the behavior and spike check
-excludeTrials = [];
-excludeSpikes = zeros(size(SpikeSummary,1));
-
-[excludeTrials, excludeSpikes] = ScreenSession(BehaviorSummary,SpikeSummary);
+%Screen the tasks and spikes according to the behavior and spike check.
+%Not cached: ScreenSession is a trivial threshold over the (already cached)
+%behavior and spike summaries, so it is recomputed live each run. The persisted
+%exclusion truth stays CSV-based: AnalysisCache/unit_qc_exclusions.csv (manual
+%per-unit labels) and Summary/<Monkey>_qc_summary.csv (per-unit metrics + labels).
+[excludeTasks, excludeSpikes] = ScreenSession(BehaviorSummary, SpikeSummary);
 
 %comments_data
 %caled_eyes
@@ -148,13 +158,12 @@ excludeSpikes = zeros(size(SpikeSummary,1));
 
 %% Preprossing: Add RT to saccade tasks.
 PlotRTCheck = true;
-RT = CalculateRT(caled_eyes,comments_data,PlotRTCheck );
+RT = CalculateRT(caled_eyes, comments_data, PlotRTCheck, [], [], main_path, ReComputeRT);
 
 
 %% Auto-rounting to it's respective analyze protocol
 
 
-%task_lists 
 
 
 

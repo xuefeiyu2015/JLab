@@ -1,4 +1,4 @@
-function RT = CalculateRT(caled_eyes, comments_data, plotFlag, plotN, errorCheck)
+function RT = CalculateRT(caled_eyes, comments_data, plotFlag, plotN, errorCheck, savePath, reCompute)
 % Detect the saccadic reaction time (RT) of each trial from the eye trace.
 %
 % For every saccade-task trial the eye trace is aligned to the go cue
@@ -21,6 +21,12 @@ function RT = CalculateRT(caled_eyes, comments_data, plotFlag, plotN, errorCheck
 %                   colored by task (default 50; NaN = draw all detected).
 %   errorCheck    - true to also draw the error-check figure of outlier saccades
 %                   (default true). RT.outliers is populated regardless.
+%   savePath      - (optional) session export folder. When set, the RT payload
+%                   (RT plus the per-trial detection data the QC plots need) is
+%                   cached to <savePath>/AnalysisCache/RT.mat. '' disables caching.
+%   reCompute     - (optional, default true) when true, recompute RT and refresh
+%                   the cache. When false, load the cached payload if it exists;
+%                   the QC plots then redraw from it without recomputing.
 %
 % Returns RT, a struct:
 %   .data     - nTrials x 1 RT (s from go cue); NaN where not detected / invalid.
@@ -43,6 +49,27 @@ function RT = CalculateRT(caled_eyes, comments_data, plotFlag, plotN, errorCheck
     if nargin < 3 || isempty(plotFlag);    plotFlag   = false;  end
     if nargin < 4 || isempty(plotN);       plotN      = 50;     end
     if nargin < 5 || isempty(errorCheck);  errorCheck = true;   end
+    if nargin < 6;                         savePath   = '';     end
+    if nargin < 7 || isempty(reCompute);   reCompute  = true;   end
+
+    % Compute-or-load the RT payload (RT plus the per-trial data the QC plots
+    % need), then render from it, so the plots look identical on the compute and
+    % cache paths. computeRTPayload is pure; plotRTFigures only draws.
+    payload = getCachedPayload(savePath, 'RT', reCompute, ...
+        @() computeRTPayload(caled_eyes, comments_data));
+    RT = payload.RT;
+
+    if plotFlag && payload.hasTrace
+        plotRTFigures(payload, plotN, errorCheck);
+    end
+end
+
+
+function payload = computeRTPayload(caled_eyes, comments_data)
+% Pure compute: detect RT / saccade metrics and bundle everything the QC plots
+% need. Returns payload with fields RT (the returned struct), t (aligned time
+% axis, s), dets (per-trial detection cells), ampOut / durOut (outlier masks),
+% taskLabels (per-trial Task) and hasTrace (whether any trace can be plotted).
 
     % ---- detection settings ------------------------------------------------
     PRE_MS   = 200;             % window kept before the go cue
@@ -112,8 +139,11 @@ function RT = CalculateRT(caled_eyes, comments_data, plotFlag, plotN, errorCheck
         RT.units  = 'marker';
         RT.data  = buildTable(nTrials, RTtime, ampl, peakVel, ...
                                startX, startY, endX, endY, durSac);
-     
-        
+
+        % No eye trace -> nothing to draw; keep the payload shape consistent.
+        payload = struct('RT', RT, 't', [], 'dets', {{}}, ...
+            'ampOut', [], 'durOut', [], 'taskLabels', {comments_data.Task}, ...
+            'hasTrace', false);
         return
     end
 
@@ -197,30 +227,43 @@ function RT = CalculateRT(caled_eyes, comments_data, plotFlag, plotN, errorCheck
     fprintf('%d abnormal saccade(s) flagged (amp>3SD: %d, dur>3SD: %d).\n', ...
         numel(outliers.trials), numel(outliers.amplitude), numel(outliers.duration));
 
-    if plotFlag
-        % Every valid trial now stores its trace (detected or not), so build the
-        % matrices over all trace-carrying trials: plotSaccadeFigure still filters
-        % to detected internally, while plotErrorCheck also draws the failed ones.
-        traced = find(cellfun(@(d) ~isempty(d) && ~isempty(d.tv), dets));
-        if isempty(traced)
-            warning('CalculateRT: no traces to plot.');
-        else
-            % Smoothed eye deviation (the trace detection is based on) and the
-            % per-trial speed profiles, assembled from the stored per-trial
-            % results so the plot stays render-only.
-            tv        = dets{traced(1)}.tv;
-            dev_all   = nan(nTrials, numel(t));    % nTrials x nSamp (smoothed)
-            speed_all = nan(nTrials, numel(tv));
-            for i = traced.'
-                dev_all(i, :)   = dets{i}.dev;
-                speed_all(i, :) = dets{i}.speed;
-            end
-            plotSaccadeFigure(t, tv, dev_all, speed_all, dets, RT.data, ...
-                comments_data.Task, plotN, RT.units);
-            if errorCheck
-                plotErrorCheck(t, tv, dev_all, speed_all, dets, ampOut, durOut, RT.units);
-            end
-        end
+    hasTrace = any(cellfun(@(d) ~isempty(d) && ~isempty(d.tv), dets));
+    payload  = struct('RT', RT, 't', t, 'dets', {dets}, ...
+        'ampOut', ampOut, 'durOut', durOut, ...
+        'taskLabels', {comments_data.Task}, 'hasTrace', hasTrace);
+end
+
+
+function plotRTFigures(payload, plotN, errorCheck)
+% Render-only: draw the RT QC figures from a computeRTPayload payload.
+    t       = payload.t;
+    dets    = payload.dets;
+    nTrials = numel(dets);
+
+    % Every valid trial stores its trace (detected or not), so build the matrices
+    % over all trace-carrying trials: plotSaccadeFigure filters to detected
+    % internally, while plotErrorCheck also draws the failed ones.
+    traced = find(cellfun(@(d) ~isempty(d) && ~isempty(d.tv), dets));
+    if isempty(traced)
+        warning('CalculateRT: no traces to plot.');
+        return
+    end
+
+    % Smoothed eye deviation (what detection is based on) and the per-trial speed
+    % profiles, assembled from the stored per-trial results so this stays
+    % render-only.
+    tv        = dets{traced(1)}.tv;
+    dev_all   = nan(nTrials, numel(t));    % nTrials x nSamp (smoothed)
+    speed_all = nan(nTrials, numel(tv));
+    for i = traced.'
+        dev_all(i, :)   = dets{i}.dev;
+        speed_all(i, :) = dets{i}.speed;
+    end
+    plotSaccadeFigure(t, tv, dev_all, speed_all, dets, payload.RT.data, ...
+        payload.taskLabels, plotN, payload.RT.units);
+    if errorCheck
+        plotErrorCheck(t, tv, dev_all, speed_all, dets, ...
+            payload.ampOut, payload.durOut, payload.RT.units);
     end
 end
 
