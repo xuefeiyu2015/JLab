@@ -406,11 +406,82 @@ of `BackRockFileLoader.m`.
 `parseEvents` turns BlackRock's free-text comment strings into structured
 `trials` and `experiment` records using the field maps from
 `BlackrockLoader.defaultEventMaps()`. A single `.nev` may contain several
-experiment **sessions** (the task started/stopped repeatedly); each
-`Experiment start: git commit ...` line begins a new session, and trials are
-keyed by position so a reset trial counter starts a new trial rather than
-merging. Derived features (polar target angle/eccentricity,
-`Stimulus_direction`, `Choose_target`, `Choose_leftright`) are added at the end.
+experiment **sessions** (the task started/stopped repeatedly). Trials are keyed
+by position, so a reset trial counter starts a new trial rather than merging,
+and **each reset of the trial counter begins a new session** — session labels
+are therefore always 1-based and cover every trial. The
+`Experiment start: git commit ...` markers are still parsed (they carry the
+per-session metadata) and are used as a cross-check: if their session
+boundaries disagree with the trial-counter resets, `parseEvents` warns
+(`BlackrockLoader:parseEvents:SessionMismatch`). Sessions are labelled from the
+resets rather than from the markers because a file that was not saved cleanly
+can be missing its leading metadata block, which used to stamp `Session = 0` on
+every trial of that block — and `Session` is a join key downstream
+(`SpikeTrialAlignmentCheck` pairs comments to spikes on `(Session,
+Trial_number)`). A session with no metadata block gets a blank `experiment`
+entry so `experiment(Session)` is always addressable. Derived features (polar
+target angle/eccentricity, `Stimulus_direction`, `Choose_target`,
+`Choose_leftright`) are added at the end.
+
+Parsing is set-oriented rather than per-comment: the whole comment matrix is
+tokenised at once, trial and session indices come from `cumsum`, and each
+*distinct* event body is classified once and its value scattered to the trials
+that used it. A 109k-comment session carries only ~600 distinct bodies, so this
+runs 12-16x faster than walking the comments one at a time. A comment matching
+neither the `Experiment` nor the `Trial N:` form no longer aborts the parse; it
+is skipped with a warning, and an unrecognised event body lands in
+`trials.undefined` as before.
+
+#### Adding a new comment key
+
+For any event whose text matches a shape the parser already knows, there are
+**two** places to edit and nothing else:
+
+1. **`BlackrockLoader.defaultEventMaps()`** — add `'Comment key' → 'Field_name'`
+   to the appropriate map.
+2. **`BlackrockLoader.defaultTrialTemplate()`** — add `Field_name`, initialised
+   `NaN` for a scalar or text field, `[NaN, NaN]` for a coordinate pair. The
+   template's field *order* is the CSV column order, so insert it where you want
+   the column.
+
+**Which map you choose is how you declare the shape** — that is the whole
+mechanism, so pick by how the comment reads:
+
+| map | comment text | what is stored |
+| --- | --- | --- |
+| `TimeEvents` | `Widget engaged` (bare name) | the comment's timestamp |
+| `SegmentEvents` | `Widget color blue` | the text after the **last** space |
+| `InformationEvents` | `Widget position (1.5, -2.5) deg` | a `[x y]` pair |
+| `InformationEvents` | `Reward start (250.0ms)` | the timestamp **and** `Reward_amount` |
+| `InformationEvents` | `Requested widget delay 250 ms` | a scalar (`None`/`none` → `NaN`) |
+| `InformationEvents` | `Widget size 4.00 deg` | a scalar |
+
+Everything downstream is derived from those two edits, so do not declare it
+anywhere: whether the exported column is text or numeric, the `_x`/`_y` split of
+a coordinate field, the CSV column order, first-write-wins, and duplicate
+capture into `trials.duplicates`.
+
+Two things to watch:
+
+- **Keys may not be substrings of one another within the same map.** Lookup is
+  exact-match, so adding `'Fixation point'` next to `'Fixation point on'` throws
+  `BlackrockLoader:EventMaps:SubstringKey` when the loader is constructed.
+- **`DashEvents` and `OutcomeEvents` are plain lists, not field maps.** Their
+  target fields are hardcoded (`End`/`Trialoutcome` when the name contains
+  `End`, `Choosen_choice` when it contains `choice`, `Choiceoutcome` for
+  outcomes). A new value following those conventions needs only the list entry;
+  one that does not needs the branch edited, as below.
+
+If the comment matches **none** of the shapes in the table, there is a third
+place: add a `kind` test and its extraction branch to
+`BlackrockLoader.classifyEventBodies` (and a new `mode` if the value is not a
+timestamp, scalar, pair, or text). That function is the only place event bodies
+are pattern-matched. (While the temporary `parseEventsLegacy` is still in the
+class, a new shape added only to the fast path will make `Test_parseEvents_AB.m`
+report a difference — expected, since that method is being removed.)
+
+Session-level rather than per-trial metadata follows the same pattern one level
+up, via `ExpEvents` in `defaultEventMaps()` plus `defaultExpTemplate()`.
 
 (See **Checking the comments to debug parsing** above for how to eyeball the raw,
 unparsed comment strings when adding or fixing a comment key.)

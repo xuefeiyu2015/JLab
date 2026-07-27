@@ -146,6 +146,7 @@ classdef BlackrockLoader < handle
             if isempty(obj.TrialTemplate); obj.TrialTemplate = BlackrockLoader.defaultTrialTemplate(); end
             if isempty(obj.ExpTemplate);   obj.ExpTemplate   = BlackrockLoader.defaultExpTemplate();   end
             if isempty(obj.EventMaps);     obj.EventMaps     = BlackrockLoader.defaultEventMaps();      end
+            BlackrockLoader.validateEventMaps(obj.EventMaps);
         end
 
 
@@ -613,17 +614,22 @@ classdef BlackrockLoader < handle
         end
 
 
-        function [trials, experiment] = parseEvents(obj, Events, EventTime, EventTick)
-        % Single pass over the .nev comment strings, building one experiment
-        % entry per session and one trials entry per (position-keyed) trial.
-        % A single .nev can hold several sessions (task started/stopped), so
-        % experiment is a struct array indexed by session_index; trials are
-        % keyed by position so a resetting trial counter starts new trials.
+        function [trials, experiment, startTicks] = parseEvents(obj, Events, EventTime, EventTick)
+        % Parse the .nev comment strings into one experiment entry per session
+        % and one trials entry per (position-keyed) trial. A single .nev can
+        % hold several sessions (task started/stopped), so experiment is a
+        % struct array indexed by session; trials are keyed by position so a
+        % resetting trial counter starts new trials.
         %
         % Called with no data args it reads obj.Loaded (the stateful pipeline);
         % pass Events/EventTime explicitly to parse an arbitrary comment set.
-        % Either way the result is stored in obj.Trials / obj.Experiment AND
-        % returned.
+        % Either way the result is stored in obj.Trials / obj.Experiment /
+        % obj.TrialStartTicks AND returned.
+        %
+        % This is the argument-resolution + state-storing shell; the parse
+        % itself lives in the delegate below so that the same inputs can be run
+        % through two implementations side by side without either of them
+        % clobbering obj state (see Test_parseEvents_AB.m).
             if nargin < 2
                 Events    = obj.Loaded.Events;
                 EventTime = obj.Loaded.EventTime;
@@ -635,6 +641,92 @@ classdef BlackrockLoader < handle
                     EventTick = uint64([]);   % caller supplied seconds only
                 end
             end
+    
+            [trials, experiment, startTicks] = ...
+                obj.parseEventsFast(Events, EventTime, EventTick);
+    
+            %{
+          disp('Use legacy parser');
+             [trials, experiment, startTicks] = ...
+                obj.parseEventsLegacy(Events, EventTime, EventTick);
+            %}
+            obj.Trials          = trials;
+            obj.Experiment      = experiment;
+            obj.TrialStartTicks = startTicks;
+        end
+
+        function [trials, experiment, startTicks] = parseEventsFast(obj, Events, EventTime, EventTick)
+        % Set-oriented parse: tokenize every comment at once, index trials by
+        % cumsum, classify each DISTINCT event body once, then scatter the
+        % values one pass per field.
+        %
+        % The per-comment parser did the work comment-major even though the
+        % information is pattern-major -- a 109k-comment session carries only
+        % ~600 distinct event bodies, so it re-ran the same regex battery
+        % hundreds of times per pattern. Nothing here loops over comments.
+            % openNEV hands these back as 1xN; every scatter below assumes
+            % columns, and the mismatch would broadcast silently.
+            EventTime = EventTime(:);
+            EventTick = EventTick(:);
+            has_ticks = numel(EventTick) == size(Events, 1);
+
+            K = BlackrockLoader.tokenizeComments(Events);
+            K = BlackrockLoader.indexCommentTrials(K);
+            Session = BlackrockLoader.sessionLabelsFromResets(K);
+
+            [ub, ~, ic] = unique(K.body(K.isTrialLine));
+            spec = BlackrockLoader.classifyEventBodies(ub, obj.EventMaps, obj.TrialTemplate);
+
+            [cols, dupCells, undCells, startTicks, nUndef] = BlackrockLoader.scatterEventWrites( ...
+                spec, ic, K, Session, EventTime, EventTick, has_ticks, obj.TrialTemplate);
+
+            trials     = BlackrockLoader.assembleTrialStruct(cols, dupCells, undCells, obj.TrialTemplate);
+            experiment = BlackrockLoader.buildExperimentMeta(K, EventTime, obj.ExpTemplate, ...
+                                                             obj.EventMaps.ExpEvents, Session);
+
+            if obj.Verbose
+                % The per-comment parser printed as it walked, which cannot be
+                % reproduced in comment order without the loop it replaced. A
+                % summary carries the same information and costs nothing.
+                dupAll = vertcat(dupCells{:});
+                undAll = vertcat(undCells{:});
+                fprintf('parseEvents: %d comments -> %d trials, %d session(s); %d distinct event bodies\n', ...
+                    numel(K.txt), K.nTrials, max([Session; 0]), numel(ub));
+                fprintf('  undefined %d, duplicates %d, malformed %d\n', ...
+                    numel(undAll), numel(dupAll), sum(K.isMalformed));
+                if ~isempty(undAll)
+                    fprintf('  undefined events:\n');
+                    fprintf('    %s\n', unique(undAll));
+                end
+                if ~isempty(dupAll)
+                    fprintf('  duplicated events:\n');
+                    fprintf('    %s\n', unique(dupAll));
+                end
+            elseif nUndef > 0
+                warning(['parseEvents: %d comment(s) matched no known event and went to ' ...
+                    'trials.undefined. Set the loader''s Verbose flag to list them.'], nUndef);
+            end
+            if any(K.isMalformed)
+                % Neither an Experiment line nor a "Trial N:" line, so there is
+                % no trial to attach it to. The per-comment parser died here.
+                warning('BlackrockLoader:parseEvents:MalformedComment', ...
+                    ['%d comment(s) matched neither the Experiment nor the "Trial N:" ' ...
+                     'form and were skipped. First: "%s"'], ...
+                    sum(K.isMalformed), K.txt(find(K.isMalformed, 1)));
+            end
+
+            trials = BlackrockLoader.addDerivedTrialFeatures(trials);
+        end
+
+        function [trials, experiment, startTicks] = parseEventsLegacy(obj, Events, EventTime, EventTick)
+        % TEMPORARY reference implementation, kept only to A/B against the
+        % vectorised parser. Comment-major: one loop iteration per comment
+        % string, which is ~1.4e5 iterations for a 5000-trial session.
+        % Returns its products instead of writing obj state, so the A/B script
+        % can run both parsers over the same inputs.
+        %
+        % Delete this method (and Test_parseEvents_AB.m) once real-data
+        % equivalence has been confirmed.
             has_ticks = numel(EventTick) == size(Events, 1);
 
             exp_template       = obj.ExpTemplate;
@@ -1039,62 +1131,7 @@ classdef BlackrockLoader < handle
                     'trials.undefined. Set the loader''s Verbose flag to list them.'], n_undefined);
             end
 
-            %% Change visual guided saccade (memory type) into memory guided saccade
-            tasks = {trials.Task};
-            trial_type = {trials.Trial_type};
-
-            memory_idx = strcmp(trial_type, 'memory');
-            task_idx = strcmp(tasks, 'visual_saccades_experiment');
-
-            tasks(memory_idx&task_idx) = {'memory_saccades_experiment'};
-            [trials.Task] = deal(tasks{:});
-
-            %% Add a few feature for further analysis
-            %1. Transform Cartesian into Polar for target postion
-            % -180(left) to 180(right)
-            Target_1_xy = vertcat(trials.Target_1_position);
-            [theta, Target_1_ecc] = cart2pol(Target_1_xy(:,1),Target_1_xy(:,2));
-            Target_1_angle = mod(90 - rad2deg(theta), 360);
-            Target_1_angle(Target_1_angle >= 180) = Target_1_angle(Target_1_angle >= 180) - 360;
-
-            Target_2_xy = vertcat(trials.Target_2_position);
-            [theta, Target_2_ecc] = cart2pol(Target_2_xy(:,1),Target_2_xy(:,2));
-            Target_2_angle = mod(90 - rad2deg(theta), 360);
-            Target_2_angle(Target_2_angle >= 180) = Target_2_angle(Target_2_angle >= 180) - 360;
-
-            stimulus_dir = (Target_1_angle >= 0) * 2 - 1;
-            stimulus_dir(isnan(Target_1_angle)) = NaN;
-
-            %2. Transform choice into target1/target2 and left/right
-            ChooseTarget = cellfun(@(s) str2double(s(end)), {trials.Choosen_choice});
-            ChooseLeftRight = ChooseTarget;
-            ChooseLeftRight(ChooseTarget==1) = (Target_1_angle(ChooseTarget==1) >= 0) * 2 - 1;
-            ChooseLeftRight(ChooseTarget==2) = (Target_2_angle(ChooseTarget==2) >= 0) * 2 - 1;
-
-            %3. Add these features back
-            Target1Angle_cell = num2cell(Target_1_angle);
-            [trials.Target_1_angle] = deal(Target1Angle_cell{:});
-
-            Target2Angle_cell = num2cell(Target_2_angle);
-            [trials.Target_2_angle] = deal(Target2Angle_cell{:});
-
-            stimulus_dir_cell = num2cell(stimulus_dir);
-            [trials.Stimulus_direction] = deal(stimulus_dir_cell{:});
-
-            ChooseTarget_cell = num2cell(ChooseTarget);
-            [trials.Choose_target] = deal(ChooseTarget_cell{:});
-            ChooseLeftRight_cell = num2cell(ChooseLeftRight);
-            [trials.Choose_leftright] = deal(ChooseLeftRight_cell{:});
-
-            Target_1_ecc_cell = num2cell(Target_1_ecc);
-            [trials.Target_1_eccentricity] = deal(Target_1_ecc_cell{:});
-
-            Target_2_ecc_cell = num2cell(Target_2_ecc);
-            [trials.Target_2_eccentricity] = deal(Target_2_ecc_cell{:});
-
-            obj.Trials          = trials;
-            obj.Experiment      = experiment;
-            obj.TrialStartTicks = startTicks;
+            trials = BlackrockLoader.addDerivedTrialFeatures(trials);
         end
 
         function A = parseEye(obj)
@@ -2053,6 +2090,803 @@ classdef BlackrockLoader < handle
             W.info.Channel_Number = electrode;             % NtotalUnit x 1, electrode per row
             W.info.Unit_No        = unit;                  % NtotalUnit x 1, unit per row
             W.info.maxSpikes      = maxSpk;                % spike-dimension length (busiest unit-trial)
+        end
+
+        function K = tokenizeComments(Events)
+        % Split the whole comment char matrix at once into the pieces the parse
+        % needs: trial number, event body, and the Experiment marker/token.
+        %
+        % Replaces two regexp calls per comment with a handful of whole-array
+        % string operations. For 1.1e5 comments this runs in ~0.17 s, and
+        % str2double over the trial numbers is the single biggest line in it.
+        %
+        % Returned struct K (all comment-length vectors are N x 1):
+        %   txt/tnum/body   trimmed comment, trial number (NaN if none), body
+        %   isExpLine/isTrialLine/isMalformed   disjoint classification
+        %   expIdx/expMarker/expToken           the Experiment lines only
+            % Observed .nev comment text is space-padded, but strtrim strips
+            % NUL on neither char nor string (isspace(char(0)) is false), so a
+            % NUL-padded file would silently defeat every match below. One
+            % normalising pass removes the question entirely.
+            Events(Events == char(0)) = ' ';
+            K.txt = strtrim(string(Events));
+
+            % extractBefore/extractAfter split at the FIRST colon, exactly where
+            % '^Trial\s+(\d+):' splits, so a colon inside the body is safe.
+            % Both yield <missing> when there is no colon; str2double(<missing>)
+            % is NaN, and that NaN is what routes a malformed comment to the
+            % fail-soft path instead of the crash the per-comment parser had.
+            prefix = extractBefore(K.txt, ":");
+            K.tnum = str2double(extractAfter(prefix, "Trial "));
+            K.body = strtrim(extractAfter(K.txt, ":"));
+            % unique() keeps every <missing> distinct (same rule as NaN), so
+            % leaving them in would collapse the whole point of uniquing the
+            % bodies. "" merges normally.
+            K.body(ismissing(K.body)) = "";
+
+            % Cheap prefilter, then the real pattern on those ~30 rows only.
+            % '(.*)' not '(.+)': the per-comment parser matched the UNtrimmed
+            % row, which always carried trailing padding, so a bare
+            % "Experiment end:" still matched. Against trimmed text '(.+)'
+            % fails and the session end timestamp would be lost.
+            ei  = find(startsWith(K.txt, "Experiment "));
+            tok = BlackrockLoader.regexpTokensOnce(K.txt(ei), '^Experiment (start|end):\s*(.*)$');
+            % cellfun('isempty', ...) reports FALSE for an empty string element
+            % -- the fast-string form only understands cell/char. The function
+            % handle is required here, not a style preference.
+            ok  = ~cellfun(@isempty, tok);
+            K.expIdx = ei(ok);
+            if isempty(K.expIdx)
+                K.expMarker = strings(0,1);
+                K.expToken  = strings(0,1);
+            else
+                % string input to regexp yields string tokens, so this vertcat
+                % gives an M x 2 string matrix directly.
+                V = vertcat(tok{ok});
+                K.expMarker = V(:,1);
+                K.expToken  = strtrim(V(:,2));
+            end
+
+            K.isExpLine = false(size(K.txt));
+            K.isExpLine(K.expIdx) = true;
+            K.isTrialLine = ~K.isExpLine & startsWith(K.txt, "Trial ") & ~isnan(K.tnum);
+            % Anything claimed by neither branch. The per-comment parser fell
+            % through to the trial branch here and died indexing mainTokens{1}.
+            K.isMalformed = ~K.isExpLine & ~K.isTrialLine;
+        end
+
+        function K = indexCommentTrials(K)
+        % Assign each trial comment its trial row, by cumsum instead of by
+        % carrying prev_trial_number/prev_session through a loop.
+        %
+        % Reproduces the per-comment rule exactly: a new trial opens when the
+        % parsed number differs from the previous TRIAL comment, or the
+        % git-marker session changed (which is what splits two trials that
+        % share a number across a session boundary).
+            isGitStart = false(size(K.txt));
+            if ~isempty(K.expIdx)
+                isGitStart(K.expIdx(K.expMarker == "start" & ...
+                                    startsWith(K.expToken, "git commit"))) = true;
+            end
+            % 0 before the first marker, matching the old session_index.
+            K.sessGit = cumsum(isGitStart);
+
+            c = find(K.isTrialLine);
+            K.trialCommentIdx   = c;
+            K.trialRowOfComment = zeros(size(K.txt));
+            if isempty(c)
+                K.tnumPerTrial    = zeros(0,1);
+                K.sessGitPerTrial = zeros(0,1);
+                K.nTrials         = 0;
+                return
+            end
+
+            tn = K.tnum(c);
+            sg = K.sessGit(c);
+            newTrial = [true; diff(tn) ~= 0 | diff(sg) ~= 0];
+            rowOf    = cumsum(newTrial);
+
+            K.trialRowOfComment(c) = rowOf;
+            K.tnumPerTrial    = tn(newTrial);
+            K.sessGitPerTrial = sg(newTrial);
+            K.nTrials         = rowOf(end);
+        end
+
+        function Session = sessionLabelsFromResets(K)
+        % Label sessions from trial-number resets, cross-checked against the
+        % "Experiment start: git commit" markers.
+        %
+        % The markers alone are not trustworthy: a file that was not saved
+        % cleanly can be missing the leading metadata block, and the old rule
+        % then stamped every trial of that block Session = 0 -- which matters,
+        % because Session is a join key downstream (SpikeTrialAlignmentCheck
+        % pairs comments to spikes on (Session, Trial_number)). Counting resets
+        % always yields 1-based labels covering every trial.
+        %
+        % The markers are still parsed and used as a consistency check: when
+        % the two partitions disagree, that is a real anomaly worth surfacing,
+        % so it warns rather than silently preferring one.
+        %
+        % '<= 0' rather than '< 0' because indexCommentTrials keeps the
+        % git-session term in its boundary rule: two adjacent trial rows can
+        % share a trial number only when a marker split them, which is itself a
+        % session change.
+            if K.nTrials == 0
+                Session = zeros(0,1);
+                return
+            end
+
+            newSessReset = [true; diff(K.tnumPerTrial) <= 0];
+            Session      = cumsum(newSessReset);
+
+            if max(K.sessGitPerTrial) == 0
+                warning('BlackrockLoader:parseEvents:NoGitMarker', ...
+                    ['No "Experiment start: git commit" marker precedes any trial; ' ...
+                     'session labels derive from trial-number resets alone (%d session(s)).'], ...
+                    Session(end));
+                return
+            end
+
+            newSessGit = [true; diff(K.sessGitPerTrial) ~= 0];
+            if ~isequal(newSessReset, newSessGit)
+                d = find(newSessReset ~= newSessGit, 1);
+                warning('BlackrockLoader:parseEvents:SessionMismatch', ...
+                    ['Session partition from trial-number resets (%d session(s)) disagrees ' ...
+                     'with the git-commit markers (%d session(s)); first disagreement at ' ...
+                     'trial row %d (Trial_number %d). Using the reset-derived labels.'], ...
+                    Session(end), sum(newSessGit), d, K.tnumPerTrial(d));
+            end
+        end
+
+        function validateEventMaps(maps)
+        % Assert the invariant that lets exact-match lookup stand in for the
+        % per-comment parser's substring reverse lookup, contains(keys, name).
+        % The two agree only while no key in a map is a proper substring of
+        % another key in the SAME map. Adding e.g. 'Fixation point' alongside
+        % 'Fixation point on' would silently bind events to the wrong field, so
+        % fail here instead.
+            names = {'TimeEvents', 'InformationEvents', 'SegmentEvents'};
+            for n = 1:numel(names)
+                kk = string(keys(maps.(names{n})));
+                for a = 1:numel(kk)
+                    inside = contains(kk, kk(a));
+                    inside(a) = false;
+                    if any(inside)
+                        error('BlackrockLoader:EventMaps:SubstringKey', ...
+                            ['%s: key "%s" is a substring of "%s". Event lookup is ' ...
+                             'exact-match and cannot disambiguate these.'], ...
+                            names{n}, kk(a), kk(find(inside, 1)));
+                    end
+                end
+            end
+        end
+
+        function spec = classifyEventBodies(ub, maps, trialTemplate)
+        % Decide, once per DISTINCT event body, which trial field(s) it writes
+        % and what value it carries.
+        %
+        % This is where the saving lives. The bodies repeat heavily across
+        % trials -- a 109k-comment session has ~600 distinct ones -- so the
+        % regex work collapses by more than 100x, and the per-comment pass
+        % downstream is reduced to scattering already-parsed values.
+        %
+        % Returns arrays indexed by unique-body, with up to 3 write slots (the
+        % most any branch emits, from the offset-range line):
+        %   field    nU x 3  index into fieldnames(trialTemplate); 0 = no write
+        %   mode     nU x 3  1 = comment timestamp, 2 = scalar, 3 = [x y], 4 = text
+        %   num      nU x 3  value for mode 2
+        %   xy       nU x 2  value for mode 3 (slot 1 only)
+        %   txt      nU x 3  value for mode 4
+        %   dupLab   nU x 3  what a losing write appends to trials.duplicates
+        %   lastWins nU x 3  overwrite instead of first-write-wins, no duplicate
+        %   isUndef  nU x 1  body matched nothing; goes to trials.undefined
+        %
+        % Mode 1 is the reason this cannot be purely per-body: those values come
+        % from each comment's own timestamp, so they are scattered per comment.
+            ub = ub(:);
+            nU = numel(ub);
+            fn = fieldnames(trialTemplate);
+
+            spec.field    = zeros(nU, 3);
+            spec.mode     = zeros(nU, 3);
+            spec.num      = nan(nU, 3);
+            spec.xy       = nan(nU, 2);
+            spec.txt      = strings(nU, 3);
+            spec.dupLab   = strings(nU, 3);
+            spec.lastWins = false(nU, 3);
+            spec.isUndef  = false(nU, 1);
+
+            timeKeys = string(keys(maps.TimeEvents));   timeVals = string(values(maps.TimeEvents));
+            infoKeys = string(keys(maps.InformationEvents)); infoVals = string(values(maps.InformationEvents));
+            segKeys  = string(keys(maps.SegmentEvents)); segVals  = string(values(maps.SegmentEvents));
+
+            % Same tests as the per-comment chain, assigned in reverse priority
+            % so the highest-priority branch (time) overwrites the rest.
+            kind = zeros(nU, 1);
+            kind(contains(ub, 'Requested time offset range'))               = 6;
+            kind(contains(ub, string(maps.OutcomeEvents)))                  = 5;
+            kind(contains(ub, string(maps.DashEvents)) & contains(ub, '-')) = 4;
+            kind(contains(ub, segKeys))                                     = 3;
+            kind(contains(ub, infoKeys))                                    = 2;
+            kind(contains(ub, timeKeys))                                    = 1;
+
+            % Patterns copied verbatim from the per-comment parser. The time and
+            % size patterns are applied in sequence rather than as one
+            % alternation: the combined form has four capture groups but its
+            % result was read as if it had two, which only worked because
+            % non-participating groups are dropped. Both are '^'-anchored, so
+            % "time else size" is exactly what the alternation meant.
+            coord_pattern  = '^(.*?)\s*\(\s*([-+]?\d*\.?\d+)\s*,\s*([-+]?\d*\.?\d+)\s*\)\s*deg$';
+            reward_pattern = '^(.*?)\s*\(([\d\.]+)ms';
+            time_pattern   = '^(.*?)\s+([-+]?\d*\.?\d+|None|none)\s*ms$';
+            size_pattern   = '^(.*?)\s+([-+]?\d*\.?\d+)\s*(?:deg)?$';
+
+            % ---- kind 1: time events -> the comment's own timestamp ----------
+            sel = find(kind == 1);
+            [hit, loc] = ismember(ub(sel), timeKeys);
+            spec.field(sel(hit), 1)  = BlackrockLoader.fieldIndex(timeVals(loc(hit)), fn);
+            spec.mode(sel(hit), 1)   = 1;
+            spec.dupLab(sel(hit), 1) = ub(sel(hit));      % duplicate label = the body
+            spec.isUndef(sel(~hit))  = true;
+
+            % ---- kind 2: information events ---------------------------------
+            % Sub-branches in the per-comment order: coordinate, then reward,
+            % then a plain scalar.
+            sel = find(kind == 2);
+            cTok = BlackrockLoader.regexpTokensOnce(ub(sel), coord_pattern);
+            rTok = BlackrockLoader.regexpTokensOnce(ub(sel), reward_pattern);
+            isC  = ~cellfun(@isempty, cTok);
+            isR  = ~isC & ~cellfun(@isempty, rTok);
+            isS  = ~isC & ~isR;
+
+            % coordinate: '<name> (x, y) deg' -> a 1x2 field
+            if any(isC)
+                r = sel(isC);  V = vertcat(cTok{isC});
+                [f, ok] = BlackrockLoader.lookupEventField(strtrim(V(:,1)), infoKeys, infoVals, fn);
+                spec.field(r(ok), 1)  = f(ok);
+                spec.mode(r(ok), 1)   = 3;
+                spec.xy(r(ok), :)     = [str2double(V(ok,2)), str2double(V(ok,3))];
+                spec.dupLab(r(ok), 1) = strtrim(V(ok,1));   % label = the key name
+                spec.isUndef(r(~ok))  = true;
+            end
+
+            % reward: '<name> (<amount>ms...' -> the field takes the TIMESTAMP,
+            % and the amount lands in Reward_amount, each guarded separately.
+            if any(isR)
+                r = sel(isR);  V = vertcat(rTok{isR});
+                [f, ok] = BlackrockLoader.lookupEventField(strtrim(V(:,1)), infoKeys, infoVals, fn);
+                spec.field(r(ok), 1)  = f(ok);
+                spec.mode(r(ok), 1)   = 1;
+                spec.dupLab(r(ok), 1) = infoVals(BlackrockLoader.matchIndex(strtrim(V(ok,1)), infoKeys));
+                spec.field(r(ok), 2)  = BlackrockLoader.fieldIndex("Reward_amount", fn);
+                spec.mode(r(ok), 2)   = 2;
+                spec.num(r(ok), 2)    = str2double(V(ok,2));
+                spec.dupLab(r(ok), 2) = "Reward_amount";
+                spec.isUndef(r(~ok))  = true;
+            end
+
+            % scalar: '<name> <value> ms' else '<name> <value> [deg]'.
+            % str2double turns the None/none alternative into NaN by itself.
+            if any(isS)
+                r = sel(isS);
+                tTok = BlackrockLoader.regexpTokensOnce(ub(r), time_pattern);
+                useT = ~cellfun(@isempty, tTok);
+                sTok = BlackrockLoader.regexpTokensOnce(ub(r), size_pattern);
+                useS = ~useT & ~cellfun(@isempty, sTok);
+                V = strings(numel(r), 2);
+                if any(useT), V(useT, :) = vertcat(tTok{useT}); end
+                if any(useS), V(useS, :) = vertcat(sTok{useS}); end
+                got = useT | useS;
+                [f, ok] = BlackrockLoader.lookupEventField(strtrim(V(:,1)), infoKeys, infoVals, fn);
+                ok = ok & got;
+                spec.field(r(ok), 1)  = f(ok);
+                spec.mode(r(ok), 1)   = 2;
+                spec.num(r(ok), 1)    = str2double(V(ok, 2));
+                spec.dupLab(r(ok), 1) = infoVals(BlackrockLoader.matchIndex(strtrim(V(ok,1)), infoKeys));
+                spec.isUndef(r(~ok))  = true;
+            end
+
+            % ---- kind 3: segment events, split at the LAST space -------------
+            sel = find(kind == 3);
+            if ~isempty(sel)
+                gTok = BlackrockLoader.regexpTokensOnce(ub(sel), '^(.*) ([^ ]*)$');   % greedy = last space
+                got  = ~cellfun(@isempty, gTok);
+                r = sel(got);  V = vertcat(gTok{got});
+                [f, ok] = BlackrockLoader.lookupEventField(strtrim(V(:,1)), segKeys, segVals, fn);
+                spec.field(r(ok), 1)  = f(ok);
+                spec.mode(r(ok), 1)   = 4;
+                spec.txt(r(ok), 1)    = strtrim(V(ok, 2));
+                spec.dupLab(r(ok), 1) = segVals(BlackrockLoader.matchIndex(strtrim(V(ok,1)), segKeys));
+                spec.isUndef(r(~ok))  = true;
+                spec.isUndef(sel(~got)) = true;
+            end
+
+            % ---- kind 4: dash events, split at the FIRST dash ----------------
+            sel = find(kind == 4);
+            if ~isempty(sel)
+                dTok = BlackrockLoader.regexpTokensOnce(ub(sel), '^([^-]*)-(.*)$');
+                got  = ~cellfun(@isempty, dTok);
+                r = sel(got);  V = vertcat(dTok{got});
+                ev  = strtrim(V(:,1));
+                out = strtrim(V(:,2));
+
+                isEnd = contains(ev, 'End');
+                spec.field(r(isEnd), 1)  = BlackrockLoader.fieldIndex("End", fn);
+                spec.mode(r(isEnd), 1)   = 1;                 % End takes the timestamp
+                spec.dupLab(r(isEnd), 1) = ev(isEnd);
+                spec.field(r(isEnd), 2)  = BlackrockLoader.fieldIndex("Trialoutcome", fn);
+                spec.mode(r(isEnd), 2)   = 4;
+                spec.txt(r(isEnd), 2)    = out(isEnd);
+                spec.dupLab(r(isEnd), 2) = "Trialoutcome";
+
+                isCh = ~isEnd & contains(ev, 'choice');
+                spec.field(r(isCh), 1)  = BlackrockLoader.fieldIndex("Choosen_choice", fn);
+                spec.mode(r(isCh), 1)   = 4;
+                spec.txt(r(isCh), 1)    = out(isCh);
+                spec.dupLab(r(isCh), 1) = "Choosen_choice";
+
+                spec.isUndef(r(~isEnd & ~isCh)) = true;
+                spec.isUndef(sel(~got))         = true;
+            end
+
+            % ---- kind 5: choice outcome, stored as the whole body ------------
+            sel = find(kind == 5);
+            spec.field(sel, 1)  = BlackrockLoader.fieldIndex("Choiceoutcome", fn);
+            spec.mode(sel, 1)   = 4;
+            spec.txt(sel, 1)    = ub(sel);
+            spec.dupLab(sel, 1) = "Choiceoutcome";
+
+            % ---- kind 6: requested time offset range -------------------------
+            % Alone among the branches this has no already-written guard, so it
+            % is last-write-wins and records no duplicates. A line matching
+            % neither token writes nothing and is NOT undefined -- the
+            % per-comment parser silently ignored it.
+            sel = find(kind == 6);
+            if ~isempty(sel)
+                gTok = BlackrockLoader.regexpTokensOnce(ub(sel), 'range\s*\[\s*([-+]?\d*\.?\d+)\s*,\s*([-+]?\d*\.?\d+)\s*\]');
+                got  = ~cellfun(@isempty, gTok);
+                if any(got)
+                    r = sel(got);  V = vertcat(gTok{got});
+                    spec.field(r, 1)    = BlackrockLoader.fieldIndex("Requested_time_offset_min", fn);
+                    spec.mode(r, 1)     = 2;
+                    spec.num(r, 1)      = str2double(V(:,1));
+                    spec.lastWins(r, 1) = true;
+                    spec.field(r, 2)    = BlackrockLoader.fieldIndex("Requested_time_offset_max", fn);
+                    spec.mode(r, 2)     = 2;
+                    spec.num(r, 2)      = str2double(V(:,2));
+                    spec.lastWins(r, 2) = true;
+                end
+
+                aTok = BlackrockLoader.regexpTokensOnce(ub(sel), 'active:\s*\[([^\]]*)\]');
+                gotA = ~cellfun(@isempty, aTok);
+                if any(gotA)
+                    r = sel(gotA);  A = vertcat(aTok{gotA});
+                    vals = arrayfun(@(s) strjoin(strtrim(strsplit(s, ',')), ' '), A(:,1), ...
+                                    'UniformOutput', false);
+                    spec.field(r, 3)    = BlackrockLoader.fieldIndex("Requested_time_offset_active", fn);
+                    spec.mode(r, 3)     = 4;
+                    spec.txt(r, 3)      = string(vals);
+                    spec.lastWins(r, 3) = true;
+                end
+            end
+
+            % ---- kind 0: claimed by nothing ---------------------------------
+            spec.isUndef(kind == 0) = true;
+        end
+
+        function [cols, dupCells, undCells, startTicks, nUndef] = scatterEventWrites( ...
+                spec, ic, K, Session, EventTime, EventTick, has_ticks, trialTemplate)
+        % Fill one column per trial field, one pass per FIELD rather than one
+        % per comment.
+        %
+        % Grouping by target field (not by event key) is what makes the
+        % many-to-one cases correct for free: 'Target 1 acquired' and
+        % 'Target 2 acquired' both write Choicetime, and first-write-wins has to
+        % apply across their union, which it does when they share a pass.
+            fn      = fieldnames(trialTemplate);
+            nF      = numel(fn);
+            nTrials = K.nTrials;
+            nU      = size(spec.field, 1);
+
+            cmtIdx  = K.trialCommentIdx;
+            nTC     = numel(cmtIdx);
+            rowOfTC = K.trialRowOfComment(cmtIdx);
+            timeOfTC = EventTime(cmtIdx);
+
+            % Which fields end up holding text, and which hold an [x y] pair.
+            % Decided from what this file actually wrote, not from a fixed list:
+            % a field nobody wrote text to must stay a plain double column, or
+            % prepareExport's iscell test would change the exported column type.
+            isTextField = false(nF, 1);
+            isTextField(spec.field(spec.mode == 4 & spec.field > 0)) = true;
+            isPairField = false(nF, 1);
+            for k = 1:nF
+                isPairField(k) = isnumeric(trialTemplate.(fn{k})) && numel(trialTemplate.(fn{k})) == 2;
+            end
+
+            cols = cell(nF, 1);
+            for k = 1:nF
+                if isTextField(k)
+                    cols{k} = repmat({NaN}, nTrials, 1);
+                elseif isPairField(k)
+                    cols{k} = nan(nTrials, 2);
+                else
+                    cols{k} = nan(nTrials, 1);
+                end
+            end
+
+            startTicks = zeros(nTrials, 1, 'uint64');
+            dupCells   = repmat({strings(0,1)}, nTrials, 1);
+            undCells   = repmat({strings(0,1)}, nTrials, 1);
+
+            if nTrials == 0
+                nUndef = 0;
+                return
+            end
+
+            % Identity columns come straight from the index pass.
+            cols{BlackrockLoader.fieldIndex("Trial_number", fn)} = K.tnumPerTrial(:);
+            cols{BlackrockLoader.fieldIndex("Session", fn)}      = Session(:);
+
+            % Flatten the three write slots of every trial comment into one list
+            % of (comment, slot) pairs, carrying indices rather than copies.
+            flatU    = repmat(ic(:), 3, 1);
+            flatSlot = repelem((1:3)', nTC, 1);
+            flatCmt  = repmat((1:nTC)', 3, 1);
+            lin      = flatU + (flatSlot - 1) * nU;
+            flatFld  = spec.field(lin);
+            keep     = flatFld > 0;
+
+            dupRow = []; dupOrd = []; dupLab = strings(0,1);
+            usedFields = unique(flatFld(keep));
+
+            for f = usedFields'
+                sel = find(keep & flatFld == f);
+                % Comment order. A single body never writes one field twice, so
+                % ordering by comment is a total order within a field.
+                [~, o] = sort(flatCmt(sel));
+                sel = sel(o);
+                r   = rowOfTC(flatCmt(sel));
+
+                if any(spec.lastWins(lin(sel)))
+                    % The offset-range fields have no already-written guard, so
+                    % the last line of a trial wins and nothing is recorded as a
+                    % duplicate.
+                    [~, iaRev] = unique(flipud(r), 'stable');
+                    ia = sort(numel(r) + 1 - iaRev);
+                    isLoser = [];
+                else
+                    [~, ia] = unique(r, 'stable');     % first occurrence per trial
+                    won = false(numel(r), 1);
+                    won(ia) = true;
+                    isLoser = find(~won);
+                end
+
+                sub = sel(ia);
+                md  = spec.mode(lin(sub));
+                rw  = r(ia);
+
+                if isTextField(f)
+                    cols{f}(rw) = cellstr(spec.txt(lin(sub)));
+                elseif isPairField(f)
+                    cols{f}(rw, :) = spec.xy(flatU(sub), :);
+                else
+                    v = nan(numel(sub), 1);
+                    m1 = md == 1;  v(m1) = timeOfTC(flatCmt(sub(m1)));
+                    m2 = md == 2;  v(m2) = spec.num(lin(sub(m2)));
+                    cols{f}(rw) = v;
+                    if has_ticks && f == BlackrockLoader.fieldIndex("Start", fn)
+                        % Keep the Start marker's exact tick: per-spike times are
+                        % measured from it, and doing that subtraction in seconds
+                        % would inherit ~238 ns of rounding.
+                        startTicks(rw(m1)) = EventTick(cmtIdx(flatCmt(sub(m1))));
+                    end
+                end
+
+                if ~isempty(isLoser)
+                    dupRow = [dupRow; r(isLoser)];                       %#ok<AGROW>
+                    dupOrd = [dupOrd; flatCmt(sel(isLoser)) * 4 + flatSlot(sel(isLoser))]; %#ok<AGROW>
+                    dupLab = [dupLab; spec.dupLab(lin(sel(isLoser)))];   %#ok<AGROW>
+                end
+            end
+
+            % Bodies that matched no branch, attributed to the trial they fell in.
+            undMask = spec.isUndef(ic(:));
+            nUndef  = sum(undMask);
+            undCells = BlackrockLoader.groupLabelsByTrial(rowOfTC(undMask), find(undMask), ...
+                                                          K.body(cmtIdx(undMask)), nTrials);
+
+            % Duplicates are appended in the order the comments arrived, which
+            % interleaves across fields -- so they are ordered globally by
+            % (trial, comment, slot) rather than by the field loop above.
+            dupCells = BlackrockLoader.groupLabelsByTrial(dupRow, dupOrd, dupLab, nTrials);
+
+            % Equivalent to the per-comment 'if Start > 0 then Save_complete = 1'
+            % re-evaluated after every comment: NaN > 0 is false, and Start is
+            % written at most once, so the fixpoint is just the test itself.
+            cols{BlackrockLoader.fieldIndex("Save_complete", fn)} = ...
+                double(cols{BlackrockLoader.fieldIndex("Start", fn)} > 0);
+        end
+
+        function C = groupLabelsByTrial(rows, ord, labels, nTrials)
+        % Bucket (trial, order, label) triples into one string array per trial,
+        % ordered by ord. Returns nTrials x 1 cell of string columns, empty ones
+        % being strings(0,1) to match the template.
+            C = repmat({strings(0,1)}, nTrials, 1);
+            if isempty(rows)
+                return
+            end
+            [~, o] = sortrows([rows(:), ord(:)]);
+            rows   = rows(o);
+            labels = labels(o);
+            cnt    = accumarray(rows, 1, [nTrials 1]);
+            hit    = find(cnt > 0);
+            parts  = mat2cell(labels(:), cnt(cnt > 0), 1);
+            C(hit) = parts;
+        end
+
+        function trials = assembleTrialStruct(cols, dupCells, undCells, trialTemplate)
+        % Turn the per-field columns into the struct array the rest of the
+        % loader expects, preserving each field's runtime type: plain double,
+        % 1x2 double, or char-where-written/NaN-where-not.
+            fn      = fieldnames(trialTemplate);
+            nF      = numel(fn);
+            nTrials = size(cols{1}, 1);
+            if nTrials == 0
+                trials = repmat(trialTemplate, 0, 1);
+                return
+            end
+
+            C = cell(nF, nTrials);
+            for k = 1:nF
+                switch fn{k}
+                    case 'duplicates', C(k,:) = dupCells';
+                    case 'undefined',  C(k,:) = undCells';
+                    otherwise
+                        if iscell(cols{k})
+                            C(k,:) = cols{k}';
+                        elseif size(cols{k}, 2) == 2
+                            C(k,:) = num2cell(cols{k}, 2)';
+                        else
+                            C(k,:) = num2cell(cols{k})';
+                        end
+                end
+            end
+            % nF x nTrials with dim 1 as the field axis yields nTrials x 1,
+            % matching the orientation the per-comment parser produced.
+            trials = cell2struct(C, fn, 1);
+        end
+
+        function experiment = buildExperimentMeta(K, EventTime, expTemplate, expEvents, Session)
+        % Build the per-session metadata entries, then index them by the
+        % reset-derived Session label.
+        %
+        % Still a loop, deliberately: there are ~30 Experiment lines in a
+        % session against ~1e5 comments, so restricting the original loop to
+        % them is already a >1000x cut and the branchy per-key handling stays
+        % readable. Only the loop bound changed.
+            expKeys = keys(expEvents);
+            nExp    = numel(K.expIdx);
+
+            gitStart  = K.expMarker == "start" & startsWith(K.expToken, "git commit");
+            markerCmt = K.expIdx(gitStart);
+            nMarkers  = numel(markerCmt);
+
+            expByMarker = repmat(expTemplate, nMarkers, 1);
+            sIdx = 0;
+            for e = 1:nExp
+                ci     = K.expIdx(e);
+                marker = K.expMarker(e);
+                tokStr = K.expToken(e);
+                tok    = char(tokStr);
+
+                if marker == "start" && startsWith(tokStr, "git commit")
+                    sIdx = sIdx + 1;
+                    expByMarker(sIdx)       = expTemplate;
+                    expByMarker(sIdx).start = EventTime(ci);
+                end
+                if sIdx < 1
+                    % Metadata before the first git-commit start has nowhere to
+                    % go, exactly as before.
+                    continue
+                end
+
+                if marker == "end"
+                    expByMarker(sIdx).end = EventTime(ci);      % last end wins
+                    if ~startsWith(tokStr, "git commit")
+                        % Why the session ended; the git-commit end line is just
+                        % a commit re-stamp, not a reason.
+                        expByMarker(sIdx).end_by = tok;
+                    end
+                end
+
+                if startsWith(tokStr, "git commit")
+                    expByMarker(sIdx).git_commit = strtrim(strrep(tok, 'git commit', ''));
+                elseif startsWith(tokStr, "eyetracker tracking")
+                    eye_tokens = regexp(tok, 'eyetracker tracking (\w+)', 'tokens');
+                    if ~isempty(eye_tokens)
+                        expByMarker(sIdx).eye_tracked = eye_tokens{1}{1};
+                    end
+                elseif startsWith(tokStr, "photodiode")
+                    coord = regexp(tok, '\(\s*([-+]?\d*\.?\d+)\s*,\s*([-+]?\d*\.?\d+)\s*\)', 'tokens');
+                    if startsWith(tokStr, "photodiode circles")
+                        expByMarker(sIdx).photodiode_circles = strtrim(strrep(tok, 'photodiode circles', ''));
+                    elseif startsWith(tokStr, "photodiode fixation position") && ~isempty(coord)
+                        expByMarker(sIdx).photodiode_fixation_position = cellfun(@str2double, coord{1});
+                    elseif startsWith(tokStr, "photodiode target_1 position") && ~isempty(coord)
+                        expByMarker(sIdx).photodiode_target_1_position = cellfun(@str2double, coord{1});
+                    elseif startsWith(tokStr, "photodiode target_2 position") && ~isempty(coord)
+                        expByMarker(sIdx).photodiode_target_2_position = cellfun(@str2double, coord{1});
+                    end
+                elseif strcmp(tok, 'experimenter closed task')
+                    % end marker text, nothing to store
+                else
+                    % Numeric metadata (viewing distance / screen size /
+                    % resolution / FPS / eyetracker rate).
+                    num_tokens = regexp(tok, '^\s*(.*?)\s+(\d+\.?\d*)\D*(\d+\.?\d*)?', 'tokens');
+                    if ~isempty(num_tokens)
+                        event_exp  = strtrim(num_tokens{1}{1});
+                        nums       = cellfun(@str2double, num_tokens{1}(2:end));
+                        flag_array = find(contains(expKeys, event_exp));
+                        % A non-unique match used to throw; skip it instead.
+                        if isscalar(flag_array)
+                            field = expEvents(expKeys{flag_array});
+                            expByMarker(sIdx).(field) = nums(~isnan(nums));
+                        end
+                    end
+                end
+            end
+
+            % Re-index from "one entry per git-commit marker" to "one entry per
+            % Session label". These coincide for a clean file; they diverge when
+            % a file is missing its leading metadata block, which is exactly the
+            % case the reset-derived labels exist to handle. Sessions with no
+            % metadata keep a blank template entry so experiment(Session) is
+            % always addressable.
+            nSess        = max([Session(:); 0]);
+            sessOfMarker = zeros(nMarkers, 1);
+            for m = 1:nMarkers
+                nxt = find(K.trialCommentIdx > markerCmt(m), 1, 'first');
+                if isempty(nxt)
+                    % Trailing marker with no trials after it; give it its own
+                    % session rather than dropping the metadata.
+                    nSess = nSess + 1;
+                    sessOfMarker(m) = nSess;
+                else
+                    sessOfMarker(m) = Session(K.trialRowOfComment(K.trialCommentIdx(nxt)));
+                end
+            end
+
+            experiment = repmat(expTemplate, nSess, 1);
+            filled     = false(nSess, 1);
+            for m = 1:nMarkers
+                s = sessOfMarker(m);
+                if ~filled(s)
+                    experiment(s) = expByMarker(m);
+                    filled(s)     = true;
+                else
+                    % Two markers inside one reset-session: keep the opening
+                    % block and take the closing one's end/end_by. Only reachable
+                    % when sessionLabelsFromResets already warned.
+                    experiment(s).end    = expByMarker(m).end;
+                    experiment(s).end_by = expByMarker(m).end_by;
+                end
+            end
+        end
+
+        function tok = regexpTokensOnce(strs, pat)
+        % regexp(..., 'tokens', 'once') over a list of strings, always returning
+        % an N x 1 cell.
+        %
+        % Given a SCALAR string, regexp returns the token row unwrapped rather
+        % than inside a 1x1 cell, so every "cellfun(@isempty, tok)" downstream
+        % would silently index per-token instead of per-string. Only bites when
+        % a session happens to contain exactly one distinct body of some kind,
+        % which is why it survives most real files.
+            strs = strs(:);
+            tok  = regexp(strs, pat, 'tokens', 'once');
+            if ~iscell(tok)
+                tok = {tok};
+            end
+        end
+
+        function idx = fieldIndex(names, fn)
+        % Position of each field name within the trial template's field order.
+            [~, idx] = ismember(cellstr(names(:)), fn);
+        end
+
+        function idx = matchIndex(names, keyList)
+        % Index of each name in keyList: exact match where one exists, else the
+        % sole substring match (what the per-comment reverse lookup did). 0 when
+        % neither is unique.
+            names = names(:);
+            idx = zeros(numel(names), 1);
+            [hit, loc] = ismember(names, keyList);
+            idx(hit) = loc(hit);
+            for k = find(~hit)'
+                cand = find(contains(keyList, names(k)));
+                if isscalar(cand); idx(k) = cand; end
+            end
+        end
+
+        function [f, ok] = lookupEventField(names, keyList, valList, fn)
+        % Map extracted event names to trial-field indices. ok is false where
+        % the name matched no key (or matched ambiguously), which routes the
+        % body to trials.undefined instead of erroring -- the per-comment parser
+        % died here on an empty or multiple match.
+            idx = BlackrockLoader.matchIndex(names, keyList);
+            ok  = idx > 0;
+            f   = zeros(numel(idx), 1);
+            if any(ok)
+                f(ok) = BlackrockLoader.fieldIndex(valList(idx(ok)), fn);
+            end
+        end
+
+        function trials = addDerivedTrialFeatures(trials)
+        % Post-parse tail: relabel memory-type visual saccades, then append the
+        % seven derived geometry/choice fields. Shared by every parser
+        % implementation so an A/B diff shows parse differences only, never
+        % differences in this block.
+        %
+        % Pure: takes the trials struct array, returns it with fields added.
+            if isempty(trials)
+                % vertcat of nothing is [], and [](:,1) errors. A comment set
+                % with no trial lines is a legitimate (if useless) input.
+                return
+            end
+
+            %% Change visual guided saccade (memory type) into memory guided saccade
+            tasks = {trials.Task};
+            trial_type = {trials.Trial_type};
+
+            memory_idx = strcmp(trial_type, 'memory');
+            task_idx = strcmp(tasks, 'visual_saccades_experiment');
+
+            tasks(memory_idx&task_idx) = {'memory_saccades_experiment'};
+            [trials.Task] = deal(tasks{:});
+
+            %% Add a few feature for further analysis
+            %1. Transform Cartesian into Polar for target postion
+            % -180(left) to 180(right)
+            Target_1_xy = vertcat(trials.Target_1_position);
+            [theta, Target_1_ecc] = cart2pol(Target_1_xy(:,1),Target_1_xy(:,2));
+            Target_1_angle = mod(90 - rad2deg(theta), 360);
+            Target_1_angle(Target_1_angle >= 180) = Target_1_angle(Target_1_angle >= 180) - 360;
+
+            Target_2_xy = vertcat(trials.Target_2_position);
+            [theta, Target_2_ecc] = cart2pol(Target_2_xy(:,1),Target_2_xy(:,2));
+            Target_2_angle = mod(90 - rad2deg(theta), 360);
+            Target_2_angle(Target_2_angle >= 180) = Target_2_angle(Target_2_angle >= 180) - 360;
+
+            stimulus_dir = (Target_1_angle >= 0) * 2 - 1;
+            stimulus_dir(isnan(Target_1_angle)) = NaN;
+
+            %2. Transform choice into target1/target2 and left/right
+            ChooseTarget = cellfun(@(s) str2double(s(end)), {trials.Choosen_choice});
+            ChooseLeftRight = ChooseTarget;
+            ChooseLeftRight(ChooseTarget==1) = (Target_1_angle(ChooseTarget==1) >= 0) * 2 - 1;
+            ChooseLeftRight(ChooseTarget==2) = (Target_2_angle(ChooseTarget==2) >= 0) * 2 - 1;
+
+            %3. Add these features back
+            Target1Angle_cell = num2cell(Target_1_angle);
+            [trials.Target_1_angle] = deal(Target1Angle_cell{:});
+
+            Target2Angle_cell = num2cell(Target_2_angle);
+            [trials.Target_2_angle] = deal(Target2Angle_cell{:});
+
+            stimulus_dir_cell = num2cell(stimulus_dir);
+            [trials.Stimulus_direction] = deal(stimulus_dir_cell{:});
+
+            ChooseTarget_cell = num2cell(ChooseTarget);
+            [trials.Choose_target] = deal(ChooseTarget_cell{:});
+            ChooseLeftRight_cell = num2cell(ChooseLeftRight);
+            [trials.Choose_leftright] = deal(ChooseLeftRight_cell{:});
+
+            Target_1_ecc_cell = num2cell(Target_1_ecc);
+            [trials.Target_1_eccentricity] = deal(Target_1_ecc_cell{:});
+
+            Target_2_ecc_cell = num2cell(Target_2_ecc);
+            [trials.Target_2_eccentricity] = deal(Target_2_ecc_cell{:});
         end
 
         function exp_template = defaultExpTemplate()
