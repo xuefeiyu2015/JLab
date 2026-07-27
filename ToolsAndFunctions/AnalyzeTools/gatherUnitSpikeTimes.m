@@ -21,15 +21,24 @@ function tc = gatherUnitSpikeTimes(spike, waveform, r)
     haveWave = ~isempty(waveform) && isfield(waveform, 'waveform_time');
     nTr      = size(spike.data, 2);
     relTime  = spike.timeseq.relative_time(:).';
-    tc       = cell(1, nTr);
 
-    for j = 1:nTr
-        if haveWave
-            wt = reshape(waveform.waveform_time(r, j, :), 1, []);
-            tc{j} = sort(wt(~isnan(wt)));
-        else
-            rd = reshape(spike.data(r, j, :), 1, []);
-            tc{j} = relTime(rd == 1);
-        end
+    % Vectorized over trials: flatten the whole (trial x spike-slot) or
+    % (trial x bin) block for this unit in one indexing op, find every spike at
+    % once, sort by (trial, time) so each trial's spikes are grouped and in
+    % ascending order, then split into the per-trial cell with mat2cell. No
+    % per-trial loop, regardless of trial or spike count.
+    if haveWave
+        wt         = reshape(waveform.waveform_time(r, :, :), nTr, []);   % nTr x maxSpk
+        mask       = ~isnan(wt);
+        [trIdx, ~] = find(mask);
+        vals       = wt(mask);
+    else
+        Rmat             = reshape(spike.data(r, :, :), nTr, []) == 1;    % nTr x nBins
+        [trIdx, binIdx]  = find(Rmat);
+        vals             = relTime(binIdx);
     end
+
+    keys   = sortrows([trIdx, vals(:)]);
+    counts = accumarray(keys(:,1), 1, [nTr, 1]);
+    tc     = mat2cell(keys(:,2).', 1, counts(:).');
 end

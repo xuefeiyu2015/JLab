@@ -39,30 +39,38 @@ Monkey = 'Athos';
 Location = 'in_lab';       % editable constant
 DataType = 'export_data';     % editable constant
 
-Folder = '2026-07-17';
-%Folder = '2026-07-15';
+%Folder = '2026-07-17';
+Folder = '2026-07-24';
 
 
 %Toddles to turn quality check plots on
+%{
+PlotBehaviorCheck= true; % for visualizing behavior summary
+PlotCalibratedEyes = true;% for plotting eye trace after calibration
+PlotSpikeCheck = true; %turn on the spike navigator interface
+PlotSaccadeCheck = true; %turn on the plots for saccade detection and saccade related visualizations
+TaskRouter = true; %turn on the task rounter for individual task based analysis
+%}
+%
 PlotBehaviorCheck= false; % for visualizing behavior summary
 PlotCalibratedEyes = false;% for plotting eye trace after calibration
 PlotSpikeCheck = false; %turn on the spike navigator interface
-PlotSaccadeCheck = true; %turn on the plots for saccade detection and saccade related visualizations
-TaskRouter = false; %turn on the task rounter for individual task based analysis
-
+PlotSaccadeCheck = false; %turn on the plots for saccade detection and saccade related visualizations
+TaskRouter = true; %turn on the task rounter for individual task based analysis
+%}
 % ReCompute flags: default true recomputes and refreshes the AnalysisCache
 % (<main_path>/AnalysisCache). Set one false to load that product from cache
 % instead of recomputing (the plots still redraw from the cached data). The eye
 % calibration is cached as a readable text file; the others as .mat.
 
-%{
+%
 ReComputeBehavior = false;
 ReComputeCal      = false;
 ReComputeSpike    = false;
 ReComputeRT       = false;
 ReComputeRF       = false;
 %}
-%
+%{
 ReComputeBehavior = true;
 ReComputeCal      = true;
 ReComputeSpike    = true;
@@ -177,7 +185,7 @@ RT = CalculateRT(caled_eyes, comments_data, PlotSaccadeCheck, [], [], main_path,
 if TaskRouter
 %% Auto-rounting to it's respective analyze protocol
 
-tasklist  = BehaviorSummary.Task(~contains(BehaviorSummary.Task,excludeTasks));
+tasklist  = BehaviorSummary.Task(~ismember(BehaviorSummary.Task,excludeTasks) );
 
 filtered_spike_data = [];
 if ~isempty(spike_data)
@@ -186,22 +194,32 @@ if ~isempty(spike_data)
 end
 
 
-data_ana = struct('comments',comments_data,'RT',RT,'eyes',caled_eyes,'spike',filtered_spike_data);
+% Field names must match the protocol contract: the per-task analyzers
+% (RFPlot, TimeDiscriminationBehavior, ...) read the trials table as data.comments.
+% extend the comments table by adding RT table.
+extended_comments = extendComments(comments_data,RT);
+data_ana = struct('comments',extended_comments,'eyes',[],'spike',filtered_spike_data);
+
+
 data_extra =[]; %returned data from another task
 plotFlag = 1; %Flag of whether to turn the plot on;
 %No need the raw waveform for now, may be extend later
-cfg = [];%Reserved for future, for selection for batch analysis
+cfg = [];%Reserved for future, for configuration for batch analysis
 
 %Now loop over tasks to rount data into their task-related protocols
 for i = 1:length(tasklist)
     task = tasklist(i);
-    switch task 
+    % Screen the recording down to this task's trials before dispatch, so each
+    % protocol receives data already scoped to its task.
+    data_task = SetupDataForTask(data_ana, task);
+    switch task
         case 'visual_saccades_experiment'
-            vse_result = RFPlot(data_ana,data_extra,plotFlag,main_path,ReComputeRF);
+            %vse_result = RFPlot(data_task,data_extra,plotFlag,main_path,ReComputeRF);
         case 'memory_saccades_experiment'
-            mse_result = FunctionSubtypeIdentify(data_ana,cfg,plotFlag);
+           % mse_result = FunctionSubtypeIdentify(data_task,cfg,plotFlag);
+            vse_result = RFPlot(data_task,cfg,plotFlag,main_path);
         case 'time_delay_experiment'
-            tde_result = TimeDiscriminationBehavior(data_ana,cfg,plotFlag);
+            tde_result = TimeDiscriminationBehavior(data_task,cfg,plotFlag);
         otherwise
             fprintf('No analyze protocol for %s yet\n',task);
      
@@ -288,8 +306,8 @@ for i = 1:numel(fields)
 
 end
 
-
-
-
 end
+
+% SetupDataForTask now lives in ToolsAndFunctions/AnalyzeTools/SetupDataForTask.m
+% (on the path via genpath), so the routing call above resolves to that file.
 

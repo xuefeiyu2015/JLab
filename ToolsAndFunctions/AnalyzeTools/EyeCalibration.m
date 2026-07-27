@@ -13,11 +13,24 @@ function caled_eyes = EyeCalibration(comments_data, eye_data, task_cal, holdWinM
 % it return the calibrated eye signal with the structure the same as
 % eye_data, just with calibrated eye in degree.
 %
-% Two kinds of task can supply calibration points:
-%   fixation task - the fixation hold, gaze at Fixation_position_x/_y.
-%   saccade task  - two epochs per trial: the fixation period before the
-%                   target appears (gaze at Fixation_position_x/_y), and the
-%                   target hold (gaze at Target_1_position_x/_y).
+% Three kinds of task can supply calibration points:
+%   fixation task    - the fixation hold, gaze at Fixation_position_x/_y.
+%   saccade task     - two epochs per trial: the fixation period before the
+%                      target appears (gaze at Fixation_position_x/_y), and the
+%                      target hold (gaze at Target_1_position_x/_y).
+%   time_delay task  - two epochs per trial, like the saccade task, but its
+%                      2AFC design needs different markers/columns: the fixation
+%                      period before the flashes (gaze at Fixation_position_x/_y),
+%                      and the choice hold, Choicetime to End (gaze at whichever
+%                      target was chosen, Choice_target_position_x/_y -- derived
+%                      from Target_1/2_position by Choose_target, since either
+%                      target can be the one fixated). Its choice targets only
+%                      ever vary in x (y is fixed), so on its own it can only
+%                      fit x gain/offset and a y offset: y gain is assumed equal
+%                      to x gain and couplings are forced to 0 (see the
+%                      "TimeDelayYFallback" warning). Pair it with a
+%                      fixation/saccade task in task_cal whenever one is
+%                      available, so the real 2D grid is used instead.
 %
 % Pass several and the calibration task is detected from what the session
 % actually ran: they are tried in the order given and the first that yields a
@@ -33,14 +46,14 @@ function caled_eyes = EyeCalibration(comments_data, eye_data, task_cal, holdWinM
 %   task_cal      - task name(s) to calibrate from, each matched as a substring
 %                   of Task (e.g. 'fixation' matches 'fixation_experiment').
 %                   Either a char (one task) or a cellstr tried in order, e.g.
-%                   {'fixation','visual_saccade','memory_saccade'}: the first
-%                   one that fits is used and the rest are not tried. Any way a
-%                   task can turn out unusable -- absent from the session, no
-%                   correct trials, too few conditions, degenerate grid --
-%                   falls through to the next. An entry matching several tasks
-%                   (a bare 'saccade' where the session ran both kinds) fits
-%                   them pooled, with a warning; name them separately to fit
-%                   just one.
+%                   {'fixation','visual_saccade','memory_saccade','time_delay'}:
+%                   the first one that fits is used and the rest are not tried.
+%                   Any way a task can turn out unusable -- absent from the
+%                   session, no correct trials, too few conditions, degenerate
+%                   grid -- falls through to the next. An entry matching
+%                   several tasks (a bare 'saccade' where the session ran both
+%                   kinds) fits them pooled, with a warning; name them
+%                   separately to fit just one.
 %   holdWinMs     - [start end] ms from each epoch's anchor marker to average
 %                   over (default [100 300], skips the saccade into the target).
 %                   The end is cut short per trial when the epoch closes early,
@@ -56,11 +69,11 @@ function caled_eyes = EyeCalibration(comments_data, eye_data, task_cal, holdWinM
 %                        the recording, over that task's fixation/target marks.
 %   calSessions   - Session numbers to calibrate from (default [] = every
 %                   session containing the task).
-%   nCalTrials    - max trials used for the fit. Default is task-dependent:
-%                   every trial for the fixation task (it is a dedicated
-%                   calibration block), min(50, available) for the saccade task.
-%                   When it bites, trials are picked round-robin over target
-%                   locations so the spatial spread is kept. Inf = use all.
+%   nCalTrials    - max trials used for the fit. Default Inf: every correct
+%                   trial of the task is used, whichever task it is. Pass a
+%                   finite number to cap it (e.g. to stop a long session's fit
+%                   drifting); when the cap bites, trials are picked round-robin
+%                   over target locations so the spatial spread is kept.
 %   savePath      - (optional) session export folder. When set, the fitted
 %                   coefficients are cached to <savePath>/AnalysisCache/
 %                   EyeCalibration.txt (a readable text file). '' disables caching.
@@ -175,7 +188,8 @@ function caled_eyes = EyeCalibration(comments_data, eye_data, task_cal, holdWinM
         if ~isempty(fitpts)
             gaze_x = applyAxis(fitpts.xv, fitpts.yv, cal.coef_x);
             gaze_y = applyAxis(fitpts.yv, fitpts.xv, cal.coef_y);
-            plotCalibratedGaze(gaze_x, gaze_y, fitpts.tx, fitpts.ty, cal);
+            nCalTrialsUsed = numel(unique(fitpts.trial));
+            plotCalibratedGaze(gaze_x, gaze_y, fitpts.tx, fitpts.ty, cal, nCalTrialsUsed);
         end
 
         % (b) eye traces for the tasks the fit was NOT built from
@@ -202,8 +216,8 @@ function [cal, fitpts] = fitOneTask(comments_data, eye_data, task_entry, cal, ..
     epochs = calibrationEpochs(task_entry);
     if isempty(epochs)
         warning('EyeCalibration:UnsupportedTask', ...
-            ['"%s" has no defined calibration epoch; skipping it. Only fixation ' ...
-             'and saccade tasks can calibrate.'], task_entry);
+            ['"%s" has no defined calibration epoch; skipping it. Only fixation, ' ...
+             'saccade and time_delay tasks can calibrate.'], task_entry);
         return
     end
 
@@ -221,18 +235,12 @@ function [cal, fitpts] = fitOneTask(comments_data, eye_data, task_entry, cal, ..
     end
     cal.task_cal = matched(:)';
 
-    % The fixation task is a dedicated calibration block, so use all of it. The
-    % saccade task is an experiment that can run long, and 50 trials already
-    % cover the target grid several times over; capping keeps the fit from
-    % drifting with the session. min() is applied later against what survives.
-    % Resolved per attempt, so a fall-back to saccade does not inherit
-    % fixation's uncapped default.
+    % By default every correct trial of the task feeds the fit -- fixation and
+    % saccade alike -- so calibration uses the whole block. A caller can still
+    % pass a finite nCalTrials to cap a long session (pickBalancedTrials then
+    % spreads the picks over the target grid); the cap is off unless asked for.
     if isempty(nCalTrials)
-        if contains(task_entry, 'fixation')
-            nCalTrials = Inf;
-        else
-            nCalTrials = 50;
-        end
+        nCalTrials = Inf;
     end
 
     % Restrict to the requested sessions (default: every session with the task).
@@ -247,9 +255,17 @@ function [cal, fitpts] = fitOneTask(comments_data, eye_data, task_entry, cal, ..
     % which is the whole requirement -- nothing further to check.
     trial_ok = task_hit & session_ok ...
         & comments_data.Save_complete == 1 ...
-        & strcmp(comments_data.Trialoutcome, 'correct');
+        & (strcmp(comments_data.Trialoutcome, 'correct')|strcmp(comments_data.Trialoutcome, 'wrong'));
 
     if ~any(trial_ok);  return;  end
+
+    % time_delay's choice-hold epoch needs the gaze location actually acquired,
+    % which -- unlike the saccade tasks' single target -- depends on which of
+    % the two targets the animal chose, so it isn't a plain column and must be
+    % derived first.
+    if any(strcmp({epochs.target_x}, 'Choice_target_position_x'))
+        comments_data = addChoiceTargetPosition(comments_data);
+    end
 
     % ---------------------------------------------------------------------
     % Collect calibration points from every epoch
@@ -262,7 +278,7 @@ function [cal, fitpts] = fitOneTask(comments_data, eye_data, task_entry, cal, ..
 
     % Shortest window worth taking a median over once clamped to the epoch.
     % At 1 kHz this is ~50 samples, enough for the median to be stable.
-    MIN_WIN_MS = 50;
+    %MIN_WIN_MS = 50;
 
     for e = 1:numel(epochs)
         ep = epochs(e);
@@ -279,10 +295,9 @@ function [cal, fitpts] = fitOneTask(comments_data, eye_data, task_entry, cal, ..
         % too little of the window survives to give a stable median.
         avail_ms = (limit - anchor) * 1000;                  % epoch length from anchor
         win_end  = min(holdWinMs(2), avail_ms);              % per-trial window end
-        win_ok   = win_end - holdWinMs(1) >= MIN_WIN_MS;
+      %  win_ok   = win_end - holdWinMs(1) >= MIN_WIN_MS;
 
-        ep_ok = trial_ok & win_ok ...
-            & ~isnan(anchor) & ~isnan(limit) & ~isnan(tgt_x) & ~isnan(tgt_y);
+        ep_ok = trial_ok & ~isnan(anchor) & ~isnan(limit) & ~isnan(tgt_x) & ~isnan(tgt_y);
 
         if ~any(ep_ok);  continue;  end
 
@@ -321,9 +336,9 @@ function [cal, fitpts] = fitOneTask(comments_data, eye_data, task_entry, cal, ..
 
     if isempty(pts.xv)
         warning('EyeCalibration:NoTrials', ...
-            ['No usable calibration epochs for "%s": no epoch keeps %g ms of the ' ...
+            ['No usable calibration epochs for "%s": no epoch for the ' ...
              '%g-%g ms window.'], ...
-            task_entry, MIN_WIN_MS, holdWinMs(1), holdWinMs(2));
+            task_entry, holdWinMs(1), holdWinMs(2));
         return
     end
 
@@ -357,9 +372,17 @@ function [cal, fitpts] = fitOneTask(comments_data, eye_data, task_entry, cal, ..
     % gain are unidentifiable and the fit collapses to a constant. Distinct grid
     % points alone are not enough: a column of targets (all x equal, y varying)
     % gives nCond = 3 but no x information at all.
+    %
+    % time_delay_experiment is the one exception: its choice targets only ever
+    % vary in x (y is fixed), so nTargetY < 2 is expected there, not a failure.
+    % Gate the relaxation on the fit being time-delay-only, so a genuinely
+    % degenerate fixation/saccade grid still fails as before.
     nTargetX = numel(unique(tx));
     nTargetY = numel(unique(ty));
-    if nTargetX < 2 || nTargetY < 2
+    isTimeDelayOnly = all(contains(matched, 'time_delay'));
+    yDegenerate = nTargetY < 2;
+
+    if nTargetX < 2 || (yDegenerate && ~isTimeDelayOnly)
         warning('EyeCalibration:TooFewConditions', ...
             ['"%s" calibration targets span %d distinct x and %d distinct y value(s) over ' ...
              '%d usable points; each axis needs >= 2.'], ...
@@ -368,33 +391,55 @@ function [cal, fitpts] = fitOneTask(comments_data, eye_data, task_entry, cal, ..
     end
 
     % The coupling column needs a third condition to be identifiable at all.
-    use_coupling = nCond >= 3;
+    % When y never varies (time-delay-only), any apparent 3rd condition is an
+    % artifact of the fixed y target, not a real coupling-identifying grid, so
+    % coupling is forced off rather than fit from tracker noise.
+    if yDegenerate
+        use_coupling = false;
+    else
+        use_coupling = nCond >= 3;
+    end
+
     Dx = designMatrix(xv, yv, use_coupling);
-    Dy = designMatrix(yv, xv, use_coupling);
+    if ~yDegenerate;  Dy = designMatrix(yv, xv, use_coupling);  end
 
     % Even with enough conditions the grid can be degenerate (e.g. collinear
     % targets), which would leave the coupling column redundant.
-    if use_coupling && (rank(Dx) < size(Dx,2) || rank(Dy) < size(Dy,2))
+    rankBad = @() rank(Dx) < size(Dx,2) || (~yDegenerate && rank(Dy) < size(Dy,2));
+    if use_coupling && rankBad()
         use_coupling = false;
         Dx = designMatrix(xv, yv, use_coupling);
-        Dy = designMatrix(yv, xv, use_coupling);
+        if ~yDegenerate;  Dy = designMatrix(yv, xv, use_coupling);  end
     end
 
-    if rank(Dx) < size(Dx,2) || rank(Dy) < size(Dy,2)
+    if rankBad()
         warning('EyeCalibration:RankDeficient', ...
             '"%s" calibration grid is degenerate (rank-deficient design).', task_entry);
         return
     end
 
     coef_x = Dx \ tx;                       % [offset_x; gain_x; couple_xy]
-    coef_y = Dy \ ty;                       % [offset_y; gain_y; couple_yx]
-
     cal.R2_x = rsquared(tx, Dx * coef_x);
-    cal.R2_y = rsquared(ty, Dy * coef_y);
+    if ~use_coupling;  coef_x(3) = 0;  end  % keep a fixed 3-element shape
 
-    if ~use_coupling                        % keep a fixed 3-element shape
-        coef_x(3) = 0;
-        coef_y(3) = 0;
+    if yDegenerate
+        % No y variation to fit gain/offset/coupling from: assume the tracker's
+        % y gain matches its (just-fitted) x gain, force the coupling to 0, and
+        % solve only the offset from the known-constant y target.
+        gain_y   = coef_x(2);
+        offset_y = mean(ty - gain_y .* yv);
+        coef_y   = [offset_y; gain_y; 0];
+        cal.R2_y = rsquared(ty, offset_y + gain_y .* yv);   % typically NaN: ty is constant
+
+        warning('EyeCalibration:TimeDelayYFallback', ...
+            ['"%s" calibration used the time-delay task only: y target varies ' ...
+             'over just %d distinct value(s), so y gain (%.4g) was assumed equal ' ...
+             'to x gain and only the y offset was fit; y gain may be inaccurate.'], ...
+            task_entry, nTargetY, gain_y);
+    else
+        coef_y = Dy \ ty;                   % [offset_y; gain_y; couple_yx]
+        cal.R2_y = rsquared(ty, Dy * coef_y);
+        if ~use_coupling;  coef_y(3) = 0;  end
     end
 
     cal.coef_x  = coef_x;
@@ -402,14 +447,20 @@ function [cal, fitpts] = fitOneTask(comments_data, eye_data, task_entry, cal, ..
     cal.applied = true;
     cal.units   = 'deg';
 
-    % The points behind the fit, for the caller's QC plot.
-    fitpts = struct('xv', xv, 'yv', yv, 'tx', tx, 'ty', ty);
+    % The points behind the fit, for the caller's QC plot. trial is kept so the
+    % plot can report how many actual trials fed the fit (a saccade trial gives
+    % two points, so points overstate the trial count).
+    fitpts = struct('xv', xv, 'yv', yv, 'tx', tx, 'ty', ty, 'trial', pts.trial(keep));
 end
 
 
-function plotCalibratedGaze(gaze_x, gaze_y, tx, ty, cal)
+function plotCalibratedGaze(gaze_x, gaze_y, tx, ty, cal, nTrials)
 % Plot calibrated gaze on the 2D screen against the known target grid.
 % One color per target location: each cloud should sit on its target marker.
+%
+% nTrials is the number of trials that fed the fit, reported in the title.
+% A saccade trial contributes two points (fixation + target hold), so the point
+% count runs ahead of the trial count -- both are shown to keep that clear.
 
     pts  = unique([tx ty], 'rows');
     nGrp = size(pts, 1);
@@ -436,9 +487,9 @@ function plotCalibratedGaze(gaze_x, gaze_y, tx, ty, cal)
     axis equal;
     xlabel('Eye X (\circ)');
     ylabel('Eye Y (\circ)');
-    title(sprintf('%s  |  R^2_x=%.3f  R^2_y=%.3f  (%d points, %d conditions)', ...
+    title(sprintf('%s  |  R^2_x=%.3f  R^2_y=%.3f  (%d trials, %d points, %d conditions)', ...
         strrep(strjoin(cal.task_cal, ', '), '_', ' '), cal.R2_x, cal.R2_y, ...
-        numel(tx), size(unique(round([tx ty], 3), 'rows'), 1)));
+        nTrials, numel(tx), size(unique(round([tx ty], 3), 'rows'), 1)));
     legend(hleg, arrayfun(@(i) sprintf('(%.1f, %.1f)\\circ', pts(i,1), pts(i,2)), ...
         (1:nGrp)', 'UniformOutput', false), 'Location', 'bestoutside');
     set(gcf, 'color', 'w');
@@ -632,8 +683,9 @@ function epochs = calibrationEpochs(task_name)
 %   target_x/_y - columns holding the known gaze location (deg)
 %
 % Each task must be listed explicitly. A task with no known-gaze epoch (e.g.
-% time_delay_experiment) returns empty and must never be calibrated from:
-% fitOneTask warns and skips it, so it is reported rather than mis-calibrated.
+% a task with no fixation/target hold at all) returns empty and must never be
+% calibrated from: fitOneTask warns and skips it, so it is reported rather
+% than mis-calibrated.
 %
 % task_name is matched as a substring, so the caller's own string ('saccade',
 % 'visual_saccade', 'visual_saccades_experiment') all resolve here identically.
@@ -658,9 +710,60 @@ function epochs = calibrationEpochs(task_name)
             'target_x', {'Fixation_position_x', 'Target_1_position_x'}, ...
             'target_y', {'Fixation_position_y', 'Target_1_position_y'});
 
+    elseif contains(task_name, 'time_delay')
+        % Pre-choice fixation, then the hold on the chosen target.
+        %
+        % time_delay_experiment (temporal discrimination, 2AFC) doesn't share
+        % the saccade tasks' epoch shape (checked against real exported trial
+        % data):
+        %   1. Fixation is held straight through both flashes to the go cue,
+        %      so the fixation epoch runs the whole Fixation_acquired ->
+        %      Fixation_point_off span (like the plain fixation task), not cut
+        %      short at Target_1_presented -- gaze doesn't move for the
+        %      flashes, so there's nothing to avoid overlapping.
+        %   2. Targets_off (the two flashes extinguishing) fires BEFORE
+        %      Choicetime here, not after, so it can't close the choice hold;
+        %      End does (Choicetime < End reliably).
+        %   3. Either of the two flashed targets can be the one the animal
+        %      actually looks to (Choose_target is 1 or 2), so the acquired
+        %      location isn't the fixed Target_1_position_x/y the saccade
+        %      tasks use -- it's Choice_target_position_x/y, derived in
+        %      fitOneTask by addChoiceTargetPosition.
+        %
+        % Its choice targets only vary in x (see fitOneTask's y-degenerate
+        % fallback), so calibrating from this task alone only pins down x
+        % gain/offset and a y offset, not y gain.
+        epochs = struct( ...
+            'name',     {'pre_choice_fixation',  'choice_hold'}, ...
+            'anchor',   {'Fixation_acquired',    'Choicetime'}, ...
+            'limit',    {'Fixation_point_off',   'End'}, ...
+            'target_x', {'Fixation_position_x',  'Choice_target_position_x'}, ...
+            'target_y', {'Fixation_position_y',  'Choice_target_position_y'});
+
     else
         epochs = [];
     end
+end
+
+
+function cd = addChoiceTargetPosition(cd)
+% Add Choice_target_position_x/_y: the location of whichever target the
+% animal actually chose (Choose_target == 1 or 2), for time_delay_experiment's
+% choice_hold epoch. Unlike the saccade tasks' single target, time_delay is a
+% 2AFC design where either flashed target can be the one fixated, so this
+% can't be read as a fixed column the way Target_1_position is elsewhere.
+
+    n  = height(cd);
+    cx = nan(n, 1);
+    cy = nan(n, 1);
+
+    is1 = cd.Choose_target == 1;
+    is2 = cd.Choose_target == 2;
+    cx(is1) = cd.Target_1_position_x(is1);  cy(is1) = cd.Target_1_position_y(is1);
+    cx(is2) = cd.Target_2_position_x(is2);  cy(is2) = cd.Target_2_position_y(is2);
+
+    cd.Choice_target_position_x = cx;
+    cd.Choice_target_position_y = cy;
 end
 
 

@@ -16,11 +16,19 @@ function [isis, violRate] = computeISI(spikeTimesCell, violThresh)
 
     if nargin < 2 || isempty(violThresh);  violThresh = 1e-3;  end
 
-    isis = [];
-    for j = 1:numel(spikeTimesCell)
-        tm = sort(spikeTimesCell{j}(:).');
-        if numel(tm) < 2;  continue;  end
-        isis = [isis, diff(tm)]; %#ok<AGROW>
+    % Vectorized within-trial diff: flatten all trials with a trial-id tag, sort
+    % by (trial, time) so each trial's spikes are contiguous and ascending, take
+    % one global diff, then keep only the diffs that stay inside a trial (i.e.
+    % where the trial id did not change). No per-trial loop or array growth.
+    lens = cellfun(@numel, spikeTimesCell);
+    if sum(lens) < 2
+        isis = [];
+    else
+        allTm   = [spikeTimesCell{:}];
+        trialId = repelem(1:numel(spikeTimesCell), lens);
+        keys    = sortrows([trialId(:), allTm(:)]);
+        d       = diff(keys(:,2));
+        isis    = d(diff(keys(:,1)) == 0).';
     end
 
     if isempty(isis)

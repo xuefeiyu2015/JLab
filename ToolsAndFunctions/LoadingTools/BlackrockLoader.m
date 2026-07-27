@@ -7,7 +7,8 @@ classdef BlackrockLoader < handle
 %   <CommentPrefix_primary>-*.nev  -> experiment comments + comment timing
 %   <CommentPrefix_legacy>-*.nev   -> legacy fallback for comments
 %   <SpikePrefix>-*.nev            -> online spike timing
-%   <AnalogPrefix>-*.ns2           -> online analog (eye) data
+%   <AnalogPrefix>-*.ns2           -> online analog (eye) data/ photodiod
+%   data
 % Legacy exception: in early sessions comments AND spikes were both written to
 % the HUB-*.nev file, so comments fall back from NSP to HUB.
 %

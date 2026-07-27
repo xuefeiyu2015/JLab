@@ -1,39 +1,42 @@
-function rfsummary = RFPlot(data, extra, plotFlag, savePath, reCompute)
+function rfsummary = RFPlot(data, cfg, plotFlag, savePath)
 % Receptive-field analysis for the visual saccade task: an interactive per-unit
 % browser (RF heatmap + 16 spatial PSTHs), built from the OFFLINE spike raster.
 %
 % Ported from the online reference OnlinePlotBlackRock/jivesLink/
 % plotJivesReceptiveField.m (RF grid, spatial PSTHs, 2-D Gaussian fit), but driven
 % by the exported online_spike product (data.spike) and the trials table
-% (data.events) instead of the online `trials` global. The GUI, per-unit navigator,
+% (data.comments) instead of the online `trials` global. The GUI, per-unit navigator,
 % note field, per-unit caching, and cross-task summary CSV mirror spikeCheck.m.
 %
-%   data     - struct from BlackRockFileAnalyzer: .spike (online_spike raster),
-%              .events (trials table, cd). Other fields (.RT/.eyes) are unused here.
-%   extra    - reserved for cross-task data (unused; kept for dispatch symmetry).
+%   data     - struct from BlackRockFileAnalyzer, already scoped to this task by
+%              SetupDataForTask: .spike (online_spike raster) and .comments
+%              (trials table, cd) hold only visual-saccade trials, with the raster
+%              trial dimension 1:1 co-ordered with the comments rows (spike trial j
+%              <-> cd row j). Other fields (.RT/.eyes) are unused here.
+%   cfg   - not implemented yet.
 %   plotFlag - (optional, default true) draw the GUI. false runs headless: no
 %              figure; with a savePath every unit's RF is computed, cached, and
 %              merged into the master analysis summary, then rfsummary is returned.
 %   savePath - (optional) export folder (.../Monkey <name>/.../<date>). '' turns
 %              persistence/export off. Used by the Export button, the headless path,
 %              and the on-close cache write.
-%   reCompute- (optional, default true) when false and savePath holds a cached
-%              RFSummary.mat, per-unit RF params are seeded from cache (skips the
-%              per-unit recompute); notes always come from unit_rf_notes.csv.
+
 %
 % Returns rfsummary, a per-unit table (Channel, Unit, RF fit params, peak FR, trial
 % count, alignment/windows, Note).
 %
 % Computation is separated from visualization: computeUnit (pure, no graphics)
-% assembles the per-unit RF grid + spatial PSTHs from the reusable spike helpers
-% (SpikeTrialAlignmentCheck, gatherUnitSpikeTimes); plotHeatmap / drawSectorPanel
+% assembles the per-unit RF grid + spatial PSTHs (reading per-trial markers straight
+% from the pre-scoped cd via gatherUnitSpikeTimes); plotHeatmap / drawSectorPanel
 % only render.
 %
 % Xuefei Yu Jul 2026
 
+reCompute = true;%Temporarily hardwired here.
+
     if nargin < 3 || isempty(plotFlag);   plotFlag  = true;  end
     if nargin < 4;                        savePath  = '';    end
-    if nargin < 5 || isempty(reCompute);  reCompute = true;  end
+   % if nargin < 5 || isempty(reCompute);  reCompute = true;  end
 
     rfsummary = table();
 
@@ -46,23 +49,23 @@ function rfsummary = RFPlot(data, extra, plotFlag, savePath, reCompute)
     SMOOTH_SIGMA = 2.5;
     GRID_EDGES   = -20:1:20;
     GRID_CTRS    = (GRID_EDGES(1:end-1) + GRID_EDGES(2:end)) / 2;
-    ECC_NEAR     = 10;            % deg; near < ECC_NEAR, far >= ECC_NEAR
+    ECC_EDGES    = [0, 7, 14, 25];      % deg; band upper edge is inclusive per band
+    nRings       = numel(ECC_EDGES) - 1;
     RF_EXTRAP_MIN = 10;
-    N_SECTORS    = 16;
+    N_SECTORS    = 8 * nRings;          % 8 compass octants x nRings eccentricity bands
     PSTH_CLR     = [0.20 0.50 0.90];
     RASTER_CLR   = [0.75 0.80 0.92];   % light ticks behind the PSTH
     WAVE_FS      = 30000;              % Blackrock NEV waveform sample rate (Hz)
-    alignOpts    = {'Visual onset', 'Go signal (saccade)'};
+    alignOpts    = {'Visual onset', 'Saccade onset'};
 
-    % Sector centre angles / eccentricity bins in axPS index order (1–16).
-    SECTOR_ANGLES = [135, 90, 45, 135, 90, 45, 180, 0, 180, 0, 225, 270, 315, 225, 270, 315];
-    SECTOR_NEAR   = logical([0,0,0, 1,1,1, 0,0,1,1, 1,1,1, 0,0,0]);
+    % Nominal compass-octant centre angles (secNum order: E,NE,N,NW,W,SW,S,SE) and
+    % eccentricity-band strings, used only as a fallback title for empty sectors --
+    % real panels are titled from the actual (angle, ecc) of their contributing
+    % trials (built per-unit in computeUnit, see st.psth.label).
+    OCT_ANGLES   = [0, 45, 90, 135, 180, 225, 270, 315];
+    ECC_BAND_STR = arrayfun(@(i) sprintf('%g-%g', ECC_EDGES(i), ECC_EDGES(i+1)), ...
+        1:nRings, 'UniformOutput', false);
     deg = char(176);
-    SECTOR_LABELS = cell(N_SECTORS, 1);
-    for k = 1:N_SECTORS
-        if SECTOR_NEAR(k);  ineq = '<';  else;  ineq = '>';  end
-        SECTOR_LABELS{k} = sprintf('%d%s, %s%d', SECTOR_ANGLES(k), deg, ineq, ECC_NEAR);
-    end
 
     % ── Guard: need a spike raster ────────────────────────────────────────
     if ~isfield(data, 'spike') || isempty(data.spike) || ~isfield(data.spike, 'data') ...
@@ -70,24 +73,27 @@ function rfsummary = RFPlot(data, extra, plotFlag, savePath, reCompute)
         disp('RFPlot: no spike raster to analyze.');
         return
     end
-    spike = data.spike;
-    cd    = data.events;
+
+    
+    cd_ori    = data.comments;
+    useTrial = strcmp(string(cd_ori.Trialoutcome), 'correct');
+    cd = cd_ori(useTrial,:);
+
+    spike_ori = data.spike;
+    spike = spike_ori;
+    spike.data = spike_ori.data(:,useTrial,:);
 
     chan  = spike.info.Channel_Number(:);
     unit  = spike.info.Unit_No(:);
     nRow  = numel(chan);
     channels = unique(chan, 'stable');
-    start = spike.timeseq.alignedrawtime(:);          % trials x 1, abs Start (s)
+    start = spike.timeseq.alignedrawtime(useTrial);          % trials x 1, abs Start (s)
 
-    % ── Trial pairing: markers (abs s) + target positions, matched by
-    %    (Session, Trial_number). T.outcome distinguishes 'correct' from 'wrong'.
-    markerCols = {'Target_1_presented', 'Target_2_presented', 'Fixation_point_off', ...
-        'Target_1_position_x', 'Target_1_position_y', ...
-        'Target_2_position_x', 'Target_2_position_y'};
-    T = SpikeTrialAlignmentCheck(spike, cd, markerCols);
-
-    taskTrial = T.valid & strcmp(T.task, ACTIVE_TASK);          % this task's trials
-    useTrial  = taskTrial & strcmp(T.outcome, 'correct');       % RF/PSTH: correct only
+    % Trials arrive pre-scoped to this task and 1:1 co-ordered with the raster
+    % (cd row j <-> spike trial j), so per-trial markers/outcome are read straight
+    % from cd; no (Session, Trial_number) re-pairing here. RF/PSTH use correct
+    % trials only.
+   
 
     % ── Per-unit store + note / cache seeding ─────────────────────────────
     S = repmat(struct('Channel', NaN, 'Unit', NaN, 'Note', '', ...
@@ -138,7 +144,7 @@ function rfsummary = RFPlot(data, extra, plotFlag, savePath, reCompute)
     lastAlign   = alignOpts{1};
 
     fig = figure('Name', 'Receptive field: visual saccade', 'Color', 'w', ...
-        'Position', [50 40 1400 940]);
+        'Position', [50 40 1700 1150]);
 
     % --- left control column ---------------------------------------------
     uicontrol(fig, 'Style', 'text', 'Units', 'normalized', 'Position', [0.01 0.945 0.14 0.028], ...
@@ -194,45 +200,51 @@ function rfsummary = RFPlot(data, extra, plotFlag, savePath, reCompute)
     statusTxt = uicontrol(fig, 'Style', 'text', 'Units', 'normalized', 'Position', [0.01 0.100 0.14 0.130], ...
         'String', '', 'BackgroundColor', 'w', 'HorizontalAlignment', 'left', 'FontSize', 9);
 
-    % --- right plot panel: heatmap + 16 spatial PSTHs (reference layout) ---
+    % --- right plot panel: heatmap + N_SECTORS spatial PSTHs -----------------
     pnl = uipanel(fig, 'Units', 'normalized', 'Position', [0.17 0.02 0.82 0.96], ...
         'BackgroundColor', 'w', 'BorderType', 'none');
 
-    pw = 0.125;  ph = 0.135;  gx = 0.010;  gy = 0.012;
-    gySep = 0.030;  gyHM = 0.050;  lm = 0.065;  rm = 0.010;  bm = 0.030;
-    y5 = bm;
-    y4 = y5 + ph + gySep;
-    y3 = y4 + ph + gyHM;
-    hmh = 2*ph + gy;
-    y2 = y3 + hmh + 3*gy;
-    y1 = y2 + ph + gySep;
-    yWE = y3 + (hmh - ph)/2;
-    x1L = lm;
-    x2L = x1L + pw + gx;
-    x6R = 1 - rm - pw;
-    x5R = x6R - pw - gx;
-    hmx = x2L + pw + gx;
-    hmw = x5R - gx - hmx;
-    xNS = hmx + hmw/2 - pw/2;
+    pw = 0.085;  ph = 0.095;  gx = 0.008;  gy = 0.008;
+    gySep = 0.015;  gHM = 0.030;  lm = 0.05;  rm = 0.05;  bm = 0.03;
+
+    ringBlockH = nRings*ph + (nRings-1)*gySep;   % stacked-ring block height (top = bottom)
+    ringBlockW = nRings*pw + (nRings-1)*gx;      % stacked-ring block width (left = right)
+
+    y3  = bm + ringBlockH + gHM;                 % heatmap bottom edge
+    hmh = 2*ph + gy;                             % heatmap height
+    hmx = lm + ringBlockW + gHM;                 % heatmap left edge
+    hmw = 1 - rm - ringBlockW - gHM - hmx;       % heatmap width (leftover)
+    xNS = hmx + hmw/2 - pw/2;                    % N/S column, centered on heatmap
+    yWE = y3 + (hmh - ph)/2;                     % E/W row, centered on heatmap
 
     axHM = axes('Parent', pnl, 'Units', 'normalized', 'Position', [hmx, y3, hmw, hmh]);
+
+    % Sector panels: 8 compass octants (secNum order) x nRings eccentricity bands,
+    % ring 1 = innermost/nearest the heatmap. Each panel steps outward along its
+    % octant's (DIRX,DIRY) direction by one panel+gap per additional ring -- this
+    % generalizes the old hand-placed near/far layout to any nRings.
+    DIRX = [1  1  0 -1 -1 -1  0  1];   % E,NE,N,NW,W,SW,S,SE
+    DIRY = [0  1  1  1  0 -1 -1 -1];
+    stepX = pw + gx;
+    stepY = ph + gySep;
+
     axPS = gobjects(N_SECTORS, 1);
-    axPS(1)  = axes('Parent', pnl, 'Units', 'normalized', 'Position', [x1L, y1,  pw, ph]);
-    axPS(2)  = axes('Parent', pnl, 'Units', 'normalized', 'Position', [xNS, y1,  pw, ph]);
-    axPS(3)  = axes('Parent', pnl, 'Units', 'normalized', 'Position', [x6R, y1,  pw, ph]);
-    axPS(4)  = axes('Parent', pnl, 'Units', 'normalized', 'Position', [x2L, y2,  pw, ph]);
-    axPS(5)  = axes('Parent', pnl, 'Units', 'normalized', 'Position', [xNS, y2,  pw, ph]);
-    axPS(6)  = axes('Parent', pnl, 'Units', 'normalized', 'Position', [x5R, y2,  pw, ph]);
-    axPS(7)  = axes('Parent', pnl, 'Units', 'normalized', 'Position', [x1L, yWE, pw, ph]);
-    axPS(9)  = axes('Parent', pnl, 'Units', 'normalized', 'Position', [x2L, yWE, pw, ph]);
-    axPS(10) = axes('Parent', pnl, 'Units', 'normalized', 'Position', [x5R, yWE, pw, ph]);
-    axPS(8)  = axes('Parent', pnl, 'Units', 'normalized', 'Position', [x6R, yWE, pw, ph]);
-    axPS(11) = axes('Parent', pnl, 'Units', 'normalized', 'Position', [x2L, y4,  pw, ph]);
-    axPS(12) = axes('Parent', pnl, 'Units', 'normalized', 'Position', [xNS, y4,  pw, ph]);
-    axPS(13) = axes('Parent', pnl, 'Units', 'normalized', 'Position', [x5R, y4,  pw, ph]);
-    axPS(14) = axes('Parent', pnl, 'Units', 'normalized', 'Position', [x1L, y5,  pw, ph]);
-    axPS(15) = axes('Parent', pnl, 'Units', 'normalized', 'Position', [xNS, y5,  pw, ph]);
-    axPS(16) = axes('Parent', pnl, 'Units', 'normalized', 'Position', [x6R, y5,  pw, ph]);
+    for oct = 1:8
+        if     DIRX(oct) > 0;  ax0 = hmx + hmw + gHM;
+        elseif DIRX(oct) < 0;  ax0 = hmx - gHM - pw;
+        else;                  ax0 = xNS;
+        end
+        if     DIRY(oct) > 0;  ay0 = y3 + hmh + gHM;
+        elseif DIRY(oct) < 0;  ay0 = y3 - gHM - ph;
+        else;                  ay0 = yWE;
+        end
+        for ring = 1:nRings
+            sIdx = (oct - 1) * nRings + ring;
+            px = ax0 + (ring - 1) * DIRX(oct) * stepX;
+            py = ay0 + (ring - 1) * DIRY(oct) * stepY;
+            axPS(sIdx) = axes('Parent', pnl, 'Units', 'normalized', 'Position', [px, py, pw, ph]);
+        end
+    end
 
     selectRow(1);
 
@@ -360,10 +372,22 @@ function rfsummary = RFPlot(data, extra, plotFlag, savePath, reCompute)
         yl = [0, allMax * 1.1];
         showPSTH = logical(psthChk.Value);
         showRas  = logical(rasChk.Value);
-        noX = [1, 2, 3, 11, 12, 13];
+        % x-ticks: only the ring closest to the heatmap on that side of a vertical
+        % stack shows them (top block: innermost ring 1; bottom block: outermost
+        % ring nRings, since that block grows downward away from the heatmap).
+        % Horizontal (E/W) octants aren't stacked, so they always show ticks.
         for s = 1:N_SECTORS
+            sOct  = ceil(s / nRings);
+            sRing = s - (sOct - 1) * nRings;
+            if DIRY(sOct) == 0
+                showX = true;
+            elseif DIRY(sOct) > 0
+                showX = (sRing == 1);
+            else
+                showX = (sRing == nRings);
+            end
             drawSectorPanel(axPS(s), st.psth.t, st.psth.mean(s, :), st.psth.sem(s, :), ...
-                st.psth.n(s), SECTOR_LABELS{s}, yl, ~ismember(s, noX), ...
+                st.psth.n(s), st.psth.label{s}, yl, showX, ...
                 showPSTH, showRas, st.psth.raster{s}, PSTH_CLR, RASTER_CLR);
         end
         storeMetrics(curRow, st);
@@ -371,73 +395,122 @@ function rfsummary = RFPlot(data, extra, plotFlag, savePath, reCompute)
             chan(curRow), unit(curRow), curRow, nRow, st.nTrials, st.peakFR);
     end
 
-    % ---------------- pure per-unit compute (no graphics) ----------------
+    % ---------------- pure per-unit compute (no graphics) -----------------
+    % Groups trials by their (Target_1_angle, Target_1_eccentricity) condition
+    % once, then does the RF-grid and spatial-PSTH math per condition/sector
+    % instead of recomputing the shared grid cell / sector for every trial.
     function st = computeUnit(r, rfWin, psthWin, alignStr, doFit)
         visual = strcmp(alignStr, 'Visual onset');
         winSec = rfWin / 1000;
-        winDur = diff(winSec);
-        tc = gatherUnitSpikeTimes(spike, [], r);          % 1 x nTr, s from Start
+        tc = gatherUnitSpikeTimes(spike, [], r);          % 1 x nTr, s from Start; feeds PSTH + raster
+        nTr = numel(tc);
+
+        xk = cd.Target_1_position_x;
+        yk = cd.Target_1_position_y;
+        if visual
+            mk = cd.Target_1_presented;
+        else
+            if ismember('RTtime', cd.Properties.VariableNames)
+                mk = cd.RTtime;
+            else
+                disp('Use approximate RT(fixation off)');
+                mk = cd.Choicetime - cd.Fixation_point_off;   % seconds
+            end
+        end
+        mRelKt = mk - start;
+
+        % RF-window firing rate per trial, normalized by the *observed* duration
+        % (handles a window truncated by a short trial's recorded range) rather
+        % than the nominal window length.
+        unitSeq = struct('data', spike.data(r, :, :), 'timeseq', spike.timeseq, ...
+            'info', struct('samplingrate', spike.info.samplingrate));
+        win = [mRelKt + winSec(1), mRelKt + winSec(2)];
+        rr  = AverageFiringRateBetween(unitSeq, win);
+        rateKt = rr(1, :).';
 
         nG = numel(GRID_EDGES) - 1;
-        gridSum = zeros(nG);  gridCnt = zeros(nG);
-        tgt_xy  = zeros(0, 2);
-        nUsed   = 0;
-
         kern    = buildKernel(PSTH_SIGMA, BIN_MS);
         t_edges = psthWin(1) : BIN_MS : psthWin(2);
         t_c     = t_edges(1:end-1) + BIN_MS/2;
         nBins   = numel(t_c);
         psthN    = zeros(N_SECTORS, 1);
         psthMean = zeros(N_SECTORS, nBins);
-        psthM2   = zeros(N_SECTORS, nBins);
+        psthSEM  = zeros(N_SECTORS, nBins);
         raster   = repmat({{}}, N_SECTORS, 1);
 
-        for j = 1:numel(tc)
-            if ~taskTrial(j);  continue;  end
-            % Target overlay: any presented target of this task's trials.
-            for kt = 1:2
-                presK = T.(sprintf('Target_%d_presented', kt))(j);
-                xk = T.(sprintf('Target_%d_position_x', kt))(j);
-                yk = T.(sprintf('Target_%d_position_y', kt))(j);
-                if ~isnan(presK) && ~isnan(xk) && ~isnan(yk)
-                    tgt_xy(end+1, :) = [xk yk]; %#ok<AGROW>
-                end
+        % Target overlay: any presented target of this task's trials.
+        presOK = ~isnan(cd.Target_1_presented) & ~isnan(xk) & ~isnan(yk);
+        tgt_xy = unique([xk(presOK), yk(presOK)], 'rows');
+
+        % ---- Stage 1: enumerate unique (angle, eccentricity) conditions ----
+        % uniquetol (not unique/round): angle & eccentricity are floats, so grouping
+        % needs float-noise tolerance -- but rounding (tried, verified against real
+        % data) both merges genuinely distinct conditions and pushes borderline
+        % eccentricities across an ECC_EDGES band boundary (e.g. 9.9998 -> 10.0). A
+        % tight ABSOLUTE tolerance (DataScale=1) avoids that: uniquetol's default
+        % scales relative to the whole [angle,ecc] matrix, which under/over-merges
+        % when the two columns have very different ranges (angle ~360, ecc ~20) --
+        % the same failure mode rounding had, just via a different mechanism.
+        valid = ~isnan(xk) & ~isnan(yk) & ~isnan(mRelKt);
+        angRaw = cd.Target_1_angle;
+        eccRaw = cd.Target_1_eccentricity;
+        [cond, ~, condId] = uniquetol([angRaw(valid), eccRaw(valid)], 1e-6, ...
+            'ByRows', true, 'DataScale', 1);
+        nCond = size(cond, 1);
+        angC  = mod(90 - cond(:, 1), 360);    % compass Target_1_angle -> math convention
+        eccC  = cond(:, 2);
+        sIdxC = arrayfun(@(k) getSectorIdx(angC(k), eccC(k), ECC_EDGES), (1:nCond)');
+
+        % Grid placement reuses the existing x/y columns (one representative
+        % position per condition; members of a condition share one target).
+        xRep = accumarray(condId, xk(valid), [nCond, 1], @mean);
+        yRep = accumarray(condId, yk(valid), [nCond, 1], @mean);
+        ixC  = discretize(xRep, GRID_EDGES);
+        iyC  = discretize(yRep, GRID_EDGES);
+
+        % ---- Stage 2a: RF grid, per condition -> grid --------------------
+        rV = rateKt(valid);
+        condSum = accumarray(condId, rV, [nCond, 1], @(v) sum(v(~isnan(v))), 0);
+        condCnt = accumarray(condId, ~isnan(rV), [nCond, 1], @sum, 0);
+        okGrid  = ~isnan(ixC) & ~isnan(iyC);
+        linIdx  = sub2ind([nG, nG], iyC(okGrid), ixC(okGrid));
+        gridSum = reshape(accumarray(linIdx, condSum(okGrid), [nG * nG, 1], @sum, 0), nG, nG);
+        gridCnt = reshape(accumarray(linIdx, condCnt(okGrid), [nG * nG, 1], @sum, 0), nG, nG);
+
+        % ---- Stage 2b: spatial PSTH + raster, per sector ------------------
+        sectorOfTrial = sIdxC(condId);        % sector for each valid trial
+        validIdx = find(valid);
+        for s = 1:N_SECTORS
+            trIdx = validIdx(sectorOfTrial == s);
+            n = numel(trIdx);
+            psthN(s) = n;
+            if n == 0
+                continue
             end
-            if ~useTrial(j);  continue;  end          % RF/PSTH: correct trials only
-            nUsed = nUsed + 1;
-            spk = tc{j};
-            for kt = 1:2
-                xk = T.(sprintf('Target_%d_position_x', kt))(j);
-                yk = T.(sprintf('Target_%d_position_y', kt))(j);
-                if isnan(xk) || isnan(yk);  continue;  end
-                if visual
-                    mk = T.(sprintf('Target_%d_presented', kt))(j);
-                else
-                    mk = T.Fixation_point_off(j);
-                end
-                if isnan(mk);  continue;  end
-                mRel = mk - start(j);                 % marker in the Start frame (s)
+            spMs = cellfun(@(spk, mRel) (spk - mRel) * 1000, tc(trIdx), ...
+                num2cell(mRelKt(trIdx)).', 'UniformOutput', false);
+            counts = cell2mat(cellfun(@(sp) histcounts(sp, t_edges), spMs, 'UniformOutput', false).');
+            fr = counts / (BIN_MS / 1000);
+            psthMean(s, :) = mean(fr, 1);
+            if n > 1
+                psthSEM(s, :) = std(fr, 0, 1) / sqrt(n);
+            end
+            raster{s} = cellfun(@(sp) sp(sp >= psthWin(1) & sp <= psthWin(2)), spMs, 'UniformOutput', false);
+        end
 
-                % RF firing rate in the window, binned onto the spatial grid.
-                ix = discretize(xk, GRID_EDGES);
-                iy = discretize(yk, GRID_EDGES);
-                if ~isnan(ix) && ~isnan(iy)
-                    cnt = sum(spk >= mRel + winSec(1) & spk <= mRel + winSec(2));
-                    gridSum(iy, ix) = gridSum(iy, ix) + cnt / winDur;
-                    gridCnt(iy, ix) = gridCnt(iy, ix) + 1;
-                end
-
-                % Spatial PSTH (Welford) + raster ticks for the target's sector.
-                sIdx = getSectorIdx(atan2d(yk, xk), hypot(xk, yk), ECC_NEAR);
-                if isnan(sIdx);  continue;  end
-                sp_ms = (spk - mRel) * 1000;
-                c  = histcounts(sp_ms, t_edges);
-                fr = c / (BIN_MS / 1000);
-                psthN(sIdx)      = psthN(sIdx) + 1;
-                delta            = fr - psthMean(sIdx, :);
-                psthMean(sIdx,:) = psthMean(sIdx, :) + delta / psthN(sIdx);
-                psthM2(sIdx,:)   = psthM2(sIdx, :) + delta .* (fr - psthMean(sIdx, :));
-                raster{sIdx}{end+1} = sp_ms(sp_ms >= psthWin(1) & sp_ms <= psthWin(2));
+        % Panel titles: actual (angle, eccentricity) of the real condition(s) that
+        % contributed trials to each sector (nominal octant/band as fallback when a
+        % sector has no trials), built here since cond/sIdxC are per-unit-call already.
+        sectorLabel = repmat({''}, N_SECTORS, 1);
+        for s = 1:N_SECTORS
+            inSec = find(sIdxC == s);
+            if isempty(inSec)
+                sOct  = ceil(s / nRings);
+                sRing = s - (sOct - 1) * nRings;
+                sectorLabel{s} = sprintf('%d%s, ecc %s (no data)', OCT_ANGLES(sOct), deg, ECC_BAND_STR{sRing});
+            else
+                parts = arrayfun(@(k) sprintf('%.0f%s/%.1f', cond(k, 1), deg, cond(k, 2)), inSec, 'UniformOutput', false);
+                sectorLabel{s} = strjoin(parts, ', ');
             end
         end
 
@@ -452,7 +525,7 @@ function rfsummary = RFPlot(data, extra, plotFlag, savePath, reCompute)
         for s = 1:N_SECTORS
             smMean(s, :) = conv(psthMean(s, :), kern, 'same');
             if psthN(s) > 1
-                smSEM(s, :) = conv(sqrt(psthM2(s, :) / (psthN(s) - 1)) / sqrt(psthN(s)), kern, 'same');
+                smSEM(s, :) = conv(psthSEM(s, :), kern, 'same');
             end
         end
 
@@ -461,14 +534,15 @@ function rfsummary = RFPlot(data, extra, plotFlag, savePath, reCompute)
 
         st = struct();
         st.gridSm = gridSm;
-        st.tgt_xy = unique(tgt_xy, 'rows');
-        st.nTrials = nUsed;
+        st.tgt_xy = tgt_xy;
+        st.nTrials = nTr;
         st.peakFR  = max([gridSm(:); 0]);
         st.fit     = fitRes;
         st.alignStr = alignStr;
         st.rfWin    = rfWin;
         st.psthWin  = psthWin;
-        st.psth = struct('t', t_c, 'mean', smMean, 'sem', smSEM, 'n', psthN, 'raster', {raster});
+        st.psth = struct('t', t_c, 'mean', smMean, 'sem', smSEM, 'n', psthN, ...
+            'raster', {raster}, 'label', {sectorLabel});
     end
 
     function storeMetrics(r, st)
@@ -556,6 +630,7 @@ function rfsummary = RFPlot(data, extra, plotFlag, savePath, reCompute)
     end
 
 end
+
 
 
 % =========================================================================
@@ -665,21 +740,21 @@ function gridSm = smoothGrid(gridFR, gridCnt, GRID_CTRS, SMOOTH_SIGMA, RF_EXTRAP
 end
 
 
-function sIdx = getSectorIdx(ang, ecc, ECC_NEAR)
-% (angle deg, eccentricity deg) -> sector index 1-16. 8 equal 45 deg direction
-% sectors x 2 eccentricity bins (near < ECC_NEAR, far >=).
+function sIdx = getSectorIdx(ang, ecc, ECC_EDGES)
+% (angle deg, eccentricity deg) -> sector index. 8 equal 45 deg compass octants x
+% numel(ECC_EDGES)-1 eccentricity bands (each band's upper edge inclusive); ring 1
+% is the innermost/nearest band.
     if isnan(ang) || isnan(ecc)
         sIdx = NaN;  return;
     end
+    nRings = numel(ECC_EDGES) - 1;
     ang360 = mod(ang, 360);
     secNum = floor(mod(ang360 + 22.5, 360) / 45) + 1;   % 1-8: E,NE,N,NW,W,SW,S,SE
-    far_map  = [8,  3,  2,  1,  7,  14, 15, 16];
-    near_map = [10, 6,  5,  4,  9,  11, 12, 13];
-    if ecc < ECC_NEAR
-        sIdx = near_map(secNum);
-    else
-        sIdx = far_map(secNum);
+    ring = nRings;                                       % default: outermost band
+    for i = 1:nRings
+        if ecc <= ECC_EDGES(i+1);  ring = i;  break;  end
     end
+    sIdx = (secNum - 1) * nRings + ring;
 end
 
 

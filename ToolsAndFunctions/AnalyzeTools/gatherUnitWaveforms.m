@@ -18,10 +18,12 @@ function W = gatherUnitWaveforms(waveform, T, r, trialMask)
 
     nSamp = size(waveform.waveform, 4);
     js    = find(trialMask(:).' & T.valid(:).');
-    W     = zeros(0, nSamp);
-    for j = js
-        wf   = reshape(waveform.waveform(r, j, :, :), [], nSamp);  % maxSpk x nSamp
-        keep = any(~isnan(wf), 2);
-        W    = [W; wf(keep, :)]; %#ok<AGROW>
-    end
+
+    % Vectorized over trials: pull the whole (1 x numel(js) x maxSpk x nSamp)
+    % block in one indexing op, collapse everything but the sample axis into
+    % rows (column-major reshape keeps nSamp as the trailing dimension, so no
+    % permute is needed), then drop the NaN-padded rows once. No per-trial loop
+    % or array growth.
+    wf = reshape(waveform.waveform(r, js, :, :), [], nSamp);
+    W  = wf(any(~isnan(wf), 2), :);
 end

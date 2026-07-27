@@ -37,7 +37,7 @@ function result = TimeDiscriminationBehavior(data, cfg,plotFlag)
     % ---------------------------------------------------------------------
     % Parse / filter the events table.
     % ---------------------------------------------------------------------
-    D = prepTDData(data.events);
+    D = prepTDData(data);
 
     if isempty(D.S)
         warning('TimeDiscriminationBehavior:noTrials', ...
@@ -66,6 +66,12 @@ function result = TimeDiscriminationBehavior(data, cfg,plotFlag)
     % ---------------------------------------------------------------------
     result = struct('sessions', []);
     cmap   = lines(3);                       % one stable colour per dropdown slot
+
+    % Per-figure recompute caches (D is fixed for the figure's lifetime, so
+    % entries never go stale -- no invalidation needed). containers.Map has
+    % handle semantics, so the nested callbacks mutate these in place.
+    slidingCache = containers.Map('KeyType', 'double', 'ValueType', 'any'); % sessionId -> full-session sliding
+    slotCache    = containers.Map('KeyType', 'char',   'ValueType', 'any'); % 'id|lo|hi' -> whole-range fit + RT
 
     fig = figure('Name', 'Time discrimination behavior', 'Color', 'w', ...
                  'Position', [60 60 1300 900]);
@@ -123,7 +129,7 @@ function result = TimeDiscriminationBehavior(data, cfg,plotFlag)
     axRTR  = axes('Parent', pnl, 'Position', [0.56 0.05 0.38 0.16]);
 
     redraw();
-    uiwait(fig);
+    %uiwait(fig);
 
     % =====================================================================
     % Nested callbacks / drawing (share D, handles, cmap, result).
@@ -135,18 +141,21 @@ function result = TimeDiscriminationBehavior(data, cfg,plotFlag)
             set(edStart(g), 'String', num2str(s.first));
             set(edEnd(g),   'String', num2str(s.last));
         end
-        redraw();
+       % redraw();
     end
 
     function onTrialEdit(g)
         s = getSlot(g);
-        if isempty(s);  redraw();  return;  end
+        if isempty(s) 
+            %redraw();  
+          return;  
+        end
         lo = clampTrial(parseField(edStart(g), s.first), s.first);
         hi = clampTrial(parseField(edEnd(g),   s.last),  s.first);
         if lo > hi;  [lo, hi] = deal(hi, lo);  end
         set(edStart(g), 'String', num2str(lo));
         set(edEnd(g),   'String', num2str(hi));
-        redraw();
+      %  redraw();
     end
 
     function v = parseField(h, defaultVal)
@@ -188,9 +197,49 @@ function result = TimeDiscriminationBehavior(data, cfg,plotFlag)
         end
     end
 
+    function res = computeAllCached(sel)
+        % Cached counterpart of computeAll: reuse unchanged slots and the
+        % once-per-session sliding bias/threshold, so only what actually
+        % changed is refit.
+        res  = struct('sessions', []);
+        sess = struct([]);            % grown into a struct array (avoids double->struct)
+        for k = 1:numel(sel)
+            s  = sel(k).S;
+            lo = sel(k).lo;  hi = sel(k).hi;
+
+            % Full-session sliding windows: expensive, computed once per session.
+            if ~isKey(slidingCache, s.id)
+                slidingCache(s.id) = computeSlidingBTFull(D, s.rows, WIN, STEP);
+            end
+            Wfull = slidingCache(s.id);
+
+            % Whole-range fit + RT: keyed by the exact selection.
+            key = sprintf('%d|%d|%d', s.id, lo, hi);
+            if isKey(slotCache, key)
+                base = slotCache(key);
+            else
+                rows = s.rows(D.trialNum(s.rows) >= lo & D.trialNum(s.rows) <= hi);
+                [pse, thr, psy, n] = computeSessionPsy(D, rows);
+                base = struct('id', s.id, 'range', [lo hi], 'pse', pse, ...
+                              'threshold', thr, 'psy', psy, 'n', n, ...
+                              'rtLeft',  computeRTByLevel(D, rows, -1), ...
+                              'rtRight', computeRTByLevel(D, rows, +1));
+                slotCache(key) = base;
+            end
+
+            base.sliding = selectWindows(Wfull, lo, hi);
+            if isempty(sess)
+                sess = base;                 % first entry seeds the struct array
+            else
+                sess(k) = base;
+            end
+        end
+        if ~isempty(sess);  res.sessions = sess;  end
+    end
+
     function redraw()
         sel    = currentSelection();
-        result = computeAll(D, sel, WIN, STEP);
+        result = computeAllCached(sel);
 
         % --- Psychometric overlay -------------------------------------
         cla(axPsy);  hold(axPsy, 'on');
@@ -269,7 +318,32 @@ function result = TimeDiscriminationBehavior(data, cfg,plotFlag)
             col = cmap(sel(k).slot, :);
             R   = result.sessions(k).(field);
             if isempty(R.lev);  continue;  end
-            plot(ax, R.lev, R.mrt, '.-', 'Color', col, 'MarkerSize', 12, 'LineWidth', 1.2);
+            okC = R.nC > 0;   % correct: filled dots
+            if any(okC)
+                errorbar(ax, R.lev(okC), R.mrtC(okC), R.sdC(okC), 'o', ...
+                    'LineStyle', 'none', 'Color', col, 'MarkerFaceColor', col, ...
+                    'MarkerEdgeColor', col, 'MarkerSize', 8, 'CapSize', 4);
+            end
+            okW = R.nW > 0;   % wrong: open dots
+            if any(okW)
+                errorbar(ax, R.lev(okW), R.mrtW(okW), R.sdW(okW), 'o', ...
+                    'LineStyle', 'none', 'Color', col, 'MarkerFaceColor', 'none', ...
+                    'MarkerEdgeColor', col, 'MarkerSize', 8, 'CapSize', 4);
+            end
+            if ~isempty(R.fit)   % linear trend from correct averages
+                xx = [min(R.lev) max(R.lev)];
+                plot(ax, xx, polyval(R.fit, xx), '-', 'Color', col, 'LineWidth', 1.2);
+            end
+        end
+        % r/p of each session's correct-trial fit, stacked in the top-right corner
+        yTxt = 0.97;
+        for k = 1:numel(sel)
+            R = result.sessions(k).(field);
+            if isempty(R.lev) || isempty(R.fit);  continue;  end
+            text(ax, 0.97, yTxt, sprintf('r=%.2f, p=%.3f', R.r, R.p), ...
+                'Units', 'normalized', 'Color', cmap(sel(k).slot, :), 'FontSize', 8, ...
+                'HorizontalAlignment', 'right', 'VerticalAlignment', 'top');
+            yTxt = yTxt - 0.11;
         end
         xlabel(ax, 'Signed onset asynchrony (ms)');  ylabel(ax, 'RT (s)');
         title(ax, ttl, 'FontSize', 9);
@@ -281,36 +355,62 @@ end
 % =========================================================================
 % Computation helpers (pure: no plotting, no side effects)
 % =========================================================================
-function D = prepTDData(ev)
-% Filter the events table to valid time-delay trials and index them by session.
-    isTime      = contains(string(ev.Task), 'time');
+function D = prepTDData(d)
+% Filter the events table to valid trials and index them by session. The events
+% table arrives pre-scoped to the time-delay task (SetupDataForTask), so only the
+% analysis-specific validity screening is applied here.
+    ev = d.comments;
     saved       = ev.Save_complete == 1;
     validChoice = ~isnan(ev.Choose_target);
-    validMask   = isTime & saved & validChoice;
+    validMask   = saved & validChoice;
 
-    D.totalTrials = max(ev.Trial_number);         % clamp upper bound (whole recording)
-    D.minTrial    = min(ev.Trial_number);         % clamp lower bound (may be 0-indexed)
-    D.trialNum    = ev.Trial_number;
+    %D.totalTrials = max(ev.Trial_number);         % clamp upper bound (whole recording)
+    %D.minTrial    = min(ev.Trial_number);         % clamp lower bound (may be 0-indexed)
+    D.totalTrials = sum(validMask);         % clamp upper bound (whole recording)
+    D.minTrial    = 1;         % clamp lower bound 
+
+    %Screen out valid trials
+    ev = ev(validMask,:);
+
+    D.trialNum    = [1:sum(validMask)]';
     D.stimulus    = ev.Requested_target_2_time_offset;
     D.direction   = ev.Stimulus_direction;
-    D.choiceLR    = ev.Choose_leftright;          % 0 = left, 1 = right
+    D.choiceLR    = ev.Choose_leftright;          % -1 = left, 1 = right
 
-    hasRT = ismember('Choicetime', ev.Properties.VariableNames) && ...
-            ismember('Fixation_point_off', ev.Properties.VariableNames);
-    if hasRT
-        D.rt = ev.Choicetime - ev.Fixation_point_off;   % seconds
+    % Per-trial correctness (repo-wide convention: the Trialoutcome string). After
+    % the Save_complete/valid-choice screen above, trials are correct or wrong only.
+    if ismember('Trialoutcome', ev.Properties.VariableNames)
+        D.correct = strcmp(string(ev.Trialoutcome), 'correct');   % normalizes cell/char/categorical
     else
-        D.rt = nan(height(ev), 1);
+        D.correct = D.choiceLR == D.direction;                    % geometric fallback
     end
 
-    sessIds = unique(ev.Session(validMask));
-    sessIds = sessIds(:)';
+
+    if ismember('RTtime', ev.Properties.VariableNames)
+        disp('Use real RT estimated by eyemovement.');
+        D.saccade = ev.RTtime;
+    else
+        disp('Use approximate RT by the comments marker.');
+        hasRT = ismember('Choicetime', ev.Properties.VariableNames) && ...
+            ismember('Fixation_point_off', ev.Properties.VariableNames);
+        if hasRT
+            D.saccade = ev.Choicetime - ev.Fixation_point_off;   % seconds
+        else
+            D.saccade = nan(height(ev), 1);
+        end
+        
+
+    end
+
+ 
+    sessIds_raw = unique(ev.Session);
+    sessIds = [1:length(sessIds_raw)]';
     S = struct('id', {}, 'rows', {}, 'first', {}, 'last', {}, 'endTrial', {});
     for k = 1:numel(sessIds)
-        sid  = sessIds(k);
-        rows = find(validMask & ev.Session == sid);
-        tn   = ev.Trial_number(rows);
-        S(k) = struct('id', sid, 'rows', rows, 'first', min(tn), ...
+        sid  = sessIds_raw(k);
+        rows = find(ev.Session == sid);
+        tn   = D.trialNum(rows);
+        S(k) = struct('id', k, 'rows', rows, 'first', min(tn), ...
                       'last', max(tn), 'endTrial', max(tn));
     end
     D.S = S;
@@ -338,7 +438,8 @@ function res = computeAll(D, sel, win, step)
         res.sessions(k).threshold = thr;
         res.sessions(k).psy       = psy;
         res.sessions(k).n         = n;
-        res.sessions(k).sliding   = computeSlidingBT(D, rows, win, step);
+        res.sessions(k).sliding   = selectWindows( ...
+            computeSlidingBTFull(D, s.rows, win, step), sel(k).lo, sel(k).hi);
         res.sessions(k).rtLeft    = computeRTByLevel(D, rows, -1);
         res.sessions(k).rtRight   = computeRTByLevel(D, rows, +1);
     end
@@ -368,42 +469,99 @@ function [pse, thr, psy, n] = computeSessionPsy(D, rows)
     catch
         pse = NaN;  thr = NaN;  psy = [];
     end
+    if abs(pse) >1000
+       % Hard up level
+       % the pse is meaningless if above this value
+       pse = NaN;
+    end
+    if thr >1000 
+       % Hard up level
+       % the thr is meaningless if above this value
+       thr = NaN;
+    end
 end
 
-function W = computeSlidingBT(D, rows, win, step)
-% Bias/threshold in a trailing window of `win` trials stepped by `step`, within
-% one session's rows only (never crossing a session boundary). x = window centre.
-    tn        = D.trialNum(rows);
-    [~, ord]  = sort(tn);
-    rows      = rows(ord);
+function W = computeSlidingBTFull(D, rows, win, step)
+% Bias/threshold in a trailing window of `win` trials stepped by `step`, over a
+% whole session's rows (never crossing a session boundary). Windows are anchored
+% to fixed session positions -- not to any selected sub-range -- so a range edit
+% just re-selects a subset (see selectWindows) instead of refitting. x = window
+% centre; lo/hi = the window's first/last trial number, used for that selection.
     n         = numel(rows);
     starts    = 1:step:max(1, n - win + 1);
     W.x   = nan(numel(starts), 1);
     W.pse = nan(numel(starts), 1);
     W.thr = nan(numel(starts), 1);
+    W.lo  = nan(numel(starts), 1);
+    W.hi  = nan(numel(starts), 1);
     if n < win;  return;  end
     for i = 1:numel(starts)
         w      = starts(i):min(n, starts(i) + win - 1);
         wrows  = rows(w);
         [p, t] = computeSessionPsy(D, wrows);
-        W.x(i)   = mean(D.trialNum(wrows));
+        tn       = D.trialNum(wrows);
+        W.x(i)   = mean(tn);
         W.pse(i) = p;
         W.thr(i) = t;
+        W.lo(i)  = min(tn);
+        W.hi(i)  = max(tn);
     end
 end
 
+function W = selectWindows(Wfull, lo, hi)
+% Pick the precomputed full-session windows whose whole trial span lies inside
+% the selected range [lo, hi], so no window uses trials outside the selection.
+    keep  = Wfull.lo >= lo & Wfull.hi <= hi;
+    W.x   = Wfull.x(keep);
+    W.pse = Wfull.pse(keep);
+    W.thr = Wfull.thr(keep);
+end
+
 function R = computeRTByLevel(D, rows, sideSign)
-% Mean RT per signed asynchrony level, for trials whose onset-first side matches
-% sideSign (-1 left-first, +1 right-first).
-    R = struct('lev', [], 'mrt', [], 'n', []);
+% RT per signed asynchrony level, split by outcome, for trials whose onset-first
+% side matches sideSign (-1 left-first, +1 right-first). Per level: correct/wrong
+% mean, std and count (mrtC/sdC/nC and mrtW/sdW/nW). `fit` is a [slope intercept]
+% linear fit of the correct-trial mean RT vs level, only when >2 signed levels
+% carry correct data (else []).
+    R = struct('lev', [], 'mrtC', [], 'sdC', [], 'nC', [], ...
+                          'mrtW', [], 'sdW', [], 'nW', [], ...
+                          'fit', [], 'r', NaN, 'p', NaN);
     sd   = D.stimulus(rows) .* D.direction(rows);
-    rt   = D.rt(rows);
+
+    if size(D.saccade,2) >1
+        %Real saccade
+        rt   = D.saccade.RTtime(rows);
+    else
+        %Estimated saccade
+        rt   = D.saccade(rows);
+
+    end
     side = sign(D.direction(rows));
+    cor  = logical(D.correct(rows));
     m    = side == sideSign & ~isnan(rt);
     if ~any(m);  return;  end
-    lev = sd(m);  rtv = rt(m);
-    [ulev, ~, ix] = unique(lev);
-    R.lev = ulev;
-    R.mrt = accumarray(ix, rtv, [], @mean);
-    R.n   = accumarray(ix, 1);
+    lev = sd(m);  rtv = rt(m);  cor = cor(m);
+    ulev = unique(lev);
+    nL   = numel(ulev);
+    [mrtC, sdC, nC, mrtW, sdW, nW] = deal(nan(nL, 1));
+    for i = 1:nL
+        atC = lev == ulev(i) &  cor;
+        atW = lev == ulev(i) & ~cor;
+        nC(i) = sum(atC);  nW(i) = sum(atW);
+        if nC(i) > 0;  mrtC(i) = mean(rtv(atC));  sdC(i) = std(rtv(atC));  end
+        if nW(i) > 0;  mrtW(i) = mean(rtv(atW));  sdW(i) = std(rtv(atW));  end
+    end
+    R.lev  = ulev;
+    R.mrtC = mrtC;  R.sdC = sdC;  R.nC = nC;
+    R.mrtW = mrtW;  R.sdW = sdW;  R.nW = nW;
+
+    % Linear trend from correct-trial averages (each level weighted equally).
+    okC = nC > 0 & isfinite(mrtC);
+    if sum(okC) > 2
+        xf = ulev(okC);  yf = mrtC(okC);
+        R.fit = polyfit(xf, yf, 1);                 % [slope intercept]
+        [rr, pp] = corrcoef(xf, yf);                % goodness of the trend
+        R.r = rr(1, 2);
+        R.p = pp(1, 2);
+    end
 end

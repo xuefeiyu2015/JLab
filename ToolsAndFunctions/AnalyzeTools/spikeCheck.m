@@ -103,6 +103,11 @@ function spikesummary = spikeCheck(spike, waveform, cd, savePath, plotFlag, reCo
         'baselineMeanRate', NaN, 'violationRate', NaN, ...
         'snr', NaN, 'widthMs', NaN, 'peakToValley', NaN, 'pcaRatio', NaN, ...
         'Excluded', false, 'Reason', '', 'Note', ''), nRow, 1);
+    % In-memory cache of computeUnit() per unit, for the lifetime of this GUI
+    % call only: once a unit has been visited (interactively or via
+    % fillAllMetrics), switching back to it re-renders from the cached struct
+    % instead of recomputing ISI/waveform/PCA from scratch.
+    computedCache = cell(nRow, 1);
     excl = loadExclusions(exclFile, chan, unit);
     for k = 1:nRow
         S(k).Channel  = chan(k);
@@ -279,7 +284,10 @@ function spikesummary = spikeCheck(spike, waveform, cd, savePath, plotFlag, reCo
     end
 
     function redraw()
-        st = computeUnit(curRow);
+        if isempty(computedCache{curRow})
+            computedCache{curRow} = computeUnit(curRow);
+        end
+        st = computedCache{curRow};
         plotFiringPanel(axFR,  st.firing, T, cmap, RATE_THRESH);
         plotISIPanel(axISI,    st.isi, cmap);
         plotWaveformPanel(axWF, st.waveform, cmap);
@@ -384,7 +392,10 @@ function spikesummary = spikeCheck(spike, waveform, cd, savePath, plotFlag, reCo
     function fillAllMetrics()
         for ii = 1:nRow
             if ~metricsFilled(ii)
-                storeMetrics(ii, computeUnit(ii));
+                if isempty(computedCache{ii})
+                    computedCache{ii} = computeUnit(ii);
+                end
+                storeMetrics(ii, computedCache{ii});
             end
         end
     end
@@ -439,33 +450,44 @@ function spikesummary = spikeCheck(spike, waveform, cd, savePath, plotFlag, reCo
         fr.meanRateAll = mean(rate, 'omitnan');
 
         % Per-trial task colour index (NaN when the trial's task is not shown).
+        % Vectorized lookup instead of a per-trial find(strcmp(...)) loop.
+        [tf, ci]   = ismember(T.task, utasks);
         fr.trialCi = nan(nTr, 1);
-        for j = 1:nTr
-            ci = find(strcmp(utasks, T.task{j}), 1);
-            if ~isempty(ci);  fr.trialCi(j) = ci;  end
-        end
+        fr.trialCi(tf) = ci(tf);
 
         % Per-task mean +- std (merged blocks), for the summary table.
-        fr.tasks = struct('Task', {}, 'meanRate', {}, 'stdRate', {}, 'nTrials', {});
-        for t = 1:numel(utasks)
+        % Preallocated to numel(utasks) (a handful of tasks) and filtered at the
+        % end, instead of growing the struct array with (end+1).
+        nTasks  = numel(utasks);
+        taskBuf = repmat(struct('Task', '', 'meanRate', NaN, 'stdRate', NaN, ...
+                                 'nTrials', 0), 1, nTasks);
+        taskKeep = false(1, nTasks);
+        for t = 1:nTasks
             sel = strcmp(T.task, utasks{t}) & ~isnan(rate);
             if ~any(sel);  continue;  end
-            fr.tasks(end+1) = struct('Task', utasks{t}, 'meanRate', mean(rate(sel)), ...
+            taskBuf(t) = struct('Task', utasks{t}, 'meanRate', mean(rate(sel)), ...
                 'stdRate', std(rate(sel)), 'nTrials', nnz(sel));
+            taskKeep(t) = true;
         end
+        fr.tasks = taskBuf(taskKeep);
 
         % Per contiguous block: shading index + its own mean/std for the label.
+        % Preallocated to numel(blocks) and filtered at the end, same reasoning.
         blocks   = contiguousBlocks(T.task);
-        fr.blocks = struct('name', {}, 'first', {}, 'last', {}, 'ci', {}, ...
-                           'mean', {}, 'std', {});
-        for b = 1:numel(blocks)
-            ci = find(strcmp(utasks, blocks(b).name), 1);
-            if isempty(ci);  continue;  end
+        nBlocks  = numel(blocks);
+        blockBuf = repmat(struct('name', '', 'first', 0, 'last', 0, 'ci', [], ...
+                                  'mean', NaN, 'std', NaN), 1, nBlocks);
+        blockKeep = false(1, nBlocks);
+        for b = 1:nBlocks
+            ci_b = find(strcmp(utasks, blocks(b).name), 1);
+            if isempty(ci_b);  continue;  end
             rv = rate(blocks(b).first:blocks(b).last);  rv = rv(~isnan(rv));
             if isempty(rv);  mu = NaN;  sd = NaN;  else;  mu = mean(rv);  sd = std(rv);  end
-            fr.blocks(end+1) = struct('name', blocks(b).name, 'first', blocks(b).first, ...
-                'last', blocks(b).last, 'ci', ci, 'mean', mu, 'std', sd);
+            blockBuf(b) = struct('name', blocks(b).name, 'first', blocks(b).first, ...
+                'last', blocks(b).last, 'ci', ci_b, 'mean', mu, 'std', sd);
+            blockKeep(b) = true;
         end
+        fr.blocks = blockBuf(blockKeep);
     end
 
     function is = isiStats(r)
@@ -474,13 +496,21 @@ function spikesummary = spikeCheck(spike, waveform, cd, savePath, plotFlag, reCo
         isiByTask    = cell(numel(utasks), 1);
         countsByTask = zeros(numel(utasks), 1);
         violByTask   = nan(numel(utasks), 1);
+        taskMaskAll = false(1, numel(tc));
         for t = 1:numel(utasks)
             tmask = strcmp(T.task, utasks{t});
+            taskMaskAll = taskMaskAll | tmask(:).';
             [isiByTask{t}, v] = computeISI(tc(tmask), 0.001);
             countsByTask(t)   = sum(cellfun(@numel, tc(tmask)));
             if haveWave;  violByTask(t) = v;  end   % raster violation is meaningless
         end
-        [allIsi, violAll] = computeISI(tc, 0.001);
+        % "All" ISIs/violation rate come from concatenating the per-task ISIs
+        % already computed above, plus a pass over any leftover trials with no
+        % recognized task (normally none, since utasks spans every valid trial's
+        % task) -- avoids a second full pass over every trial's spike times.
+        restIsi = computeISI(tc(~taskMaskAll), 0.001);
+        allIsi  = [isiByTask{:}, restIsi];
+        if isempty(allIsi);  violAll = NaN;  else;  violAll = mean(allIsi < 0.001);  end
 
         is.isiByTask     = isiByTask;
         is.countsByTask  = countsByTask;
@@ -525,25 +555,43 @@ function spikesummary = spikeCheck(spike, waveform, cd, savePath, plotFlag, reCo
 
         nSamp  = size(waveform.waveform, 4);
         wf.tms = (0:nSamp-1) / WAVE_FS * 1000;
-        Wall   = zeros(0, nSamp);
-        labAll = [];
-        allW   = zeros(0, nSamp);
-        for t = 1:numel(utasks)
+        nTasks = numel(utasks);
+
+        % Gather each task's waveforms into a cell (one slot per task, no
+        % growing concatenation), and preallocate wf.byTask + filter at the
+        % end instead of appending with (end+1).
+        Wcell     = cell(1, nTasks);
+        labCell   = cell(1, nTasks);
+        byTaskBuf = repmat(struct('task', '', 'ci', [], 'W', [], 'meanW', [], ...
+            'snr', NaN, 'widthMs', NaN, 'peakToValley', NaN, 'nSpikes', 0), 1, nTasks);
+        byTaskKeep = false(1, nTasks);
+
+        for t = 1:nTasks
             Wt = gatherUnitWaveforms(waveform, T, r, strcmp(T.task, utasks{t}));
-            Wall   = [Wall; Wt];  labAll = [labAll; t*ones(size(Wt,1),1)]; %#ok<AGROW>
+            Wcell{t}   = Wt;
+            labCell{t} = t * ones(size(Wt,1), 1);
             if isempty(Wt);  continue;  end
             f = extractWaveformFeatures(Wt, WAVE_FS);
-            wf.byTask(end+1) = struct('task', utasks{t}, 'ci', t, 'W', Wt, ...
+            byTaskBuf(t) = struct('task', utasks{t}, 'ci', t, 'W', Wt, ...
                 'meanW', mean(Wt, 1, 'omitnan'), 'snr', f.snr, 'widthMs', f.widthMs, ...
                 'peakToValley', f.peakToValley, 'nSpikes', f.nSpikes);
-            allW = [allW; Wt]; %#ok<AGROW>
+            byTaskKeep(t) = true;
         end
-        if ~isempty(allW)
-            fAll = extractWaveformFeatures(allW, WAVE_FS);
+        wf.byTask = byTaskBuf(byTaskKeep);
+
+        if nTasks == 0
+            Wall   = zeros(0, nSamp);
+            labAll = zeros(0, 1);
+        else
+            Wall   = cat(1, Wcell{:});
+            labAll = cat(1, labCell{:});
+        end
+        if ~isempty(Wall)
+            fAll = extractWaveformFeatures(Wall, WAVE_FS);
             wf.overall = struct('snr', fAll.snr, 'widthMs', fAll.widthMs, ...
                                 'peakToValley', fAll.peakToValley);
         end
-        pca = spikeWaveformPCA(Wall, labAll, numel(utasks));
+        pca = spikeWaveformPCA(Wall, labAll, nTasks);
     end
 
     function storeMetrics(r, st)
@@ -579,16 +627,21 @@ function plotFiringPanel(ax, fr, T, cmap, thresh)
             [0 0 yTop yTop], cmap(fb.ci,:), 'FaceAlpha', 0.10, 'EdgeColor', 'none');
     end
     plot(ax, x, rate, '-', 'Color', [0.6 0.6 0.6], 'LineWidth', 0.75);
-    for j = 1:nTr
-        if isnan(rate(j));  continue;  end
-        if isnan(fr.trialCi(j));  col = [0.4 0.4 0.4];  else;  col = cmap(fr.trialCi(j),:);  end
-        if T.success(j)
-            plot(ax, x(j), rate(j), 'o', 'MarkerFaceColor', col, ...
-                'MarkerEdgeColor', col, 'MarkerSize', 5);
-        else
-            plot(ax, x(j), rate(j), 'o', 'MarkerEdgeColor', col, ...
-                'MarkerFaceColor', 'none', 'MarkerSize', 5);
-        end
+
+    % Per-trial markers, vectorized: one scatter call for filled (successful)
+    % trials and one for open (unsuccessful) trials, instead of one plot() call
+    % per trial -- the same two colour/fill categories, just batched.
+    col = repmat([0.4 0.4 0.4], nTr, 1);
+    hasCi = ~isnan(fr.trialCi);
+    col(hasCi, :) = cmap(fr.trialCi(hasCi), :);
+    valid = ~isnan(rate);
+    succ  = valid & T.success(:);
+    openM = valid & ~T.success(:);
+    if any(succ)
+        scatter(ax, x(succ), rate(succ), 5^2*pi/4, col(succ,:), 'o', 'filled');
+    end
+    if any(openM)
+        scatter(ax, x(openM), rate(openM), 5^2*pi/4, col(openM,:), 'o');
     end
     for b = 1:numel(fr.blocks)
         fb = fr.blocks(b);

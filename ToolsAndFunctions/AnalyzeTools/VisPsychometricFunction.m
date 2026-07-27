@@ -9,7 +9,12 @@ function [pse, threshold, psy] = VisPsychometricFunction(psymat, plot_flag)
 % plot_flag, optional, 1:plot psychometric function, 0: do not plot
 % Output:
 % pse: the mu, bias
-% threshold: the sd
+% threshold: the sd (= 1/slope). Constrained > 0: the slope is fit as b1 = exp(g),
+%      so a reversed (wrong-way) curve can no longer yield a negative threshold; it
+%      is pushed to the boundary (b1 -> 0+, i.e. a large positive threshold that a
+%      caller's upper-bound guard, e.g. thr > 1000 -> NaN, then flags). When the
+%      unconstrained slope is already positive the constraint is inactive and the
+%      result is unchanged.
 % psy: everything the psychometric plot is drawn from, so a caller can draw
 %      its own (several fits on one axes, say) without refitting:
 %   .stim_levels - unique signed stimulus levels (stimulus .* direction)
@@ -36,14 +41,36 @@ function [pse, threshold, psy] = VisPsychometricFunction(psymat, plot_flag)
     pRight = accumarray(idx, choice_response==1, [], @mean);
     nLevel = accumarray(idx, 1);
 
-    % Fitting with logistic regression
+    % Fitting with logistic regression (unconstrained MLE) -- used as the seed.
     psy_tbl = table(stimulus_dir(:), choice_response(:), ...
             'VariableNames', {'stimulus_dir','response'});
     fitted_psy = fitglm(psy_tbl, 'response ~ stimulus_dir', 'Distribution', 'binomial');
     b0 = fitted_psy.Coefficients.Estimate(1);
     b1 = fitted_psy.Coefficients.Estimate(2);
 
-    % Get bias and threshold
+    separable = isSeparable(pRight);
+
+    % threshold = 1/b1, so a threshold above zero means a positive slope. The
+    % unconstrained fit does not enforce that: a reversed (wrong-way) curve gives
+    % b1 < 0 and a meaningless negative threshold. Refit under the positive-slope
+    % constraint b1 = exp(g) > 0 (a stable binomial-NLL fminsearch, base MATLAB) so
+    % the threshold parameter is constrained above zero. Only the non-separable
+    % b1 <= 0 case needs it: separable data is monotone ascending (slope already
+    % positive, unbounded, flagged unreliable by callers), and when the seed slope
+    % is already positive the constraint is inactive and the seed is the answer --
+    % so well-behaved fits are left untouched.
+    if ~separable && b1 <= 0
+        x = stimulus_dir(:);
+        y = (choice_response(:) == 1);
+        nll = @(p) sum( y .* softplus(-(p(1) + exp(p(2)) * x)) ...
+                      + (1 - y) .* softplus(  p(1) + exp(p(2)) * x ) );
+        seed  = [b0, log(max(abs(b1), 1e-6))];
+        phat  = fminsearch(nll, seed, optimset('Display', 'off'));
+        b0 = phat(1);
+        b1 = exp(phat(2));
+    end
+
+    % Get bias and threshold from the (now positive-slope) coefficients.
     pse = -b0 / b1;
     threshold = 1/b1;
 
@@ -63,7 +90,7 @@ function [pse, threshold, psy] = VisPsychometricFunction(psymat, plot_flag)
 
     psy = struct('stim_levels', stim_levels, 'pRight', pRight, 'n', nLevel, ...
                  'fit_x', fit_x, 'fit_y', fit_y, 'b0', b0, 'b1', b1, ...
-                 'separable', isSeparable(pRight), 'nTrials', TotalTrials);
+                 'separable', separable, 'nTrials', TotalTrials);
 
     %% Plot Psychometric function
     if plot_flag
@@ -112,6 +139,12 @@ function [pse, threshold, psy] = VisPsychometricFunction(psymat, plot_flag)
 
 end
 
+
+function s = softplus(z)
+% Numerically stable log(1+exp(z)) = -log(sigmoid(z)), so the logistic
+% log-likelihood never overflows/underflows at large |z| (steep slopes).
+    s = max(z, 0) + log1p(exp(-abs(z)));
+end
 
 function tf = isSeparable(pRight)
 % True when some stimulus value splits the choices perfectly, so the logistic

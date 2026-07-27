@@ -493,12 +493,13 @@ function det = detectSaccade(t, x, y, cfg, mk, useDegThr)
             iOffBase = iEndStart;
         end
         
-        while iOffBase > 1 && speed(iOffBase + 1) > thr3sd
+        while iOffBase < length(speed) && speed(iOffBase+1) > thr3sd
               iOffBase = iOffBase + 1;
               if iOffBase == length(speed)
                     break;
               end
         end
+        
         
 
             offset_t = tv(iOffBase);
@@ -637,7 +638,7 @@ end
 
 function tbl = buildTable(nTrials, RTtime, ampl, peakVel, startX, startY, endX, endY, durSac)
 % Assemble the per-trial saccade-detail table.
-    Trial = (1:nTrials).';
+    Trial = (0:nTrials-1).';
     tbl = table(Trial, RTtime, ampl, peakVel, startX, startY, endX, endY, durSac, ...
         'VariableNames', {'Trial', 'RTtime', 'SaccadeAmplitude', 'PeakVelocity', ...
                           'StartX', 'StartY', 'EndX', 'EndY', 'SaccadeDuration'});

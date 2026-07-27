@@ -17,6 +17,9 @@ function T = SpikeTrialAlignmentCheck(spike, cd, markers)
 %
 % Output struct T (all fields nTrials x 1, indexed by spike-raster trial):
 %   .valid   - logical, trial matched a trials-table row
+%   .loc     - row index into cd for each raster trial (0 where unmatched), so
+%              callers can subset/re-order cd to the raster order without redoing
+%              the (Session, Trial_number) match
 %   .task    - task string ('' when unmatched)
 %   .success - logical, outcome is 'correct' or 'wrong'
 %   .outcome - raw trial outcome string ('' when unmatched), so callers that need
@@ -37,6 +40,7 @@ function T = SpikeTrialAlignmentCheck(spike, cd, markers)
     valid = loc > 0;
 
     T.valid   = valid;
+    T.loc     = loc;
     T.task    = repmat({''}, ns, 1);
     T.task(valid) = cellstr(string(cd.Task(loc(valid))));
     oc        = repmat({''}, ns, 1);
