@@ -42,14 +42,14 @@ reCompute = true;%Temporarily hardwired here.
 
     % ── Constants (from the reference) ────────────────────────────────────
     ACTIVE_TASK  = 'visual_saccades_experiment';  % this folder = this protocol
-    RF_WIN_MS    = [50, 250];
+    RF_WIN_MS    = [50, 200];
     VIS_WIN_MS   = [-200, 600];
     BIN_MS       = 10;
     PSTH_SIGMA   = 20;
     SMOOTH_SIGMA = 2.5;
     GRID_EDGES   = -20:1:20;
     GRID_CTRS    = (GRID_EDGES(1:end-1) + GRID_EDGES(2:end)) / 2;
-    ECC_EDGES    = [0, 7, 14, 25];      % deg; band upper edge is inclusive per band
+    ECC_EDGES    = [0, 8, 14, 25];      % deg; band upper edge is inclusive per band
     nRings       = numel(ECC_EDGES) - 1;
     RF_EXTRAP_MIN = 10;
     N_SECTORS    = 8 * nRings;          % 8 compass octants x nRings eccentricity bands
@@ -411,10 +411,11 @@ reCompute = true;%Temporarily hardwired here.
             mk = cd.Target_1_presented;
         else
             if ismember('RTtime', cd.Properties.VariableNames)
-                mk = cd.RTtime;
+                mk = cd.RTtime + cd.Fixation_point_off;
             else
                 disp('Use approximate RT(fixation off)');
-                mk = cd.Choicetime - cd.Fixation_point_off;   % seconds
+               % mk = cd.Choicetime - cd.Fixation_point_off;   % seconds
+                mk = cd.Choicetime;
             end
         end
         mRelKt = mk - start;

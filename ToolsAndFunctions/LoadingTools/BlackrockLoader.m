@@ -7,8 +7,14 @@ classdef BlackrockLoader < handle
 %   <CommentPrefix_primary>-*.nev  -> experiment comments + comment timing
 %   <CommentPrefix_legacy>-*.nev   -> legacy fallback for comments
 %   <SpikePrefix>-*.nev            -> online spike timing
-%   <AnalogPrefix>-*.ns2           -> online analog (eye) data/ photodiod
-%   data
+%   <EyePrefix>-*.ns2           -> eye data (and, by default, the photodiode)
+%   <LFPPrefix>-*.ns2              -> local field potential (Hub-*.ns2 by default)
+%   photodiode                     -> by default, channels PhotodiodeChannels
+%                                      sliced from the eye <EyePrefix>-*.ns2
+%                                      stream; falls back to (or, if
+%                                      PhotodiodeUseSeparateFile is set, goes
+%                                      straight to) a dedicated
+%                                      <PhotodiodePrefix>-*.ns4 file
 % Legacy exception: in early sessions comments AND spikes were both written to
 % the HUB-*.nev file, so comments fall back from NSP to HUB.
 %
@@ -22,12 +28,24 @@ classdef BlackrockLoader < handle
 % or drive it step by step (each step stores its result in a loader property):
 %   loader.load(DataFolder);   % -> loader.Loaded
 %   loader.parseEvents();      % -> loader.Trials, loader.Experiment
-%   loader.parseAnalog();      % -> loader.Analog
+%   loader.parseEye();      % -> loader.Eye
+%   loader.parseLFP();         % -> loader.LFP
+%   loader.parsePhotodiode();  % -> loader.Photodiode
 %   loader.parseSpikes();      % -> loader.Spike, loader.SpikeWaveformData
 %   loader.prepareExport();    % -> loader.Export (trials table + expmeta lines)
 %   loader.export(OutputPath, 'Blackrock_2026-06-24');   % writes the files
 % Session state is cleared at the start of every load(), so one loader can be
 % reused across a batch of folders without leaking data between them.
+%
+% Precision rule: VOLTAGES are single, TIMES are always double.
+%   single  - segmented sample values (Eye/LFP/Photodiode .data, spike
+%             waveforms, the 0/1 raster). Half the memory, and still ~300x finer
+%             than the ADC quantum these values are stored on.
+%   double  - every timestamp, everywhere: comment/event times, spike times,
+%             trial Start/End, timeseq.alignedrawtime, timeseq.relative_time,
+%             and waveform_time. Recording clocks run to ~1.5e9 s absolute and
+%             down to nanosecond PTP ticks, so single would lose real
+%             resolution. Never narrow a time field.
 %
 % Last updates of the comments --June 27th, 2026
 % by Xuefei Yu
@@ -37,17 +55,52 @@ classdef BlackrockLoader < handle
         CommentPrefix_primary = 'NSP'    % NSP-*.nev: comments + comment timing
         CommentPrefix_legacy  = 'HUB'    % legacy fallback for comments
         SpikePrefix           = 'HUB'    % HUB-*.nev: online spike timing
-        AnalogPrefix          = 'NSP'    % NSP-*.ns2: analog/eye data
-        AnalogIdentifier      = '*.ns2'  % analog data extension
+        EyePrefix          = 'NSP'    % NSP-*.ns2: eye (+ photodiode) data
+        EyeIdentifier      = '*.ns2'  % eye stream extension
+        LFPPrefix             = 'Hub'    % Hub-*.ns2: local field potential
+        LFPIdentifier         = '*.ns2'  % LFP data extension (mirrors EyeIdentifier)
+
+        % --- channel layout of the eye EyePrefix-*.ns2 stream ---
+        % The eye file carries both signals, so it is read and segmented ONCE
+        % and the resulting per-trial array is split by row: EyeChannels ->
+        % obj.Eye, PhotodiodeChannels -> obj.Photodiode.
+        EyeChannels               = [1 2 3]  % row indices that carry eye signal
+
+        % --- photodiode: sliced from the eye ns2 stream by default, else a
+        % dedicated separate file ---
+        PhotodiodeChannels        = [4 5 6]  % row indices in the eye EyePrefix-*.ns2 stream
+        PhotodiodePrefix          = 'NSP'    % fallback/forced separate-file prefix
+        PhotodiodeIdentifier      = '*.ns4'  % fallback/forced separate-file extension
+        PhotodiodeUseSeparateFile = false    % true = skip the ns2 slice attempt and
+                                              % load the separate file directly
 
         % --- what to load ---
-        LoadAnalogData        = false
+        LoadEyeData        = false
+        LoadLFPData           = false
+        LoadPhotodiodeData    = false
         LoadOnlineSpikeData   = false
         LoadOnlineSpikeWaveform     = false    % opt-in: extract per-spike waveforms (uV);
                                          % requires LoadOnlineSpikeData; exported to its own .mat
         IncludeUnsorted       = false    % keep unit 0 (unsorted) + unit 255 (noise) spikes;
                                          % default false drops both before segmentation.
                                          % Source-agnostic: applies to online or offline spikes
+
+        % --- runtime behaviour ---
+        Verbose            = false   % print the per-event parsing chatter from parseEvents.
+                                     % Off by default: command-window output is slow, and an
+                                     % unrecognised comment format would otherwise emit several
+                                     % lines per event across ~1e5 events. Problems still
+                                     % surface as warnings when this is off.
+        FreeRawAfterParse  = true    % release each raw continuous stream as soon as its
+                                     % per-trial product exists, instead of holding raw +
+                                     % segmented copies of every stream until the next load().
+                                     % Set false to keep obj.Loaded fully inspectable.
+        CompressExport     = true    % gzip the .mat exports. On by default: these arrays are
+                                     % mostly NaN padding and compress ~6x (measured 9.0 GB
+                                     % -> 1.45 GB for one session), which is worth more than
+                                     % the ~60 s of single-threaded gzip it costs. Set false
+                                     % to spend the disk instead when turning a session
+                                     % around quickly.
 
         % --- parsing schema (filled by static factories if left empty) ---
         TrialTemplate         % struct of NaN-initialised trial fields
@@ -64,10 +117,20 @@ classdef BlackrockLoader < handle
     properties (SetAccess = private)
         % --- per-folder session state, populated by the pipeline steps and
         % cleared at the start of every load() (see resetSession) ---
-        Loaded            % the S struct from loadSession (events, spikes, analog, statuses, flags)
+        Loaded            % the S struct from loadSession (events, spikes, continuous streams, statuses, flags)
         Trials            % struct array from parseEvents
         Experiment        % struct array from parseEvents
-        Analog            % segmentAnalog output   ([] when analog not loaded)
+        TrialStartTicks   % uint64, one per trial: the Start marker's raw clock
+                          % tick, parallel to Trials. Lets per-spike times be
+                          % measured from Start exactly (see segmentSpikeWaveforms);
+                          % 0 where no Start was seen, [] when the comment source
+                          % carried no ticks.
+        Eye               % per-trial eye slices: segmentContinuous output restricted to
+                          % EyeChannels ([] when the eye stream was not loaded).
+                          % Named for its contents, not its source file -- the
+                          % EyePrefix-*.ns2 also carries the photodiode.
+        LFP               % segmentContinuous output   ([] when LFP not loaded)
+        Photodiode        % segmentContinuous output   ([] when photodiode not loaded)
         Spike             % segmentSpikes output   ([] when spikes not loaded)
         SpikeWaveformData % segmentSpikeWaveforms output ([] unless waveforms on)
         Export            % struct: .trials_table (table) + .expmeta_lines (cellstr)
@@ -89,15 +152,32 @@ classdef BlackrockLoader < handle
 
         function processFolder(obj, DataFolder, OutputPath, BaseName)
         % Run the whole pipeline for one date folder:
-        %   load -> parseEvents -> parseAnalog -> parseSpikes -> prepareExport -> export
+        %   load -> parseEvents -> parseEye -> parseLFP -> parsePhotodiode
+        %        -> parseSpikes -> prepareExport -> export
         % Exceptions propagate so a batch driver's per-folder try/catch can mark
         % just this folder failed and keep going.
-            obj.load(DataFolder);
-            obj.parseEvents();
-            obj.parseAnalog();
-            obj.parseSpikes();
-            obj.prepareExport();
-            obj.export(OutputPath, BaseName);
+        %
+        % Each stage's wall time is printed as it finishes, so a slow folder
+        % shows which stage is responsible without needing the profiler.
+            stage_names = {'load', 'parseEvents', 'parseEye', 'parseLFP', ...
+                           'parsePhotodiode', 'parseSpikes', 'prepareExport', 'export'};
+            stage_times = zeros(1, numel(stage_names));
+
+            t = tic; obj.load(DataFolder);            stage_times(1) = toc(t);
+            t = tic; obj.parseEvents();               stage_times(2) = toc(t);
+            t = tic; obj.parseEye();               stage_times(3) = toc(t);
+            t = tic; obj.parseLFP();                  stage_times(4) = toc(t);
+            t = tic; obj.parsePhotodiode();           stage_times(5) = toc(t);
+            t = tic; obj.parseSpikes();               stage_times(6) = toc(t);
+            t = tic; obj.prepareExport();             stage_times(7) = toc(t);
+            t = tic; obj.export(OutputPath, BaseName); stage_times(8) = toc(t);
+
+            % interleave name/time so one fprintf prints the whole table
+            stage_report = [stage_names; num2cell(stage_times)];
+            fprintf('\n--- Stage timing (s) ---\n');
+            fprintf('  %-16s %8.2f\n', stage_report{:});
+            fprintf('  %-16s %8.2f\n', 'TOTAL', sum(stage_times));
+            fprintf('------------------------\n');
         end
 
         function load(obj, DataFolder)
@@ -108,62 +188,74 @@ classdef BlackrockLoader < handle
 
             S = obj.Loaded;
             fprintf('\n--- Loaded Blackrock data ---\n');
-            fprintf('  Comments: %s\n', S.comments_source);
-            fprintf('  Analog:   %s\n', S.analog_status);
-            fprintf('  Spikes:   %s\n', S.spike_status);
+            fprintf('  Comments:   %s\n', S.comments_source);
+            fprintf('  Eye:        %s\n', S.eye_status);
+            fprintf('  LFP:        %s\n', S.lfp_status);
+            fprintf('  Photodiode: %s\n', S.photodiode_status);
+            fprintf('  Spikes:     %s\n', S.spike_status);
             fprintf('-----------------------------\n');
         end
         
 
         function S = loadSession(obj, DataFolder)
         % Orchestrator: assemble one date folder's Blackrock products into the
-        % session struct S by delegating to loadComments / loadAnalog /
+        % session struct S by delegating to loadComments / loadContinuous /
         % loadSpikes. Throws ONLY when comments cannot be obtained (loadComments
         % throws uncaught, so the caller's per-folder try/catch fails just that
-        % folder). Analog/spikes are gated by the load flags and fail soft:
+        % folder). Continuous streams and spikes are gated by the load flags and fail soft:
         % their throws are caught here, recorded in a status string, and that
         % product is skipped.
 
             % defaults so every field exists on return
             S.Events           = [];
             S.EventTime        = [];
+            S.EventTick        = uint64([]);
+            S.EventTimeRes     = [];
             S.comments_source  = '';
             S.online_spike     = BlackrockLoader.spikeContainer();  % generic raw-spike container
             S.spike_status     = 'not requested';
             S.nsxdata          = [];
+            S.uv_per_digit     = [];
             S.nsx_samplingrate = [];
             S.nsx_abs_time     = [];
-            S.analog_status    = 'not requested';
-            S.LoadAnalogData      = obj.LoadAnalogData;
+            S.eye_status    = 'not requested';
+            S.lfp_nsxdata          = [];
+            S.lfp_uv_per_digit     = [];
+            S.lfp_samplingrate     = [];
+            S.lfp_abs_time         = [];
+            S.lfp_timeresolution   = [];
+            S.lfp_status           = 'not requested';
+            S.photodiode_nsxdata        = [];
+            S.photodiode_uv_per_digit   = [];
+            S.photodiode_samplingrate   = [];
+            S.photodiode_abs_time       = [];
+            S.photodiode_timeresolution = [];
+            S.photodiode_status         = 'not requested';
+            % true when the photodiode rides in the eye ns2 stream, so it is
+            % segmented together with the eye channels in one pass instead of
+            % holding and re-cutting its own copy (see parseEye).
+            S.photodiode_from_eye       = false;
+            S.LoadEyeData      = obj.LoadEyeData;
+            S.LoadLFPData         = obj.LoadLFPData;
+            S.LoadPhotodiodeData  = obj.LoadPhotodiodeData;
             S.LoadOnlineSpikeData = obj.LoadOnlineSpikeData;
             S.LoadOnlineSpikeWaveform   = obj.LoadOnlineSpikeWaveform;
             S.IncludeUnsorted           = obj.IncludeUnsorted;
             S.timeresolution = [];
 
+            % Parsed .nev structs shared between loadComments and loadSpikes for
+            % this folder only: on legacy recordings both live in the same HUB
+            % file, and parsing it costs a full read of a multi-GB file. Local,
+            % so it is released when this call returns.
+            nevCache = containers.Map('KeyType', 'char', 'ValueType', 'any');
+
             % --- Comments + comment timing (required): throws if none found ---
-            C = obj.loadComments(DataFolder);
+            C = obj.loadComments(DataFolder, nevCache);
             S.Events          = C.Events;
             S.EventTime       = C.EventTime;
+            S.EventTick       = C.EventTick;
+            S.EventTimeRes    = C.TimeRes;
             S.comments_source = C.comments_source;
-
-
-            % --- Online analog / eye data (gated, soft failure) ---
-            if S.LoadAnalogData
-                try
-                    % [] keeps obj.AnalogIdentifier; the prefix must be passed
-                    % explicitly since loadAnalog defaults to match-any.
-                    A = obj.loadAnalog(DataFolder, [], obj.AnalogPrefix);
-                    S.nsxdata          = A.nsxdata;
-                    S.nsx_samplingrate = A.nsx_samplingrate;
-                    S.nsx_abs_time     = A.nsx_abs_time;
-                    S.timeresolution   = A.timeresolution;
-                    S.analog_status    = A.analog_status;
-                catch ME_ana
-                    S.LoadAnalogData = false;
-                    S.analog_status = ['failed: ' ME_ana.message];
-                    warning('%s', ['Analog loading ' S.analog_status]);
-                end
-            end
 
              % Waveforms reuse the online-spike products, so they need spikes on.
             if obj.LoadOnlineSpikeWaveform && ~S.LoadOnlineSpikeData
@@ -171,10 +263,14 @@ classdef BlackrockLoader < handle
                     'spike waveforms need online spikes and are skipped.']);
             end
 
-             % --- Online spike timing (gated, soft failure) ---
+            % --- Online spike timing (gated, soft failure) ---
+            % Deliberately loaded right after comments, before the continuous files:
+            % on legacy recordings both come from the same HUB .nev, so running
+            % them back-to-back lets the shared parse be dropped below instead of
+            % staying resident through the (much larger) continuous-stream loads.
             if S.LoadOnlineSpikeData
                 try
-                    R = obj.loadSpikes(DataFolder);
+                    R = obj.loadSpikes(DataFolder, nevCache);
                     S.online_spike = R.online_spike;
                     S.spike_status = R.spike_status;
                 catch ME_spk
@@ -183,17 +279,116 @@ classdef BlackrockLoader < handle
                     warning('%s', ['Spike loading ' S.spike_status]);
                 end
             end
+            remove(nevCache, keys(nevCache));   % every .nev consumer is done
+
+            % --- Eye data, from the EyePrefix-*.ns2 (gated, soft failure) ---
+            if S.LoadEyeData
+                try
+                    % [] keeps obj.EyeIdentifier; the prefix must be passed
+                    % explicitly since loadContinuous defaults to match-any.
+                    A = obj.loadContinuous(DataFolder, [], obj.EyePrefix);
+                    S.nsxdata          = A.nsxdata;
+                    S.uv_per_digit     = A.uv_per_digit;
+                    S.nsx_samplingrate = A.nsx_samplingrate;
+                    S.nsx_abs_time     = A.nsx_abs_time;
+                    S.timeresolution   = A.timeresolution;
+                    S.eye_status    = A.status;
+                catch ME_ana
+                    S.LoadEyeData = false;
+                    S.eye_status = ['failed: ' ME_ana.message];
+                    warning('%s', ['Eye loading ' S.eye_status]);
+                end
+            end
+
+            % --- LFP (gated, soft failure). Independent of the eye stream:
+            % same logic as loadContinuous above, different file schema. ---
+            if S.LoadLFPData
+                try
+                    A = obj.loadContinuous(DataFolder, obj.LFPIdentifier, obj.LFPPrefix);
+                    S.lfp_nsxdata        = A.nsxdata;
+                    S.lfp_uv_per_digit   = A.uv_per_digit;
+                    S.lfp_samplingrate   = A.nsx_samplingrate;
+                    S.lfp_abs_time       = A.nsx_abs_time;
+                    S.lfp_timeresolution = A.timeresolution;
+                    S.lfp_status         = A.status;
+                catch ME_lfp
+                    S.LoadLFPData = false;
+                    S.lfp_status = ['failed: ' ME_lfp.message];
+                    warning('%s', ['LFP loading ' S.lfp_status]);
+                end
+            end
+
+            % --- Photodiode (gated, soft failure). By default it rides in the
+            % eye ns2 stream just loaded above, on rows PhotodiodeChannels. In
+            % that case NOTHING is copied here: the eye stream is segmented once
+            % in parseEye and the result is split by row, so we only record
+            % that the photodiode comes from there. Falls back to (or, if
+            % PhotodiodeUseSeparateFile is set, goes straight to) a dedicated
+            % separate file using all of its channels. ---
+            if S.LoadPhotodiodeData
+                try
+                    if obj.PhotodiodeUseSeparateFile
+                        A = obj.loadContinuous(DataFolder, obj.PhotodiodeIdentifier, obj.PhotodiodePrefix);
+                        S.photodiode_nsxdata        = A.nsxdata;   % all channels in the dedicated file
+                        S.photodiode_uv_per_digit   = A.uv_per_digit;
+                        S.photodiode_samplingrate   = A.nsx_samplingrate;
+                        S.photodiode_abs_time       = A.nsx_abs_time;
+                        S.photodiode_timeresolution = A.timeresolution;
+                        S.photodiode_status         = A.status;
+                    elseif S.LoadEyeData && size(S.nsxdata, 1) >= max(obj.PhotodiodeChannels)
+                        S.photodiode_from_eye       = true;
+                        S.photodiode_samplingrate   = S.nsx_samplingrate;
+                        S.photodiode_abs_time       = S.nsx_abs_time;
+                        S.photodiode_timeresolution = S.timeresolution;
+                        S.photodiode_status = sprintf('ok (channels %s of the eye ns2)', ...
+                            mat2str(obj.PhotodiodeChannels));
+                    else
+                        A = obj.loadContinuous(DataFolder, obj.PhotodiodeIdentifier, obj.PhotodiodePrefix);
+                        S.photodiode_nsxdata        = A.nsxdata;   % all channels present
+                        S.photodiode_uv_per_digit   = A.uv_per_digit;
+                        S.photodiode_samplingrate   = A.nsx_samplingrate;
+                        S.photodiode_abs_time       = A.nsx_abs_time;
+                        S.photodiode_timeresolution = A.timeresolution;
+                        S.photodiode_status         = A.status;
+                    end
+                catch ME_pd
+                    S.LoadPhotodiodeData = false;
+                    S.photodiode_status = ['failed: ' ME_pd.message];
+                    warning('%s', ['Photodiode loading ' S.photodiode_status]);
+                end
+            end
         end
 
-          function C = loadComments(obj, DataFolder)
+          function C = loadComments(obj, DataFolder, nevCache)
         % Load comment strings + their timing from one date folder (required
         % product). Resolves the .nev by role prefix: NSP primary, then HUB
         % (legacy recordings kept comments in the HUB file). Returns a struct
-        % with .Events, .EventTime, .comments_source. Throws if neither file
+        % with .Events, .EventTime, .EventTick, .TimeRes, .comments_source.
+        %
+        % EventTick is the raw uint64 clock ticks; EventTime is the same instants
+        % in seconds, DERIVED from the ticks in commentFields (one place, so the
+        % two cannot drift). Both are kept because they serve different jobs:
+        % seconds is what the rest of the pipeline computes in, while ticks are
+        % needed wherever an exact DIFFERENCE matters. These are absolute epoch
+        % timestamps (~1.5e18 ns), so in seconds they land in a binade where a
+        % double resolves only ~238 ns, and any time obtained by subtracting two
+        % such seconds inherits that error from both operands. Subtracting the
+        % ticks first and dividing after is exact -- see segmentSpikeWaveforms.
+        % Throws if neither file
         % carries comments -- comments are mandatory for downstream parsing.
         % Pure: opens only the .nev it needs, touches no session state.
+        %
+        % nevCache is an optional containers.Map of already-parsed NEV structs
+        % keyed by full path (see loadSession). Legacy recordings keep comments
+        % AND spikes in the same HUB file, which loadSpikes then wants too, so
+        % sharing the cache saves a second full parse of a multi-GB file. Note
+        % openNEV's 'noread' is NOT a cheaper alternative here: it skips the
+        % comment packets along with the waveforms.
+            if nargin < 3; nevCache = []; end
             C.Events          = [];
             C.EventTime       = [];
+            C.EventTick       = uint64([]);   % raw integer clock ticks (see below)
+            C.TimeRes         = [];           % ticks per second for EventTick
             C.comments_source = '';
 
             nev_all = dir(fullfile(DataFolder, '*.nev'));
@@ -201,19 +396,16 @@ classdef BlackrockLoader < handle
             hub_nev = BlackrockLoader.pickByPrefix(nev_all, obj.CommentPrefix_legacy);   % '' if none
 
             if ~isempty(nsp_nev)
-                nsp_data = openNEV(fullfile(DataFolder, nsp_nev), 'report', 'nosave');
+                nsp_data = BlackrockLoader.openNevCached(fullfile(DataFolder, nsp_nev), nevCache);
                 if BlackrockLoader.hasComments(nsp_data)
-                    C.Events          = nsp_data.Data.Comments.Text;
-                    C.EventTime       = nsp_data.Data.Comments.TimeStampSec;
-                    C.comments_source = nsp_nev;
+                    C = BlackrockLoader.commentFields(nsp_data, nsp_nev);
                 end
             end
             if isempty(C.comments_source) && ~isempty(hub_nev)
-                hub_data = openNEV(fullfile(DataFolder, hub_nev), 'report', 'nosave');
+                hub_data = BlackrockLoader.openNevCached(fullfile(DataFolder, hub_nev), nevCache);
                 if BlackrockLoader.hasComments(hub_data)
-                    C.Events          = hub_data.Data.Comments.Text;
-                    C.EventTime       = hub_data.Data.Comments.TimeStampSec;
-                    C.comments_source = hub_nev;   % legacy: comments live in the HUB file
+                    % legacy: comments live in the HUB file
+                    C = BlackrockLoader.commentFields(hub_data, hub_nev);
                 end
             end
             if isempty(C.comments_source)
@@ -222,31 +414,39 @@ classdef BlackrockLoader < handle
             end
         end
 
-        function A = loadAnalog(obj, DataFolder, postFix, preFix)
-        % Load analog / eye data for one date folder. Returns a struct with
-        % .nsxdata (uV), .nsx_samplingrate, .nsx_abs_time, .timeresolution, and
-        % .analog_status. Throws if no matching analog file is present or if the
-        % user cancels the multi-file selection dialog; the orchestrator
-        % (loadSession) turns such throws into a soft status string.
+        function A = loadContinuous(obj, DataFolder, postFix, preFix)
+        % Load ONE continuous (.nsx) stream for a date folder -- eye, LFP or
+        % photodiode, depending on the prefix/extension asked for. Returns a struct with
+        % .nsxdata, .uv_per_digit, .nsx_samplingrate, .nsx_abs_time,
+        % .timeresolution, and .status. Throws if no matching file
+        % is present or if the user cancels the multi-file selection dialog; the
+        % orchestrator (loadSession) turns such throws into a soft status string.
         % Pure: opens only the .nsx it needs, touches no session state.
+        %
+        % .nsxdata is RAW int16 as stored on disk, not uV. openNSx's 'uv' option
+        % forces the whole array to double (4x the file size in RAM, and these
+        % files run to hundreds of MB), so instead we keep the samples int16 and
+        % return .uv_per_digit -- the per-channel scale factor, nChan x 1 --
+        % alongside. segmentContinuous applies it per trial slice, converting only
+        % the data that is actually kept. uV = double(nsxdata) .* uv_per_digit.
         %
         % Both overrides apply to this call only and leave the config properties
         % untouched:
         %   postFix -- file extension. Accepts '.ns6', 'ns6' or '*.ns6'.
-        %              Omitted/empty -> obj.AnalogIdentifier ('*.ns2').
+        %              Omitted/empty -> obj.EyeIdentifier ('*.ns2').
         %              Note .ns6 is 30 kHz broadband, ~30x the samples of a .ns2.
         %   preFix  -- filename prefix, e.g. 'NSP' or 'Hub1'. Omitted/empty ->
         %              no prefix filter, i.e. any file with that extension
         %              (several matches raise the selection dialog).
-        %              loadSession always passes obj.AnalogPrefix, so the
+        %              loadSession always passes obj.EyePrefix, so the
         %              pipeline stays prefix-pinned.
         %
-        %   loadAnalog(f)                  % '*.ns2', any prefix
-        %   loadAnalog(f, '.ns6')          % '*.ns6', any prefix
-        %   loadAnalog(f, '.ns6', 'NSP')   % '*.ns6', NSP only
-        %   loadAnalog(f, [], 'Hub1')      % '*.ns2', Hub1 only
+        %   loadContinuous(f)                  % '*.ns2', any prefix
+        %   loadContinuous(f, '.ns6')          % '*.ns6', any prefix
+        %   loadContinuous(f, '.ns6', 'NSP')   % '*.ns6', NSP only
+        %   loadContinuous(f, [], 'Hub1')      % '*.ns2', Hub1 only
             if nargin < 3 || isempty(postFix)
-                ident = obj.AnalogIdentifier;
+                ident = obj.EyeIdentifier;
             else
                 ident = postFix;
                 if ~startsWith(ident, '*')
@@ -259,10 +459,11 @@ classdef BlackrockLoader < handle
             end
 
             A.nsxdata          = [];
+            A.uv_per_digit     = [];
             A.nsx_samplingrate = [];
             A.nsx_abs_time     = [];
             A.timeresolution   = [];
-            A.analog_status    = '';
+            A.status    = '';
 
             % No prefix -> take every match; filterByPrefix cannot express
             % match-any (its '^' regex returns a zero-length match, which reads
@@ -273,7 +474,7 @@ classdef BlackrockLoader < handle
             end
             if isempty(ns_list)
                 if isempty(preFix); prefix_desc = 'any-prefix'; else; prefix_desc = preFix; end
-                error('No %s %s analog file found.', prefix_desc, ident);
+                error('No %s %s continuous file found.', prefix_desc, ident);
             end
             ns_names = {ns_list.name};
             if numel(ns_names) > 1
@@ -281,44 +482,63 @@ classdef BlackrockLoader < handle
                     sprintf('Select eye (%s) file to load (Cancel = skip):', ident), ...
                     'SelectionMode', 'single', 'ListString', ns_names, 'ListSize', [400 200]);
                 if ~ok
-                    error('Analog file selection cancelled by user.');
+                    error('Continuous file selection cancelled by user.');
                 end
                 Filename_ns = ns_names{sel};
             else
                 Filename_ns = ns_names{1};
             end
 
-            tmp_ana_data = openNSx(fullfile(DataFolder, Filename_ns), 'read', 'report', 'uv');
-            A.nsxdata          = tmp_ana_data.Data;                       % in uV
+            % 'int16' keeps the samples as stored; the uV conversion is deferred
+            % to segmentContinuous via uv_per_digit (see the header comment).
+            % Reading without 'uv' makes NPMK warn about the raw units and then
+            % PROMPT for a keypress, which would stall a batch run, so the
+            % warning is muted for the duration of the call and the user's
+            % NPMK setting restored afterwards.
+            restoreWarn = BlackrockLoader.muteNpmkUvPrompt();
+            cleanup = onCleanup(restoreWarn);
+            tmp_ana_data = openNSx(fullfile(DataFolder, Filename_ns), 'read', 'report', 'int16');
+            clear cleanup   % restore now rather than at function exit
+            A.nsxdata          = tmp_ana_data.Data;                       % raw int16
+            % Same per-channel factor openNSx applies for 'uv' (MaxAnalogValue
+            % over MaxDigiValue), kept as a column so it broadcasts down the
+            % channel dimension of a chan x samples slice.
+            A.uv_per_digit     = double([tmp_ana_data.ElectrodesInfo.MaxAnalogValue])' ./ ...
+                                 double([tmp_ana_data.ElectrodesInfo.MaxDigiValue])';
             nsx_starttime      = tmp_ana_data.MetaTags.Timestamp;
             nsx_timeresolution = tmp_ana_data.MetaTags.TimeRes;
             A.nsx_samplingrate = tmp_ana_data.MetaTags.SamplingFreq;
             nsx_starttimeSec   = nsx_starttime / nsx_timeresolution;
-            N = length(A.nsxdata);
+            N = size(A.nsxdata, 2);
             nsx_rel_time       = (0:N-1) / A.nsx_samplingrate;            % from start time
             A.nsx_abs_time     = nsx_starttimeSec + nsx_rel_time;
             A.timeresolution   = nsx_timeresolution;
-            A.analog_status    = sprintf('ok (%s)', Filename_ns);
+            A.status    = sprintf('ok (%s)', Filename_ns);
         end
 
-        function R = loadSpikes(obj, DataFolder)
+        function R = loadSpikes(obj, DataFolder, nevCache)
         % Load online spike timing (+ optional waveforms) for one date folder.
         % Opens the HUB-*.nev itself and converts timestamps to seconds using the
         % NEV's OWN clock (MetaTags.TimeRes; falls back to 1e9 if absent), so the
-        % result is independent of whether analog was loaded. Drops unsorted
+        % result is independent of whether the eye stream was loaded. Drops unsorted
         % (unit 0) / noise (unit 255) spikes unless IncludeUnsorted is set.
         % Returns a struct with .online_spike (the generic spike container) and
         % .spike_status. Throws if no HUB file or no spike timestamps are present.
         % Pure: opens only the .nev it needs, touches no session state.
+        %
+        % nevCache is the same optional already-parsed-NEV map loadComments
+        % takes; on legacy recordings both products come out of one HUB file, so
+        % passing it means that file is parsed once per folder instead of twice.
+            if nargin < 3; nevCache = []; end
             R.online_spike = BlackrockLoader.spikeContainer();
             R.spike_status = '';
 
             nev_all = dir(fullfile(DataFolder, '*.nev'));
-            hub_nev = BlackrockLoader.pickByPrefix(nev_all, obj.CommentPrefix_legacy);   % '' if none
+            hub_nev = BlackrockLoader.pickByPrefix(nev_all, obj.SpikePrefix);   % '' if none
             if isempty(hub_nev)
                 error('No %s-*.nev file for online spikes.', obj.SpikePrefix);
             end
-            hub_data = openNEV(fullfile(DataFolder, hub_nev), 'report', 'nosave');
+            hub_data = BlackrockLoader.openNevCached(fullfile(DataFolder, hub_nev), nevCache);
             if ~BlackrockLoader.hasSpikes(hub_data)
                 error('No spike timestamps in %s', hub_nev);
             end
@@ -333,24 +553,29 @@ classdef BlackrockLoader < handle
                 disp('Use empircle time resolution: 10^9')
                 timeRes = 10^9;
             end
-            spikeTimeSec  = double(hub_data.Data.Spikes.TimeStamp)/timeRes;
+            spikeTimeTick = hub_data.Data.Spikes.TimeStamp;   % uint64, exact
+            spikeTimeSec  = double(spikeTimeTick)/timeRes;
             % keep channel identity for per-trial rasterization
             spikeChannel  = hub_data.Data.Spikes.Electrode;
             spikeUnit     = hub_data.Data.Spikes.Unit;
             spikeWaveform = [];   % stays empty unless waveforms are requested
 
-            % Optional per-spike waveforms (opt-in via LoadOnlineSpikeWaveform),
-            % converted to uV. openNEV returns Waveform as [nSamp x nSpikes]
-            % int16 with columns aligned 1:1 to TimeStamp/Electrode/Unit. We scale
-            % here (rather than passing 'uv' to openNEV) so the conversion is
-            % independent of how hub_data was opened. This mirrors openNEV's 'uv'
-            % path exactly: wf_uV = raw .* DigitalFactor(electrode) / 1000.
+            % Optional per-spike waveforms (opt-in via LoadOnlineSpikeWaveform).
+            % openNEV returns Waveform as [nSamp x nSpikes] int16 with columns
+            % aligned 1:1 to TimeStamp/Electrode/Unit. This is the largest array
+            % in the session, so it stays int16 and the uV scale travels beside
+            % it as a per-spike factor; segmentSpikeWaveforms applies it to the
+            % in-window spikes it actually keeps. Same conversion openNEV's 'uv'
+            % path uses: wf_uV = raw .* DigitalFactor(electrode) / 1000.
+            spikeWaveformScale = [];   % 1 x nSpikes uV-per-digit, [] when no waveforms
             if obj.LoadOnlineSpikeWaveform && isfield(hub_data.Data.Spikes, 'Waveform') ...
                     && ~isempty(hub_data.Data.Spikes.Waveform)
-                rawWf   = double(hub_data.Data.Spikes.Waveform);            % [nSamp x nSpikes]
-                elecIdx = double(hub_data.Data.Spikes.Electrode);
-                digi    = double([hub_data.ElectrodesInfo(elecIdx).DigitalFactor]); % 1 x nSpikes
-                spikeWaveform = bsxfun(@times, rawWf, digi/1000);          % uV
+                spikeWaveform = hub_data.Data.Spikes.Waveform;              % [nSamp x nSpikes] int16
+                % Look the factor up per electrode, then index by spike. Building
+                % it as [ElectrodesInfo(elecIdx).DigitalFactor] instead expands a
+                % comma-separated list with one struct element per spike.
+                digiByElectrode = double([hub_data.ElectrodesInfo.DigitalFactor]) / 1000;
+                spikeWaveformScale = digiByElectrode(double(hub_data.Data.Spikes.Electrode));
             end
 
             % Drop unsorted (unit 0) and noise (unit 255) spikes unless opted in.
@@ -359,11 +584,13 @@ classdef BlackrockLoader < handle
             if ~obj.IncludeUnsorted
                 keep = ~ismember(double(spikeUnit), [0 255]);
                 nDropped = sum(~keep);
-                spikeTimeSec = spikeTimeSec(keep);
+                spikeTimeSec  = spikeTimeSec(keep);
+                spikeTimeTick = spikeTimeTick(keep);
                 spikeChannel = spikeChannel(keep);
                 spikeUnit    = spikeUnit(keep);
                 if ~isempty(spikeWaveform)
-                    spikeWaveform = spikeWaveform(:, keep);
+                    spikeWaveform      = spikeWaveform(:, keep);
+                    spikeWaveformScale = spikeWaveformScale(keep);
                 end
                 R.spike_status = sprintf('ok (%s; dropped %d unsorted/noise spikes)', hub_nev, nDropped);
             else
@@ -373,17 +600,20 @@ classdef BlackrockLoader < handle
             % Pack into the generic, source-agnostic container that
             % parseSpikes/segmentSpikes then rasterize per trial.
             R.online_spike.TimeSec  = spikeTimeSec;
+            R.online_spike.TimeTick = spikeTimeTick;
+            R.online_spike.TimeRes  = timeRes;
             R.online_spike.Channel  = spikeChannel;
             R.online_spike.Unit     = spikeUnit;
             R.online_spike.Waveform = spikeWaveform;
             if ~isempty(spikeWaveform)
-                R.online_spike.WaveformUnit = 'microVolts';
+                R.online_spike.WaveformScale = spikeWaveformScale;
+                R.online_spike.WaveformUnit  = 'microVolts';
             end
             R.online_spike.source = 'online';
         end
 
 
-        function [trials, experiment] = parseEvents(obj, Events, EventTime)
+        function [trials, experiment] = parseEvents(obj, Events, EventTime, EventTick)
         % Single pass over the .nev comment strings, building one experiment
         % entry per session and one trials entry per (position-keyed) trial.
         % A single .nev can hold several sessions (task started/stopped), so
@@ -398,6 +628,14 @@ classdef BlackrockLoader < handle
                 Events    = obj.Loaded.Events;
                 EventTime = obj.Loaded.EventTime;
             end
+            if nargin < 4
+                if nargin < 2 && isfield(obj.Loaded, 'EventTick')
+                    EventTick = obj.Loaded.EventTick;
+                else
+                    EventTick = uint64([]);   % caller supplied seconds only
+                end
+            end
+            has_ticks = numel(EventTick) == size(Events, 1);
 
             exp_template       = obj.ExpTemplate;
             trial              = obj.TrialTemplate;
@@ -407,20 +645,52 @@ classdef BlackrockLoader < handle
             information_events = obj.EventMaps.InformationEvents;
             dash_events        = obj.EventMaps.DashEvents;
             outcome_events     = obj.EventMaps.OutcomeEvents;
+            verbose            = obj.Verbose;
 
-            experiment    = exp_template([]);   % empty struct array, grows per session
-            trials        = trial([]);          % empty struct array, grows per trial
+            % keys() on a containers.Map builds (and sorts) a fresh cell array
+            % every call. These lists are fixed for the whole parse, so they are
+            % materialised once here instead of several times per event across
+            % ~1e5 events.
+            exp_event_keys     = keys(exp_events);
+            time_event_keys    = keys(time_events);
+            info_event_keys    = keys(information_events);
+            segment_event_keys = keys(segment_events);
+
+            % Regex patterns, hoisted for the same reason (the combined one was
+            % being re-concatenated on every iteration).
+            exp_pattern      = '^Experiment (start|end):\s*(.+)$';
+            trial_pattern    = '^Trial\s+(\d+):\s*(.*)$';
+            coord_pattern    = '^(.*?)\s*\(\s*([-+]?\d*\.?\d+)\s*,\s*([-+]?\d*\.?\d+)\s*\)\s*deg$';
+            reward_pattern   = '^(.*?)\s*\(([\d\.]+)ms';
+            time_pattern     = '^(.*?)\s+([-+]?\d*\.?\d+|None|none)\s*ms$';
+            size_pattern     = '^(.*?)\s+([-+]?\d*\.?\d+)\s*(?:deg)?$';
+            combined_pattern = [time_pattern, '|', size_pattern];
+
+            EventsNumber = size(Events, 1);
+
+            % Preallocate and grow by doubling, trimming at the end. Extending a
+            % 60+ field struct array one element at a time reallocated the whole
+            % array on every new trial; sizing it to EventsNumber up front would
+            % instead allocate one struct element per comment, most of them
+            % unused. Doubling keeps both bounded.
+            experiment    = repmat(exp_template, 16, 1);
+            trials        = repmat(trial, 1024, 1);
+            % Raw integer tick of each trial's Start marker, parallel to trials.
+            % Kept OUTSIDE the trial struct on purpose: the template is all
+            % doubles and feeds struct2table for the CSV, and a uint64 field
+            % would either break that or be silently demoted back to a double
+            % (losing the exactness this exists for). 0 = not seen.
+            startTicks    = zeros(1024, 1, 'uint64');
             session_index = 0;
             trial_index   = 0;
             prev_trial_number = NaN;
             prev_session      = NaN;
+            n_undefined       = 0;   % events no branch claimed; summarised after the loop
 
-            EventsNumber = size(Events, 1);
             for i = 1:EventsNumber
                 curr_event = Events(i, :);
                 curr_eventtime = EventTime(i);
                 %First check if it is an experimental setup
-                exp_pattern = '^Experiment (start|end):\s*(.+)$';
                 exp_flag = regexp(curr_event, exp_pattern, 'tokens');
                 if ~isempty(exp_flag)
                     %Get the experiment meta data
@@ -431,6 +701,10 @@ classdef BlackrockLoader < handle
                     %(the first line of every metadata block within the recording).
                     if strcmp(exp_marker,'start') && startsWith(exp_token,'git commit')
                         session_index = session_index + 1;
+                        if session_index > numel(experiment)
+                            % doubling, not per-iteration growth: amortised O(1)
+                            experiment = [experiment; repmat(exp_template, numel(experiment), 1)]; %#ok<AGROW>
+                        end
                         experiment(session_index) = exp_template;
                         experiment(session_index).start = curr_eventtime;
                     end
@@ -472,7 +746,6 @@ classdef BlackrockLoader < handle
                             if ~isempty(num_tokens)
                                 event_exp      = strtrim(num_tokens{1}{1});
                                 nums           = cellfun(@str2double,num_tokens{1}(2:end));
-                                exp_event_keys = keys(exp_events);
                                 flag_array     = contains(exp_event_keys,event_exp);
                                 if any(flag_array)
                                     field = exp_events(exp_event_keys{flag_array});
@@ -486,7 +759,7 @@ classdef BlackrockLoader < handle
                 else %Trial data
 
                     %Get trial number and event text
-                     mainTokens = regexp(curr_event, '^Trial\s+(\d+):\s*(.*)$', 'tokens');
+                     mainTokens = regexp(curr_event, trial_pattern, 'tokens');
                      TrialNum_curr = str2double(mainTokens{1}{1}); % Get trial number
                      event_text = strtrim(mainTokens{1}{2}); %Get the remaining events
 
@@ -498,7 +771,7 @@ classdef BlackrockLoader < handle
                     % earlier same-numbered trial. The session test also splits trials that
                     % share a number across two sessions (e.g. session 1 trial 1 vs session 2
                     % trial 1).
-                    if isempty(trials)
+                    if trial_index == 0
                         % first trial event
                         trial_index = 1;
                         trials(trial_index) = trial;
@@ -510,6 +783,11 @@ classdef BlackrockLoader < handle
                         if TrialNum_curr ~= prev_trial_number || session_index ~= prev_session
                             % trial number or session changed -> start a new trial
                             trial_index = trial_index + 1;
+                            if trial_index > numel(trials)
+                                % doubling, not per-iteration growth: amortised O(1)
+                                trials = [trials; repmat(trial, numel(trials), 1)]; %#ok<AGROW>
+                                startTicks = [startTicks; zeros(numel(startTicks), 1, 'uint64')]; %#ok<AGROW>
+                            end
                             currTrial = trial;
                             currTrial.Trial_number = TrialNum_curr;
                             currTrial.Session = session_index;
@@ -520,9 +798,9 @@ classdef BlackrockLoader < handle
                     end
 
                    %go through each type of events
-                   time_flag = contains(event_text, keys(time_events));
-                   info_flag = contains(event_text, keys(information_events));
-                   seg_flag = contains(event_text, keys(segment_events));
+                   time_flag = contains(event_text, time_event_keys);
+                   info_flag = contains(event_text, info_event_keys);
+                   seg_flag = contains(event_text, segment_event_keys);
                    dash_flag = contains(event_text, dash_events) & contains(event_text, '-');
                    outcome_flag = contains(event_text, outcome_events);
                    offset_range_flag = contains(event_text, 'Requested time offset range');
@@ -530,7 +808,6 @@ classdef BlackrockLoader < handle
 
                    if time_flag
                      %Directly assign current time
-                     time_event_keys = keys(time_events);
                      flag_array = contains(time_event_keys,event_text);
                      curr_key = time_event_keys{flag_array};
                      field = time_events(curr_key);
@@ -538,11 +815,17 @@ classdef BlackrockLoader < handle
                      if isnan(trials(trial_index).(field))
                          %First check whether it's already assigned
                         trials(trial_index).(field) = curr_eventtime;
+                        if has_ticks && strcmp(field, 'Start')
+                            % keep the Start marker's exact tick: per-spike times
+                            % are measured from it, and doing that subtraction in
+                            % seconds would inherit ~238 ns of rounding
+                            startTicks(trial_index) = EventTick(i);
+                        end
                      else
                          %Otherwise, put it into the duplicates for further debug
                           trials(trial_index).duplicates(end+1,1) = event_text;
-                          disp('Duplicate found for time event:');
-                          disp(event_text);
+                          if verbose; disp('Duplicate found for time event:'); end
+                          if verbose; disp(event_text); end
 
                      end
 
@@ -551,12 +834,7 @@ classdef BlackrockLoader < handle
 
                    elseif info_flag
                        %Extract values following the event
-                       coord_pattern = '^(.*?)\s*\(\s*([-+]?\d*\.?\d+)\s*,\s*([-+]?\d*\.?\d+)\s*\)\s*deg$';
-                       reward_pattern = '^(.*?)\s*\(([\d\.]+)ms';
-                       time_pattern = '^(.*?)\s+([-+]?\d*\.?\d+|None|none)\s*ms$';
-                       size_pattern = '^(.*?)\s+([-+]?\d*\.?\d+)\s*(?:deg)?$';
-
-
+                       %(coord/reward/time/size/combined patterns are hoisted above the loop)
                        coor_tokens = regexp(event_text, coord_pattern, 'tokens');
                        reward_tokens = regexp(event_text, reward_pattern, 'tokens');
 
@@ -565,8 +843,6 @@ classdef BlackrockLoader < handle
                            %Get the event and coordinate/reward amount
                            event_coord = strtrim(coor_tokens{1}{1});
                            coord = cellfun(@str2double, coor_tokens{1}(2:end));
-
-                           info_event_keys = keys(information_events);
                            flag_array = contains(info_event_keys,event_coord);
                            curr_key = info_event_keys{flag_array};
                            field = information_events(curr_key);
@@ -575,8 +851,8 @@ classdef BlackrockLoader < handle
                                trials(trial_index).(field) = coord;
                            else
                                trials(trial_index).duplicates(end+1,1) = event_coord;
-                                disp('Duplicate found for coor event:');
-                                disp(event_coord);
+                                if verbose; disp('Duplicate found for coor event:'); end
+                                if verbose; disp(event_coord); end
 
                            end
 
@@ -584,8 +860,6 @@ classdef BlackrockLoader < handle
                        elseif ~isempty(reward_tokens)
                            event_reward = strtrim(reward_tokens{1}{1});
                            reward_amount = cellfun(@str2double, reward_tokens{1}(2:end));
-
-                           info_event_keys = keys(information_events);
                            flag_array = contains(info_event_keys,event_reward);
                            curr_key = info_event_keys{flag_array};
                            field = information_events(curr_key);
@@ -593,15 +867,15 @@ classdef BlackrockLoader < handle
                                trials(trial_index).(field) = curr_eventtime;
                            else
                                trials(trial_index).duplicates(end+1,1) = field;
-                               disp('Duplicate found for reward event:');
-                                disp(event_reward);
+                               if verbose; disp('Duplicate found for reward event:'); end
+                                if verbose; disp(event_reward); end
                            end
 
                            if isnan(trials(trial_index).Reward_amount)
                                 trials(trial_index).Reward_amount = reward_amount;
                            else
                                trials(trial_index).duplicates(end+1,1) = 'Reward_amount';
-                               disp('Duplicate found for reward amount');
+                               if verbose; disp('Duplicate found for reward amount'); end
 
                            end
 
@@ -609,15 +883,11 @@ classdef BlackrockLoader < handle
 
 
                        else
-                           combined_pattern = [ time_pattern, '|', size_pattern];
                            tokens = regexp(event_text, combined_pattern, 'tokens');
                            %Get the event and duration
 
                            event_dur = strtrim(tokens{1}{1});
                            dur = str2double(tokens{1}{2});
-
-
-                           info_event_keys = keys(information_events);
                            flag_array = contains(info_event_keys,event_dur);
                            curr_key = info_event_keys{flag_array};
                            field = information_events(curr_key);
@@ -627,8 +897,8 @@ classdef BlackrockLoader < handle
                                 trials(trial_index).(field) = dur;
                            else
                                trials(trial_index).duplicates(end+1,1) = field;
-                                disp('Duplicate found for duration/size event:');
-                                disp(event_dur);
+                                if verbose; disp('Duplicate found for duration/size event:'); end
+                                if verbose; disp(event_dur); end
 
                            end
 
@@ -642,8 +912,6 @@ classdef BlackrockLoader < handle
                        last_space_idx = find(event_text == ' ', 1, 'last');
                        event_name = strtrim(event_text(1:last_space_idx-1));
                        value = strtrim(event_text(last_space_idx+1:end));
-
-                       segment_event_keys = keys(segment_events);
                        flag_array = contains(segment_event_keys,event_name);
                        curr_key = segment_event_keys{flag_array};
                        field = segment_events(curr_key);
@@ -652,8 +920,8 @@ classdef BlackrockLoader < handle
                           trials(trial_index).(field) = value;
                        else
                            trials(trial_index).duplicates(end+1,1) = field;
-                           disp('Duplicate found for segment event:');
-                           disp(field);
+                           if verbose; disp('Duplicate found for segment event:'); end
+                           if verbose; disp(field); end
 
                        end
 
@@ -670,8 +938,8 @@ classdef BlackrockLoader < handle
                                trials(trial_index).End = curr_eventtime;
                            else
                                trials(trial_index).duplicates(end+1,1) = event;
-                                disp('Duplicate End  found for dash event:');
-                                disp(event);
+                                if verbose; disp('Duplicate End  found for dash event:'); end
+                                if verbose; disp(event); end
 
                            end
 
@@ -679,8 +947,8 @@ classdef BlackrockLoader < handle
                                 trials(trial_index).Trialoutcome = outcome;
                            else
                                trials(trial_index).duplicates(end+1,1) ='Trialoutcome';
-                                disp('Duplicate outcome found for dash event:');
-                                disp(event);
+                                if verbose; disp('Duplicate outcome found for dash event:'); end
+                                if verbose; disp(event); end
 
                            end
                        elseif contains(event,'choice')
@@ -688,14 +956,15 @@ classdef BlackrockLoader < handle
                                 trials(trial_index).Choosen_choice = outcome;
                            else
                                trials(trial_index).duplicates(end+1,1) ='Choosen_choice';
-                                disp('Duplicate found for dash event:');
-                                disp(event);
+                                if verbose; disp('Duplicate found for dash event:'); end
+                                if verbose; disp(event); end
 
                            end
                        else
-                           disp('Undefined dash event:');
-                           disp(event_text);
-                           disp('Check the undefined var');
+                           if verbose; disp('Undefined dash event:'); end
+                           if verbose; disp(event_text); end
+                           if verbose; disp('Check the undefined var'); end
+                           n_undefined = n_undefined + 1;
                            trials(trial_index).undefined(end+1,1) = string(event_text);
                        end
 
@@ -705,8 +974,8 @@ classdef BlackrockLoader < handle
                             trials(trial_index).Choiceoutcome = event_text;
                        else
                            trials(trial_index).duplicates(end+1,1) ='Choiceoutcome';
-                                disp('Duplicate found for outcome event:');
-                                disp(event_text);
+                                if verbose; disp('Duplicate found for outcome event:'); end
+                                if verbose; disp(event_text); end
 
                        end
                        %{
@@ -714,8 +983,8 @@ classdef BlackrockLoader < handle
                             trials(trial_index).Choicetime = curr_eventtime;
                        else
                             trials(trial_index).duplicates(end+1,1) ='Choicetime';
-                                disp('Duplicate found for outcome event:');
-                                disp('Choicetime');
+                                if verbose; disp('Duplicate found for outcome event:'); end
+                                if verbose; disp('Choicetime'); end
 
                        end
                        %}
@@ -737,9 +1006,10 @@ classdef BlackrockLoader < handle
 
                    else
                        %Undefined fields
-                       disp('Undefined event detected:');
-                       disp(event_text);
-                       disp('Check the undefined var');
+                       if verbose; disp('Undefined event detected:'); end
+                       if verbose; disp(event_text); end
+                       if verbose; disp('Check the undefined var'); end
+                       n_undefined = n_undefined + 1;
                        trials(trial_index).undefined(end+1,1) = string(event_text);
 
                    end
@@ -753,6 +1023,20 @@ classdef BlackrockLoader < handle
 
                 end %End of if the judgement of if it is experiment flag or trial flag
 
+            end
+
+            % Trim the preallocated slack back to what was actually filled.
+            trials     = trials(1:trial_index);
+            experiment = experiment(1:session_index);
+            startTicks = startTicks(1:trial_index);
+
+            % One summary instead of three lines per unmatched event: a task
+            % software change can send every event down the undefined path, and
+            % printing that per event costs more than the whole parse. The
+            % strings are still kept per trial in trials.undefined.
+            if n_undefined > 0 && ~verbose
+                warning(['parseEvents: %d comment(s) matched no known event and went to ' ...
+                    'trials.undefined. Set the loader''s Verbose flag to list them.'], n_undefined);
             end
 
             %% Change visual guided saccade (memory type) into memory guided saccade
@@ -808,22 +1092,111 @@ classdef BlackrockLoader < handle
             Target_2_ecc_cell = num2cell(Target_2_ecc);
             [trials.Target_2_eccentricity] = deal(Target_2_ecc_cell{:});
 
-            obj.Trials     = trials;
-            obj.Experiment = experiment;
+            obj.Trials          = trials;
+            obj.Experiment      = experiment;
+            obj.TrialStartTicks = startTicks;
         end
 
-        function A = parseAnalog(obj)
-        % Segment the loaded analog stream into per-trial slices, stored in
-        % obj.Analog. When analog was not loaded, obj.Analog is [].
-            if isempty(obj.Loaded) || ~obj.Loaded.LoadAnalogData
-                obj.Analog = [];
+        function A = parseEye(obj)
+        % Segment the loaded eye stream into per-trial slices, stored in
+        % obj.Eye (rows EyeChannels). When the photodiode rides in the same
+        % file it is produced here too, from the same single segmentation pass.
+        % When the eye stream was not loaded, obj.Eye is [].
+            obj.segmentEyeStream();
+            A = obj.Eye;
+        end
+
+        function A = parseLFP(obj)
+        % Segment the loaded LFP stream into per-trial slices, stored in
+        % obj.LFP. When LFP was not loaded, obj.LFP is [].
+            if isempty(obj.Loaded) || ~obj.Loaded.LoadLFPData
+                obj.LFP = [];
             else
                 S = obj.Loaded;
-                obj.Analog = BlackrockLoader.segmentAnalog(obj.Trials, S.nsxdata, ...
-                    S.nsx_abs_time, S.nsx_samplingrate, ...
-                    obj.Segment_PreBuffer, obj.Segment_PostBuffer);
+                obj.LFP = BlackrockLoader.segmentContinuous(obj.Trials, S.lfp_nsxdata, ...
+                    S.lfp_abs_time, S.lfp_samplingrate, ...
+                    obj.Segment_PreBuffer, obj.Segment_PostBuffer, S.lfp_uv_per_digit);
+                obj.freeRaw({'lfp_nsxdata', 'lfp_abs_time'});
             end
-            A = obj.Analog;
+            A = obj.LFP;
+        end
+
+        function A = parsePhotodiode(obj)
+        % Segment the loaded photodiode stream into per-trial slices, stored in
+        % obj.Photodiode. When photodiode was not loaded, obj.Photodiode is [].
+        %
+        % In the default layout the photodiode lives on rows PhotodiodeChannels
+        % of the eye ns2, so the work is done by the shared eye-stream pass --
+        % calling this after parseEye is then a no-op, and calling it on its
+        % own runs that pass (which also fills obj.Eye). Only a dedicated
+        % photodiode file is segmented separately here.
+            if isempty(obj.Loaded) || ~obj.Loaded.LoadPhotodiodeData
+                obj.Photodiode = [];
+            elseif obj.Loaded.photodiode_from_eye
+                obj.segmentEyeStream();
+            else
+                S = obj.Loaded;
+                obj.Photodiode = BlackrockLoader.segmentContinuous(obj.Trials, S.photodiode_nsxdata, ...
+                    S.photodiode_abs_time, S.photodiode_samplingrate, ...
+                    obj.Segment_PreBuffer, obj.Segment_PostBuffer, S.photodiode_uv_per_digit);
+                obj.freeRaw({'photodiode_nsxdata', 'photodiode_abs_time'});
+            end
+            A = obj.Photodiode;
+        end
+
+        function segmentEyeStream(obj)
+        % Segment the eye ns2 ONCE and split the result by channel row into
+        % obj.Eye (EyeChannels) and, when the photodiode rides in the same
+        % file, obj.Photodiode (PhotodiodeChannels).
+        %
+        % Both products come out of a single segmentContinuous pass because they are
+        % the same samples on the same clock -- cutting the stream twice was
+        % pure duplicated work. Memoised on the products already existing, so
+        % parseEye and parsePhotodiode can be called in either order, or
+        % individually, and the pass still runs exactly once.
+            if isempty(obj.Loaded) || ~obj.Loaded.LoadEyeData
+                obj.Eye = [];
+                return
+            end
+            S = obj.Loaded;
+            wants_pd = S.LoadPhotodiodeData && S.photodiode_from_eye;
+            if ~isempty(obj.Eye) && (~wants_pd || ~isempty(obj.Photodiode))
+                return   % already segmented
+            end
+            if isempty(S.nsxdata)
+                % raw stream already released (FreeRawAfterParse) and whatever
+                % was asked for is gone -- nothing left to segment
+                return
+            end
+
+            full = BlackrockLoader.segmentContinuous(obj.Trials, S.nsxdata, ...
+                S.nsx_abs_time, S.nsx_samplingrate, ...
+                obj.Segment_PreBuffer, obj.Segment_PostBuffer, S.uv_per_digit);
+
+            nChan = size(full.data, 1);
+            obj.Eye = BlackrockLoader.subsetChannels(full, ...
+                BlackrockLoader.clampChannels(obj.EyeChannels, nChan, 'EyeChannels'));
+            if wants_pd
+                obj.Photodiode = BlackrockLoader.subsetChannels(full, ...
+                    BlackrockLoader.clampChannels(obj.PhotodiodeChannels, nChan, 'PhotodiodeChannels'));
+            end
+            obj.freeRaw({'nsxdata', 'nsx_abs_time'});
+        end
+
+        function freeRaw(obj, fields)
+        % Release named raw fields of obj.Loaded once their per-trial product
+        % exists. Raw continuous streams are the largest thing the loader holds;
+        % without this the raw and segmented copies of every stream stay live
+        % until the next load(), which is what pushes big sessions into swap.
+        % Disabled by FreeRawAfterParse when you want obj.Loaded inspectable.
+            if ~obj.FreeRawAfterParse || isempty(obj.Loaded)
+                return
+            end
+            for k = 1:numel(fields)
+                if isfield(obj.Loaded, fields{k})
+                    obj.Loaded.(fields{k}) = [];
+                end
+            end
         end
 
         function R = parseSpikes(obj)
@@ -841,17 +1214,23 @@ classdef BlackrockLoader < handle
             if L.LoadOnlineSpikeData
                 wfForMean = [];
                 if L.LoadOnlineSpikeWaveform && ~isempty(S.Waveform)
-                    wfForMean = S.Waveform;   % [nSamp x nSpikes] uV, aligned to S.TimeSec/Channel/Unit
+                    wfForMean = S.Waveform;   % [nSamp x nSpikes] raw, aligned to S.TimeSec/Channel/Unit
                 end
                 obj.Spike = BlackrockLoader.segmentSpikes(obj.Trials, S.TimeSec, ...
                     S.Channel, S.Unit, ...
                     obj.Segment_PreBuffer, obj.Segment_PostBuffer, obj.Segment_BinWidth, ...
-                    obj.Spike_ISIViolationMs, wfForMean);
+                    obj.Spike_ISIViolationMs, wfForMean, S.WaveformScale);
             end
             if L.LoadOnlineSpikeWaveform && ~isempty(S.Waveform)
                 obj.SpikeWaveformData = BlackrockLoader.segmentSpikeWaveforms(obj.Trials, ...
                     S.TimeSec, S.Channel, S.Unit, S.Waveform, ...
-                    obj.Segment_PreBuffer, obj.Segment_PostBuffer);
+                    obj.Segment_PreBuffer, obj.Segment_PostBuffer, S.WaveformScale, ...
+                    S.TimeTick, obj.TrialStartTicks, S.TimeRes);
+            end
+            % The raw waveform matrix is the largest array in the session and is
+            % of no further use once both spike products exist.
+            if obj.FreeRawAfterParse && ~isempty(obj.Loaded.online_spike)
+                obj.Loaded.online_spike.Waveform = [];
             end
             R = obj.Spike;
         end
@@ -930,13 +1309,26 @@ classdef BlackrockLoader < handle
         % BaseName (e.g. 'Blackrock_2026-06-24'):
         %   <BaseName>_expmeta_matlab.txt          (always)
         %   <BaseName>_trials_matlab.csv           (always)
-        %   <BaseName>_analog_matlab.mat           (if analog was segmented)
+        %   <BaseName>_eye_matlab.mat              (if the eye stream was segmented)
+        %   <BaseName>_lfp_matlab.mat              (if LFP was segmented)
+        %   <BaseName>_photodiode_matlab.mat       (if photodiode was segmented)
         %   <BaseName>_spikes_matlab.mat           (if spikes were segmented)
         %   <BaseName>_spikes_waveform_matlab.mat  (if waveforms were segmented)
+        %
+        % All .mat products use -v7.3: every one of them is a dense per-trial
+        % array that can exceed the 2 GB per-variable cap of the default format.
+        % Compression is on unless CompressExport is cleared: these arrays are
+        % mostly NaN padding and compress ~6x, which outweighs the
+        % single-threaded gzip time on anything but a quick turnaround.
             if ~exist(OutputPath, 'dir')
                 mkdir(OutputPath);
             end
             src = obj.Loaded.comments_source;
+            if obj.CompressExport
+                save_opts = {'-v7.3'};
+            else
+                save_opts = {'-v7.3', '-nocompression'};
+            end
 
             % Experiment meta (.txt)
             fname_exp = [BaseName '_expmeta_matlab.txt'];
@@ -950,30 +1342,47 @@ classdef BlackrockLoader < handle
             writetable(obj.Export.trials_table, fullfile(OutputPath, fname_trials));
             fprintf('File:%s Trials Data has been parsed into %s\n', src, fname_trials);
 
-            % Analog (.mat) - only when segmented
-            if ~isempty(obj.Analog)
-                analog = obj.Analog; %#ok<NASGU>
-                fname_analog = [BaseName '_analog_matlab.mat'];
-                save(fullfile(OutputPath, fname_analog), 'analog');
-                fprintf('File:%s Analog segmented (%d trials) into %s\n', ...
-                    src, size(obj.Analog.data, 2), fname_analog);
+            % Eye (.mat) - only when segmented
+            if ~isempty(obj.Eye)
+                eye = obj.Eye; %#ok<NASGU>
+                fname_eye = [BaseName '_eye_matlab.mat'];
+                save(fullfile(OutputPath, fname_eye), 'eye', save_opts{:});
+                fprintf('File:%s Eye segmented (%d trials) into %s\n', ...
+                    src, size(obj.Eye.data, 2), fname_eye);
+            end
+
+            % LFP (.mat) - only when segmented
+            if ~isempty(obj.LFP)
+                lfp = obj.LFP; %#ok<NASGU>
+                fname_lfp = [BaseName '_lfp_matlab.mat'];
+                save(fullfile(OutputPath, fname_lfp), 'lfp', save_opts{:});
+                fprintf('File:%s LFP segmented (%d trials) into %s\n', ...
+                    src, size(obj.LFP.data, 2), fname_lfp);
+            end
+
+            % Photodiode (.mat) - only when segmented
+            if ~isempty(obj.Photodiode)
+                photodiode = obj.Photodiode; %#ok<NASGU>
+                fname_pd = [BaseName '_photodiode_matlab.mat'];
+                save(fullfile(OutputPath, fname_pd), 'photodiode', save_opts{:});
+                fprintf('File:%s Photodiode segmented (%d trials) into %s\n', ...
+                    src, size(obj.Photodiode.data, 2), fname_pd);
             end
 
             % Spikes (.mat) - only when segmented
             if ~isempty(obj.Spike)
                 online_spike = obj.Spike; %#ok<NASGU>
                 fname_spikes = [BaseName '_spikes_matlab.mat'];
-                save(fullfile(OutputPath, fname_spikes), 'online_spike');
+                save(fullfile(OutputPath, fname_spikes), 'online_spike', save_opts{:});
                 fprintf('File:%s Spikes rasterized (%d units x %d trials) into %s\n', ...
                     src, size(obj.Spike.data, 1), size(obj.Spike.data, 2), fname_spikes);
             end
 
-            % Spike waveforms (.mat, -v7.3) - only when segmented. The dense 4-D
-            % array can exceed the 2 GB per-variable cap of the default format.
+            % Spike waveforms (.mat) - only when segmented
             if ~isempty(obj.SpikeWaveformData)
                 online_spike_waveform = obj.SpikeWaveformData; %#ok<NASGU>
                 fname_wf = [BaseName '_spikes_waveform_matlab.mat'];
-                save(fullfile(OutputPath, fname_wf), 'online_spike_waveform', '-v7.3');
+                save(fullfile(OutputPath, fname_wf), 'online_spike_waveform', save_opts{:});
                 fprintf('File:%s Spike waveforms (%d samples, up to %d spk/unit-trial) into %s\n', ...
                     src, obj.SpikeWaveformData.waveform_nsamp, ...
                     obj.SpikeWaveformData.info.maxSpikes, fname_wf);
@@ -986,7 +1395,10 @@ classdef BlackrockLoader < handle
             obj.Loaded            = [];
             obj.Trials            = [];
             obj.Experiment        = [];
-            obj.Analog            = [];
+            obj.TrialStartTicks   = [];
+            obj.Eye            = [];
+            obj.LFP               = [];
+            obj.Photodiode        = [];
             obj.Spike             = [];
             obj.SpikeWaveformData = [];
             obj.Export            = [];
@@ -1060,16 +1472,182 @@ classdef BlackrockLoader < handle
         % parseSpikes/segmentSpikes. All per-spike arrays are aligned 1:1 (same length / column
         % count), so they can be filtered or segmented together.
             s = struct( ...
-                'TimeSec',      [], ...   % spike times (s, recording clock); 1 x nSpikes
-                'Channel',      [], ...   % electrode per spike; 1 x nSpikes
-                'Unit',         [], ...   % unit id per spike;   1 x nSpikes
-                'Waveform',     [], ...   % [nSamp x nSpikes] uV, or [] when none
-                'WaveformUnit', '', ...   % e.g. 'microVolts' (label for Waveform)
-                'source',       '');      % provenance: 'online' | 'offline'
+                'TimeSec',       [], ...  % spike times (s, recording clock); 1 x nSpikes
+                'TimeTick',      uint64([]), ... % the same times as raw integer clock
+                                    ...          % ticks; exact, unlike TimeSec (see
+                                    ...          % loadComments). 1 x nSpikes, or []
+                'TimeRes',       [], ...  % ticks per second for TimeTick
+                'Channel',       [], ...  % electrode per spike; 1 x nSpikes
+                'Unit',          [], ...  % unit id per spike;   1 x nSpikes
+                'Waveform',      [], ...  % [nSamp x nSpikes] raw int16, or [] when none
+                'WaveformScale', [], ...  % 1 x nSpikes uV per digit for Waveform, or []
+                                    ...   % when Waveform is already in WaveformUnit
+                'WaveformUnit',  '', ...  % e.g. 'microVolts' (unit AFTER WaveformScale)
+                'source',        '');     % provenance: 'online' | 'offline'
         end
 
-        function A = segmentAnalog(trials, nsxdata, nsx_abs_time, nsx_samplingrate, preMs, postMs)
-        % Cut the continuous analog stream into one slice per trial.
+        function [spkIdx, trialOf] = trialSpikeIndex(sortedTimes, t_start, t_end)
+        % Map every (trial, in-window spike) pair to a flat pair of index
+        % vectors: spkIdx into sortedTimes, trialOf into the trial list. The
+        % window is [t_start, t_end) -- the same bounds the per-trial masks
+        % (spikeTimes >= t0 & spikeTimes < t1) used.
+        %
+        % sortedTimes must be ascending, so each trial's spikes are a CONTIGUOUS
+        % range of it. Finding the two bounds per trial replaces scanning all
+        % spikes once per trial, which is what made segmentation cost
+        % nTrials x nSpikes. Trials with a NaN window contribute nothing.
+        %
+        % Ranges may overlap between trials -- with pre/post buffers wider than
+        % the inter-trial interval a spike legitimately belongs to two trials --
+        % so this deliberately does not assign each spike to a single trial.
+            nS = numel(sortedTimes);
+            nT = numel(t_start);
+            ok = ~isnan(t_start(:)) & ~isnan(t_end(:));
+
+            spkIdx = zeros(0, 1);
+            trialOf = zeros(0, 1);
+            if nS == 0 || ~any(ok)
+                return
+            end
+
+            % #{spikes strictly before q} for every window bound, in ONE pass
+            % over the spikes. histcounts needs increasing edges, so ask about
+            % the sorted unique bounds and map the answers back. (Spike times
+            % themselves may repeat -- simultaneous spikes on different
+            % electrodes -- which is why they are the data here, not the edges.)
+            q = [t_start(ok); t_end(ok)];
+            [qs, ~, back] = unique(q(:));
+            nBefore = cumsum(histcounts(sortedTimes, [-inf; qs(:); inf]));
+            nBefore = nBefore(1:numel(qs));     % nBefore(j) = #{spikes < qs(j)}
+            bound   = nBefore(back);
+            m       = sum(ok);
+
+            lo = nan(nT, 1);  hi = nan(nT, 1);
+            lo(ok) = bound(1:m)     + 1;   % first index with time >= t_start
+            hi(ok) = bound(m+1:end);       % last  index with time <  t_end
+
+            n = hi - lo + 1;
+            n(isnan(n) | n < 0) = 0;
+            total = sum(n);
+            if total == 0
+                return
+            end
+
+            % Concatenate lo(k):hi(k) for every kept trial without a loop: step
+            % by 1 everywhere, except at each block's first element, where the
+            % step jumps from the previous block's end to this block's lo.
+            keep = find(n > 0);
+            nk   = n(keep);
+            lok  = lo(keep);
+            trialOf = repelem(keep, nk);
+
+            step       = ones(total, 1);
+            blockStart = cumsum([1; nk(1:end-1)]);
+            prevEnd    = [0; lok(1:end-1) + nk(1:end-1) - 1];
+            step(blockStart) = lok - prevEnd;
+            spkIdx     = cumsum(step);
+        end
+
+        function restoreFcn = muteNpmkUvPrompt()
+        % Turn off NPMK's "data are in units of 1/4 uV" warning, and with it the
+        % interactive "warn every time? (Y/n)" prompt openNSx fires when data is
+        % read without 'uv' (openNSx.m:1353-1367). That prompt blocks until a
+        % key is pressed, which would hang any unattended batch run.
+        %
+        % Returns a function handle that puts the user's setting back; call it
+        % (or let an onCleanup do so) as soon as the openNSx call returns, so the
+        % preference is only suppressed for our own reads.
+            restoreFcn = @() [];   % no settingsManager on the path -> nothing to do
+            if exist('settingsManager', 'file') ~= 2
+                return
+            end
+            try
+                s = settingsManager();
+                if ~isfield(s, 'ShowuVWarning') || ~s.ShowuVWarning
+                    return   % already off; leave it alone
+                end
+                previous = s.ShowuVWarning;
+                s.ShowuVWarning = 0;
+                settingsManager(s);
+                restoreFcn = @() BlackrockLoader.restoreNpmkUvWarning(previous);
+            catch
+                % settings are a convenience, never a reason to fail a load
+            end
+        end
+
+        function restoreNpmkUvWarning(previous)
+            try
+                s = settingsManager();
+                s.ShowuVWarning = previous;
+                settingsManager(s);
+            catch
+            end
+        end
+
+        function C = commentFields(nev, sourceName)
+        % Pull the comment product out of an already-parsed NEV.
+        %
+        % EventTime is DERIVED here from EventTick rather than copied from
+        % openNEV's precomputed Data.Comments.TimeStampSec. The two are
+        % identical bit-for-bit (openNEV computes exactly this quotient), so
+        % this changes no value -- it exists so the tick -> second relationship
+        % is stated once, in our code, where a reader looks for it. Ticks are
+        % the raw datum; seconds are a derived view of them, and deriving them
+        % in one place is what stops the two from ever drifting apart.
+        %
+        % Both branches of loadComments come through here for the same reason:
+        % duplicating these five assignments was itself a way for the primary
+        % and legacy paths to diverge.
+            C.Events          = nev.Data.Comments.Text;
+            C.EventTick       = nev.Data.Comments.TimeStamp;      % uint64, exact
+            C.TimeRes         = double(nev.MetaTags.TimeRes);     % ticks per second
+            C.EventTime       = double(C.EventTick) / C.TimeRes;  % seconds, derived
+            C.comments_source = sourceName;
+        end
+
+        function nev = openNevCached(nevPath, cache)
+        % openNEV, but reusing an already-parsed struct when the caller supplies
+        % a cache (a containers.Map keyed by full path). Parsing a .nev means
+        % reading every packet in the file, so a multi-GB HUB file that carries
+        % both comments and spikes would otherwise be read twice per folder.
+        % With cache omitted this is a plain openNEV call.
+        %
+        % Test the class, not isempty: a containers.Map with nothing in it is
+        % isempty()==true, so an isempty guard would skip the store on the very
+        % first call and the cache could never fill.
+            usable = isa(cache, 'containers.Map');
+            if usable && isKey(cache, nevPath)
+                nev = cache(nevPath);
+                return
+            end
+            nev = openNEV(nevPath, 'report', 'nosave');
+            if usable
+                cache(nevPath) = nev; %#ok<NASGU> handle object, mutated in place
+            end
+        end
+
+        function B = subsetChannels(A, rows)
+        % Take a channel subset of a segmentContinuous product. Only .data is
+        % indexed; timeseq/info describe the trials and the clock, which the
+        % subset shares, so they carry through unchanged.
+            B = A;
+            B.data = A.data(rows, :, :);
+        end
+
+        function rows = clampChannels(rows, nChan, name)
+        % Drop requested channel rows that the stream does not actually have, so
+        % a file with fewer channels than the configured layout degrades to the
+        % rows that exist instead of erroring mid-pipeline.
+            keep = rows <= nChan;
+            if ~all(keep)
+                warning(['%s requests channel(s) %s but the stream has only %d; ' ...
+                    'using %s.'], name, mat2str(rows(~keep)), nChan, mat2str(rows(keep)));
+                rows = rows(keep);
+            end
+        end
+
+        function A = segmentContinuous(trials, nsxdata, nsx_abs_time, nsx_samplingrate, preMs, postMs, uvScale)
+        % Cut a continuous stream into one slice per trial.
         % For each trial the window is [Start - preMs, End + postMs] (ms buffers),
         % matched against nsx_abs_time (seconds, same NSP clock as the event
         % timestamps). Slices are left-aligned (each starts at its own window
@@ -1077,50 +1655,107 @@ classdef BlackrockLoader < handle
         % chan x nTrials x maxSamples array that lines up 1:1 with trials.
         % A trial whose Start/End is NaN (or that has no samples in range) gets
         % an all-NaN slice so the 3rd dimension stays index-aligned with trials.
+        %
+        % nsxdata may be raw int16 (as loadContinuous now returns it) together with
+        % uvScale, a per-channel uV-per-digit column vector; each slice is then
+        % scaled on the way in. Omit/empty uvScale when nsxdata is already in uV.
+        % Output .data is single -- half the memory of double, and well beyond
+        % the ~5 significant figures a 16-bit ADC can actually resolve.
+        %
+        % The sample window is computed arithmetically rather than searched:
+        % nsx_abs_time is uniform by construction (see loadContinuous), so the
+        % window bounds follow from the first sample's time and the sampling
+        % rate. Only nsx_abs_time(1) is read, which keeps this O(nTrials)
+        % instead of scanning the whole time vector once per trial.
             if nargin < 5 || isempty(preMs);  preMs  = 500; end   % default buffer (ms)
             if nargin < 6 || isempty(postMs); postMs = 500; end
+            if nargin < 7; uvScale = []; end                      % [] -> data already in uV
 
             pre  = preMs  / 1000;   % seconds
             post = postMs / 1000;
 
             nChan   = size(nsxdata, 1);
+            nSample = size(nsxdata, 2);
             nTrials = numel(trials);
 
-            % --- first pass: find each trial's sample window ---
-            idx          = cell(nTrials, 1);
-            n            = zeros(nTrials, 1);
-            rawstarttime = nan(nTrials, 1);
-            for i = 1:nTrials
-                if isnan(trials(i).Start) || isnan(trials(i).End)
-                    continue   % missing marker -> all-NaN slice
-                end
-                t0 = trials(i).Start - pre;
-                t1 = trials(i).End   + post;
-                w  = find(nsx_abs_time >= t0 & nsx_abs_time <= t1);
-                if isempty(w)
-                    continue
-                end
-                idx{i}          = w;
-                n(i)            = numel(w);
-                rawstarttime(i) = trials(i).Start;      % abs time of the Start marker (s)
+            if ~isempty(uvScale)
+                uvScale = double(uvScale(:));   % nChan x 1, broadcast down the columns
             end
 
+            % --- first pass: each trial's sample window, in closed form ---
+            % nsx_abs_time(k) = tRef + (k-1)/fs, so the first sample at or after
+            % t0 is ceil((t0-tRef)*fs)+1 and the last at or before t1 is
+            % floor((t1-tRef)*fs)+1 -- the same inclusive window the old
+            % find(>= t0 & <= t1) produced.
+            %
+            % These are absolute epoch timestamps (~1.5e9 s), where a double
+            % resolves only ~2.4e-7 s. At 1 kHz that is ~2.4e-4 of a sample, so
+            % the stored grid is not perfectly even -- successive steps vary in
+            % the last bits -- and the arithmetic above can land one sample off
+            % at a window edge. The candidate is therefore snapped against the
+            % actual sample times, which is still O(1) per trial: only the
+            % candidate and its neighbour are read, never the whole vector.
+            tRef   = nsx_abs_time(1);
+            starts = [trials.Start]';
+            ends   = [trials.End]';
+            ok     = ~isnan(starts) & ~isnan(ends);
+            t0     = starts - pre;
+            t1     = ends   + post;
+
+            i0 = ceil ((t0 - tRef) * nsx_samplingrate) + 1;   % may fall outside 1..nSample
+            i1 = floor((t1 - tRef) * nsx_samplingrate) + 1;
+
+            % i0 := smallest index whose time is >= t0
+            sel = ok & i0 >= 1 & i0 <= nSample;
+            adj = false(nTrials, 1);
+            adj(sel) = reshape(nsx_abs_time(i0(sel)), [], 1) < t0(sel);
+            i0(adj) = i0(adj) + 1;
+            sel = ok & i0 >= 2 & i0 <= nSample + 1;
+            adj = false(nTrials, 1);
+            adj(sel) = reshape(nsx_abs_time(i0(sel) - 1), [], 1) >= t0(sel);
+            i0(adj) = i0(adj) - 1;
+
+            % i1 := largest index whose time is <= t1
+            sel = ok & i1 >= 1 & i1 <= nSample;
+            adj = false(nTrials, 1);
+            adj(sel) = reshape(nsx_abs_time(i1(sel)), [], 1) > t1(sel);
+            i1(adj) = i1(adj) - 1;
+            sel = ok & i1 >= 0 & i1 <= nSample - 1;
+            adj = false(nTrials, 1);
+            adj(sel) = reshape(nsx_abs_time(i1(sel) + 1), [], 1) <= t1(sel);
+            i1(adj) = i1(adj) + 1;
+
+            % Clamp on one side each, so a window lying entirely outside the
+            % recording ends up with i1 < i0 and is dropped rather than
+            % collapsing onto a bogus single sample.
+            i0 = max(i0, 1);
+            i1 = min(i1, nSample);
+
+            n        = i1 - i0 + 1;
+            n(~ok)   = 0;              % missing marker -> all-NaN slice
+            n(n < 0) = 0;              % window entirely outside the recording
+            rawstarttime = starts;
+            rawstarttime(n == 0) = NaN;   % abs time of the Start marker (s)
+
             % --- second pass: stack into NaN-padded 3-D array (left-aligned) ---
-            % built chan x maxSamples x nTrials, then permuted to chan x nTrials x maxSamples
+            % Allocated directly as chan x nTrials x maxSamples; the old version
+            % built chan x maxSamples x nTrials and permuted, which duplicated
+            % the whole array at peak memory.
             maxSamples = max([n; 0]);
-            data = nan(nChan, maxSamples, nTrials);
-            for i = 1:nTrials
-                if n(i) > 0
-                    data(:, 1:n(i), i) = nsxdata(:, idx{i});
+            data = nan(nChan, nTrials, maxSamples, 'single');
+            for i = find(n > 0)'
+                slice = single(nsxdata(:, i0(i):i1(i)));
+                if ~isempty(uvScale)
+                    slice = slice .* single(uvScale);
                 end
+                data(:, i, 1:n(i)) = reshape(slice, nChan, 1, n(i));
             end
-            data = permute(data, [1 3 2]);   % -> chan x nTrials x maxSamples
 
             % reltime: 0 at the Start marker, negative through the pre-buffer
             reltime = ((0:maxSamples-1) / nsx_samplingrate) - pre;
 
             A = struct();
-            A.data    = data;       % chan x nTrials x maxSamples, NaN-padded
+            A.data    = data;       % chan x nTrials x maxSamples, NaN-padded, single
             A.timeseq.alignedrawtime = rawstarttime;  % nTrials x 1, abs time of the Start marker (s)
             A.timeseq.aligned_marker = 'Start';        % event that relative_time=0 is aligned to
             A.timeseq.relative_time  = reltime;        % 1 x maxSamples, seconds from the aligned marker
@@ -1129,14 +1764,14 @@ classdef BlackrockLoader < handle
             A.info.Trial_number = [trials.Trial_number]';   % nTrials x 1
         end
 
-        function R = segmentSpikes(trials, spikeTimes, spikeElectrode, spikeUnit, preMs, postMs, binMs, violMs, spikeWaveform)
+        function R = segmentSpikes(trials, spikeTimes, spikeElectrode, spikeUnit, preMs, postMs, binMs, violMs, spikeWaveform, waveformScale)
         % Rasterize online spikes into one binary slice per trial.
         % For each trial the window is [Start - preMs, End + postMs] (ms buffers),
         % matched against spikeTimes (seconds, NSP/HUB clock). Time is binned at
         % binMs (default 1 ms); a bin is 1 if any spike of that row falls in it,
         % 0 otherwise. Slices are left-aligned (bin 1 at the window start) and
         % NaN-padded to the longest trial, giving one NtotalUnit x nTrials x maxBins
-        % array that lines up 1:1 with trials (same layout as segmentAnalog).
+        % array that lines up 1:1 with trials (same layout as segmentContinuous).
         % Rows are one per (electrode, unit) pair, so NtotalUnit is the total
         % isolated units summed across channels (a channel with 2 units -> 2 rows);
         % info.Channel_Number / info.Unit_No record the IDs per row.
@@ -1146,6 +1781,8 @@ classdef BlackrockLoader < handle
         % info.MeanWaveform carries each unit's average waveform (uV, one row per
         % unit x nSamp) over its FULL set of spikes when spikeWaveform is supplied
         % ([nSamp x nSpikes], columns aligned to spikeTimes); [] otherwise.
+        % waveformScale is the optional per-spike uV-per-digit factor that goes
+        % with a raw int16 spikeWaveform; omit/empty when it is already in uV.
         % A trial whose Start/End is NaN gets an all-NaN slice so the trial
         % dimension stays index-aligned with trials.
         % (Per-spike waveforms are a separate product: see segmentSpikeWaveforms.)
@@ -1153,7 +1790,8 @@ classdef BlackrockLoader < handle
             if nargin < 6 || isempty(postMs); postMs = 500; end
             if nargin < 7 || isempty(binMs);  binMs  = 1;   end   % bin width (ms)
             if nargin < 8 || isempty(violMs); violMs = 1;   end   % ISI-violation window (ms)
-            if nargin < 9 || isempty(spikeWaveform); spikeWaveform = []; end   % [nSamp x nSpikes] uV, or []
+            if nargin < 9  || isempty(spikeWaveform); spikeWaveform = []; end  % [nSamp x nSpikes], or []
+            if nargin < 10; waveformScale = []; end                            % [] -> already uV
 
             pre    = preMs  / 1000;   % seconds
             post   = postMs / 1000;
@@ -1175,26 +1813,42 @@ classdef BlackrockLoader < handle
             % Fraction of ISIs < violMs over each unit's FULL continuous spike train
             % (not per-trial): a pure timing metric, independent of the raster and
             % of the waveform product. NaN for a unit with fewer than 2 spikes.
+            % Sort by (unit, time) once, so every unit's train is a contiguous
+            % ascending run. The old form re-scanned all spikes once per unit.
             violSec  = violMs / 1000;
             violRate = nan(nChan, 1);
-            for r = 1:nChan
-                tr = sort(spikeTimes(spikeRow == r));
-                if numel(tr) >= 2
-                    violRate(r) = mean(diff(tr) < violSec);
-                end
+            rowSorted = sortrows([spikeRow, spikeTimes], [1 2]);
+            unitOf = rowSorted(:, 1);
+            isi    = diff(rowSorted(:, 2));
+            sameUnit = diff(unitOf) == 0;              % drop the gaps between units
+            if any(sameUnit)
+                violRate = accumarray(unitOf(find(sameUnit)), ...
+                    isi(sameUnit) < violSec, [nChan 1], @mean, NaN);
             end
 
             % --- overall mean waveform per unit (uV, row-aligned to chanKeys) ---
             % Mean over the unit's FULL set of spikes (all trials), or [] when no
             % waveform product was loaded. NaN row for a unit with no waveform columns.
+            % Sorting the spikes by unit turns "this unit's columns" into one
+            % contiguous block of the ordering, so each unit gathers only its own
+            % columns and the whole loop touches every column exactly once. The
+            % old form scanned the entire matrix once per unit; converting the
+            % whole matrix up front instead would mean a full double copy of the
+            % largest array in the session.
             if ~isempty(spikeWaveform)
                 nSamp  = size(spikeWaveform, 1);
+                counts = accumarray(spikeRow, 1, [nChan 1]);
+                [~, byUnit] = sort(spikeRow);
+                stop   = cumsum(counts);
+                start  = stop - counts + 1;
                 meanWf = nan(nChan, nSamp);
-                for r = 1:nChan
-                    cols = spikeWaveform(:, spikeRow == r);
-                    if ~isempty(cols)
-                        meanWf(r, :) = mean(cols, 2, 'omitnan').';
+                for r = find(counts > 0)'
+                    cols_r = byUnit(start(r):stop(r));
+                    block  = single(spikeWaveform(:, cols_r));
+                    if ~isempty(waveformScale)
+                        block = block .* single(reshape(waveformScale(cols_r), 1, []));
                     end
+                    meanWf(r, :) = mean(double(block), 2, 'omitnan').';
                 end
             else
                 meanWf = [];
@@ -1202,47 +1856,38 @@ classdef BlackrockLoader < handle
 
             nTrials = numel(trials);
 
-            % --- first pass: find each trial's bin count and window ---
-            nBins        = zeros(nTrials, 1);
-            t_start      = nan(nTrials, 1);
-            t_end        = nan(nTrials, 1);
+            % --- first pass: each trial's bin count and window ---
+            starts = [trials.Start]';
+            ends   = [trials.End]';
+            ok     = ~isnan(starts) & ~isnan(ends);   % missing marker -> all-NaN slice
+
+            t_start = nan(nTrials, 1);   t_start(ok) = starts(ok) - pre;
+            t_end   = nan(nTrials, 1);   t_end(ok)   = ends(ok)   + post;
+            nBins   = zeros(nTrials, 1);
+            nBins(ok) = max(round((t_end(ok) - t_start(ok)) / binSec), 0);
             rawstarttime = nan(nTrials, 1);
-            for i = 1:nTrials
-                if isnan(trials(i).Start) || isnan(trials(i).End)
-                    continue   % missing marker -> all-NaN slice
-                end
-                t0 = trials(i).Start - pre;
-                t1 = trials(i).End   + post;
-                nBins(i)        = max(round((t1 - t0) / binSec), 0);
-                t_start(i)      = t0;
-                t_end(i)        = t1;
-                rawstarttime(i) = trials(i).Start;   % abs time of the Start marker (s)
-            end
+            rawstarttime(ok) = starts(ok);   % abs time of the Start marker (s)
 
             % --- second pass: fill NaN-padded binary raster (left-aligned) ---
+            % Allocated directly as NtotalUnit x nTrials x maxBins; building it
+            % transposed and permuting at the end duplicated the whole array.
             maxBins = max([nBins; 0]);
-            raster  = nan(nChan, maxBins, nTrials);
-            for i = 1:nTrials
-                if nBins(i) <= 0
-                    continue
-                end
-                t0 = t_start(i);
-                t1 = t_end(i);
-                raster(:, 1:nBins(i), i) = 0;   % within-window bins start at 0
-                sel = spikeTimes >= t0 & spikeTimes < t1;
-                if ~any(sel)
-                    continue
-                end
-                bins = floor((spikeTimes(sel) - t0) / binSec) + 1;
-                bins = min(bins, nBins(i));     % guard the right edge
-                rows = spikeRow(sel);
-                lin  = sub2ind([nChan, nBins(i)], rows, bins);
-                slice = raster(:, 1:nBins(i), i);
-                slice(lin) = 1;                 % binary: spike present (clamped)
-                raster(:, 1:nBins(i), i) = slice;
+            raster  = nan(nChan, nTrials, maxBins, 'single');
+            for i = find(nBins > 0)'
+                raster(:, i, 1:nBins(i)) = 0;   % within-window bins start at 0
             end
-            % NtotalUnit x nTrials x maxBins (one row per channel x unit)
-            raster = permute(raster, [1 3 2]);
+
+            % Every (trial, in-window spike) pair at once, then a single indexed
+            % write -- rather than rescanning all spikes, and read-modify-writing
+            % a slice, once per trial.
+            [sortedTimes, sortIdx] = sort(spikeTimes);
+            [spkIdx, trialOf] = BlackrockLoader.trialSpikeIndex(sortedTimes, t_start, t_end);
+            if ~isempty(spkIdx)
+                bins = floor((sortedTimes(spkIdx) - t_start(trialOf)) / binSec) + 1;
+                bins = min(bins, nBins(trialOf));        % guard the right edge
+                rows = spikeRow(sortIdx(spkIdx));
+                raster(sub2ind([nChan, nTrials, maxBins], rows, trialOf, bins)) = 1;
+            end
 
             % reltime: 0 at the Start marker, negative through the pre-buffer
             reltime = ((0:maxBins-1) * binSec) - pre;
@@ -1262,7 +1907,7 @@ classdef BlackrockLoader < handle
             R.info.MeanWaveformUnit = 'microVolts';
         end
 
-        function W = segmentSpikeWaveforms(trials, spikeTimes, spikeElectrode, spikeUnit, spikeWaveform, preMs, postMs)
+        function W = segmentSpikeWaveforms(trials, spikeTimes, spikeElectrode, spikeUnit, spikeWaveform, preMs, postMs, waveformScale, spikeTicks, startTicks, timeRes)
         % Collect the raw waveform (uV) of every in-window spike into a dense,
         % NaN-padded 4-D array. Rows are one per (electrode, unit) in the SAME
         % order as segmentSpikes, so waveform rows line up 1:1 with the raster.
@@ -1274,8 +1919,14 @@ classdef BlackrockLoader < handle
         % maxSpk is the largest per-(unit,trial) in-window spike count, shared
         % across all rows/trials -> the busiest unit drives memory. Trials with a
         % NaN Start/End contribute no spikes (all-NaN slice), staying index-aligned.
+        % waveformScale is the optional per-spike uV-per-digit factor that goes
+        % with a raw int16 spikeWaveform; omit/empty when it is already in uV.
             if nargin < 6 || isempty(preMs);  preMs  = 500; end   % default buffer (ms)
             if nargin < 7 || isempty(postMs); postMs = 500; end
+            if nargin < 8; waveformScale = []; end                % [] -> already uV
+            if nargin < 9;  spikeTicks = uint64([]); end
+            if nargin < 10; startTicks = uint64([]); end
+            if nargin < 11; timeRes    = [];         end
 
             pre  = preMs  / 1000;   % seconds
             post = postMs / 1000;
@@ -1283,6 +1934,11 @@ classdef BlackrockLoader < handle
             spikeTimes     = double(spikeTimes(:));
             spikeElectrode = double(spikeElectrode(:));
             spikeUnit      = double(spikeUnit(:));
+            % Force columns: these get compared elementwise against per-pair
+            % column vectors below, and a stray row would broadcast into an
+            % nPair x nPair matrix instead of comparing pairwise.
+            spikeTicks     = spikeTicks(:);
+            startTicks     = startTicks(:);
             nSamp = size(spikeWaveform, 1);   % [nSamp x nSpikes]
 
             % --- channel list: one row per (electrode, unit), sorted (matches segmentSpikes) ---
@@ -1294,52 +1950,95 @@ classdef BlackrockLoader < handle
 
             nTrials = numel(trials);
 
-            % --- first pass: window per trial + busiest (unit,trial) spike count ---
-            t_start      = nan(nTrials, 1);
-            t_end        = nan(nTrials, 1);
+            % --- trial windows ---
+            starts = [trials.Start]';
+            ends   = [trials.End]';
+            ok     = ~isnan(starts) & ~isnan(ends);   % missing marker -> all-NaN slice
+
+            t_start = nan(nTrials, 1);   t_start(ok) = starts(ok) - pre;
+            t_end   = nan(nTrials, 1);   t_end(ok)   = ends(ok)   + post;
             rawstarttime = nan(nTrials, 1);
-            maxSpk       = 0;
-            for i = 1:nTrials
-                if isnan(trials(i).Start) || isnan(trials(i).End)
-                    continue   % missing marker -> all-NaN slice
-                end
-                t_start(i)      = trials(i).Start - pre;
-                t_end(i)        = trials(i).End   + post;
-                rawstarttime(i) = trials(i).Start;   % abs time of the Start marker (s)
-                sel = spikeTimes >= t_start(i) & spikeTimes < t_end(i);
-                if any(sel)
-                    maxSpk = max(maxSpk, max(accumarray(spikeRow(sel), 1, [nChan 1])));
-                end
+            rawstarttime(ok) = starts(ok);   % abs time of the Start marker (s)
+
+            % --- every (trial, in-window spike) pair, and each spike's position
+            % 1..k within its (row, trial) group ---
+            % This replaces both the old per-trial scan for maxSpk and the
+            % per-spike scalar 4-D assignment: the pairs come from one binary
+            % search per trial bound, and the position is a rank-within-group
+            % computed by sorting rather than by a running counter.
+            [sortedTimes, sortIdx] = sort(spikeTimes);
+            [spkIdx, trialOf] = BlackrockLoader.trialSpikeIndex(sortedTimes, t_start, t_end);
+            origIdx = sortIdx(spkIdx);          % index into the unsorted spike arrays
+            rowOf   = spikeRow(origIdx);
+
+            nPair = numel(spkIdx);
+            pos   = zeros(nPair, 1);
+            if nPair > 0
+                % rank within each (row, trial) group: sort by group (stable, so
+                % time order is kept inside a group), then run a counter that
+                % resets at every group boundary.
+                g = (trialOf - 1) * nChan + rowOf;
+                [gs, gord] = sort(g);
+                isNew = [true; diff(gs) ~= 0];
+                run   = (1:nPair)';
+                pos(gord) = run - cummax(run .* isNew) + 1;
             end
+            maxSpk = max([pos; 0]);
 
             % --- allocate (warn first if the dense array is large) ---
-            if nChan*nTrials*maxSpk*nSamp*8 > 2e9
+            if nChan*nTrials*maxSpk*nSamp*4 > 2e9
                 warning(['segmentSpikeWaveforms: waveform array is %.1f GB ' ...
                     '(%d units x %d trials x %d spikes x %d samples). ' ...
                     'Consider narrowing the data (fewer/sorted units or trials).'], ...
-                    nChan*nTrials*maxSpk*nSamp*8/1e9, nChan, nTrials, maxSpk, nSamp);
+                    nChan*nTrials*maxSpk*nSamp*4/1e9, nChan, nTrials, maxSpk, nSamp);
             end
-            wf      = nan(nChan, nTrials, maxSpk, nSamp);   % uV, NaN-padded
-            wf_time = nan(nChan, nTrials, maxSpk);          % s, relative to Start
+            wf      = nan(nChan, nTrials, maxSpk, nSamp, 'single');   % uV, NaN-padded
+            % Times stay double. Only voltages go single: at a few seconds from
+            % the marker a single resolves ~0.5 us, which would throw away real
+            % resolution on a 30 kHz (let alone nanosecond PTP) spike clock.
+            % This array is nSamp times smaller than wf, so the cost is minor.
+            wf_time = nan(nChan, nTrials, maxSpk);                    % s, relative to Start
 
-            % --- second pass: each in-window spike -> position 1..k per (row, trial) ---
-            for i = 1:nTrials
-                if isnan(t_start(i))
-                    continue
+            % --- fill: two indexed writes instead of a scalar write per spike ---
+            if nPair > 0
+                base = sub2ind([nChan, nTrials, maxSpk], rowOf, trialOf, pos);
+
+                % Time of each spike relative to its trial's Start marker.
+                % Both clocks are absolute epoch values (~1.5e18 ns), so in
+                % seconds a double resolves only ~238 ns and the subtraction
+                % below would inherit that from BOTH operands. When the raw
+                % integer ticks are available, subtract them first (exact in
+                % uint64) and divide after -- the result then lands near zero,
+                % where a double resolves ~0.004 ns.
+                exact_ticks = ~isempty(spikeTicks) && ~isempty(startTicks) && ...
+                              ~isempty(timeRes) && numel(spikeTicks) == numel(spikeTimes) && ...
+                              numel(startTicks) == nTrials;
+                if exact_ticks
+                    st_tick  = spikeTicks(sortIdx);          % same order as sortedTimes
+                    spkTick  = reshape(st_tick(spkIdx), [], 1);
+                    refTick  = reshape(startTicks(trialOf), [], 1);
+                    % uint64 cannot go negative; split so pre-Start spikes keep
+                    % their sign instead of saturating at zero.
+                    after    = spkTick >= refTick;
+                    dt       = zeros(nPair, 1);
+                    dt( after) =  double(spkTick( after) - refTick( after)) / timeRes;
+                    dt(~after) = -double(refTick(~after) - spkTick(~after)) / timeRes;
+                    % trials with no recorded Start tick fall back to seconds
+                    noRef        = refTick == 0;
+                    dt(noRef)    = sortedTimes(spkIdx(noRef)) - rawstarttime(trialOf(noRef));
+                    wf_time(base) = dt;
+                else
+                    wf_time(base) = sortedTimes(spkIdx) - rawstarttime(trialOf);
                 end
-                sel = spikeTimes >= t_start(i) & spikeTimes < t_end(i);
-                if ~any(sel)
-                    continue
+
+                % wf is [row, trial, spk, samp]; the sample dimension is last, so
+                % consecutive samples of one spike sit a whole page apart.
+                page  = nChan * nTrials * maxSpk;
+                block = single(spikeWaveform(:, origIdx));               % nSamp x nPair
+                if ~isempty(waveformScale)
+                    block = block .* single(reshape(waveformScale(origIdx), 1, nPair));
                 end
-                selIdx = find(sel);            % original spike indices, in time order
-                rws    = spikeRow(selIdx);
-                cnt    = zeros(nChan, 1);       % running per-row position within this trial
-                for j = 1:numel(selIdx)
-                    r = rws(j);
-                    cnt(r) = cnt(r) + 1;
-                    wf(r, i, cnt(r), :)   = spikeWaveform(:, selIdx(j));
-                    wf_time(r, i, cnt(r)) = spikeTimes(selIdx(j)) - rawstarttime(i);
-                end
+                wf(base + (0:nSamp-1) * page) = block.';
             end
 
             W = struct();

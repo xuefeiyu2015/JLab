@@ -12,7 +12,7 @@ function RT = CalculateRT(caled_eyes, comments_data, plotFlag, plotN, errorCheck
 %                     .timeseq.alignedrawtime (nTrials x 1, s; absolute Start)
 %                     .info.samplingrate (Hz)
 %                     .cal.applied (logical), .cal.units ('deg' | 'uV')
-%                   When no analog was recorded, caled_eyes has only
+%                   When no eye data was recorded, caled_eyes has only
 %                   .cal.applied = false and NO .data field.
 %   comments_data - table of parsed trials (1:1 with dim 2 of .data). Needs
 %                   Task, Trialoutcome, Fixation_point_off, Fixation_exited.

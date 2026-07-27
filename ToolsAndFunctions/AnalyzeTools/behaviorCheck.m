@@ -1,6 +1,6 @@
 function summary = behaviorCheck(cd, plotFlag, savePath, reCompute)
 % Behavior quality check: standalone, callable right after loading the trials
-% table (no spike/analog data needed).
+% table (no spike/eye data needed).
 %
 %   cd        - trials table (one row per trial).
 %   plotFlag  - (optional, default true) draw the figure. false runs headless:

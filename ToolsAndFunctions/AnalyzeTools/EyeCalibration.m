@@ -40,7 +40,7 @@ function caled_eyes = EyeCalibration(comments_data, eye_data, task_cal, holdWinM
 %   comments_data - table of parsed trials (one row per trial, 1:1 with dim 2
 %                   of eye_data.data). Needs Task, Session, Save_complete,
 %                   Trialoutcome, and the event/target columns of the task.
-%   eye_data      - segmented analog product from BlackrockLoader.segmentAnalog:
+%   eye_data      - segmented eye product from BlackrockLoader.segmentContinuous:
 %                   .data (chan x nTrials x maxSamples, uV, NaN-padded),
 %                   .timeseq.relative_time (s from Start), .timeseq.alignedrawtime (s).
 %   task_cal      - task name(s) to calibrate from, each matched as a substring
@@ -355,10 +355,19 @@ function [cal, fitpts] = fitOneTask(comments_data, eye_data, task_entry, cal, ..
 
     keep = ismember(pts.trial, cal_trials);
 
-    xv = pts.xv(keep);
-    yv = pts.yv(keep);
-    tx = pts.tx(keep);                            % deg, the regressand
-    ty = pts.ty(keep);
+    % double() is required, not cosmetic. The eye trace arrives as single (see
+    % BlackrockLoader: sample values are stored single, timestamps double), and
+    % the design matrix below is [1, v, v.*v_other] with the eye in uV -- column
+    % magnitudes of roughly 1 : 5e3 : 2.5e7, i.e. cond(D) ~ 2e7. Against
+    % eps('single') = 1.2e-7 that leaves no significant digits: rank() then
+    % reports the design as rank-1 and mldivide returns a collapsed fit (gaze
+    % wrong by tens of degrees). In double the same design has ~9 orders of
+    % headroom. Casting here covers designMatrix, rank, mldivide, rsquared and
+    % the yDegenerate branch in one place.
+    xv = double(pts.xv(keep));
+    yv = double(pts.yv(keep));
+    tx = double(pts.tx(keep));                    % deg, the regressand
+    ty = double(pts.ty(keep));
 
     % Round before grouping: target coordinates carry float jitter (8.66, 4.95).
     [~, ~, cond_id] = unique(round([tx ty], 3), 'rows');
@@ -405,7 +414,13 @@ function [cal, fitpts] = fitOneTask(comments_data, eye_data, task_entry, cal, ..
 
     % Even with enough conditions the grid can be degenerate (e.g. collinear
     % targets), which would leave the coupling column redundant.
-    rankBad = @() rank(Dx) < size(Dx,2) || (~yDegenerate && rank(Dy) < size(Dy,2));
+    % rank() is asked of the EQUILIBRATED design: the raw columns are
+    % [1, v, v.*w] with the eye in uV, so their norms span ~1 : 5e3 : 2.5e7 and
+    % cond(D) ~ 2e7. That scale spread alone can push the smallest singular
+    % value under rank()'s tolerance and make a perfectly good grid look
+    % degenerate. Equilibrating first tests the grid, not the units.
+    rankBad = @() rank(equilibrate(Dx)) < size(Dx,2) || ...
+                  (~yDegenerate && rank(equilibrate(Dy)) < size(Dy,2));
     if use_coupling && rankBad()
         use_coupling = false;
         Dx = designMatrix(xv, yv, use_coupling);
@@ -418,7 +433,7 @@ function [cal, fitpts] = fitOneTask(comments_data, eye_data, task_entry, cal, ..
         return
     end
 
-    coef_x = Dx \ tx;                       % [offset_x; gain_x; couple_xy]
+    coef_x = solveScaled(Dx, tx);           % [offset_x; gain_x; couple_xy]
     cal.R2_x = rsquared(tx, Dx * coef_x);
     if ~use_coupling;  coef_x(3) = 0;  end  % keep a fixed 3-element shape
 
@@ -437,7 +452,7 @@ function [cal, fitpts] = fitOneTask(comments_data, eye_data, task_entry, cal, ..
              'to x gain and only the y offset was fit; y gain may be inaccurate.'], ...
             task_entry, nTargetY, gain_y);
     else
-        coef_y = Dy \ ty;                   % [offset_y; gain_y; couple_yx]
+        coef_y = solveScaled(Dy, ty);       % [offset_y; gain_y; couple_yx]
         cal.R2_y = rsquared(ty, Dy * coef_y);
         if ~use_coupling;  coef_y(3) = 0;  end
     end
@@ -781,6 +796,36 @@ function D = designMatrix(v_main, v_other, use_coupling)
     else
         D = [ones(numel(v_main),1), v_main];
     end
+end
+
+function [Dn, s] = equilibrate(D)
+% Rescale each column of D to unit RMS, returning the scaled design and the
+% scale factors. The eye enters in uV, so the raw columns [1, v, v.*w] have
+% norms spanning ~1 : 5e3 : 2.5e7 and cond(D) ~ 2e7 -- entirely an artefact of
+% the units, not of the calibration grid. Equilibrating removes it, which both
+% makes rank() judge the grid rather than the scaling and keeps the solve well
+% conditioned.
+%
+% Only SCALING is applied, never centring. The fitted model is
+%   t = offset + gain*v + couple*v*w
+% which has no standalone w term, so subtracting a mean from v or w would
+% expand to one and could not be folded back into these three coefficients.
+% Pure column scaling is exactly invertible (see solveScaled).
+    s = sqrt(mean(D.^2, 1));
+    s(~isfinite(s) | s == 0) = 1;      % constant/empty column -> leave it alone
+    Dn = D ./ s;
+end
+
+function c = solveScaled(D, t)
+% Least-squares solve of D*c = t, done on the equilibrated design and mapped
+% back so c is in the ORIGINAL column units. Callers (and the cached
+% EyeCalibration.txt, and applyAxis) therefore keep the same coefficient
+% meaning: t = c(1) + c(2)*v + c(3)*v*w on raw uV.
+%
+% Exact because scaling column j by s(j) simply divides c(j) by s(j):
+%   (D./s) * (c.*s) == D * c
+    [Dn, s] = equilibrate(D);
+    c = (Dn \ t) ./ s(:);
 end
 
 

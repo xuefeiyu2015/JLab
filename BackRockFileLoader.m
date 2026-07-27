@@ -10,11 +10,16 @@
 % files -- June 19th, 2026
 % Migrate to the object-oriented BlackrockLoader: this script is now a thin
 % driver that constructs one loader, then per date folder calls
-% loader.processFolder (load -> parseEvents -> parseAnalog -> parseSpikes ->
+% loader.processFolder (load -> parseEvents -> parseEye -> parseSpikes ->
 % prepareExport -> export). All load/parse/prepare/export/templates/maps logic
 % lives in ToolsAndFunctions/LoadingTools/BlackrockLoader.m -- June 27th, 2026
-% add methods for loading and parsing photodio and lfps
-clear
+% Add methods for loading and parsing LFP (Hub-*.ns2) and photodiode
+% (sliced from the eye ns2 by default, else a dedicated NSP-*.ns4) -- July 26th, 2026
+% 'clear classes', not plain 'clear': plain clear drops variables but KEEPS the
+% compiled BlackrockLoader definition, so after editing the class MATLAB happily
+% runs the stale version and any fix appears to have no effect. This must stay
+% the first executable line -- clear classes wipes the workspace as well.
+clear classes %#ok<CLCLS>
 close all
 
 %% Check if the path is setup ready
@@ -71,17 +76,50 @@ Folder = {'2026-07-24'};
 FolderList = BlackrockLoader.resolveFolders(Folder, DataTypePath);
 
 %% Load configuration (passed to the loader; exports reuse the buffers)
-% Analog (eye) data lives in NSP-*.ns2; online spikes live in HUB-*.nev. Both
+% Eye data lives in NSP-*.ns2 (photodiode on channels 4-6 of the same file);
+% online spikes live in HUB-*.nev. Both
 % are gated here and are soft failures inside loadSession (that product is just
 % skipped, recorded in the returned status string).
-LoadAnalogData      = true;
+LoadEyeData      = true;
 LoadOnlineSpikeData = true;  %default is false for online spikes
-LoadOnlineSpikeWaveform   = true;   % default is false: also export per-spike waveforms (uV) to a
+LoadOnlineSpikeWaveform = true;   % default is false: also export per-spike waveforms (uV) to a
                                % separate *_spikes_waveform_matlab.mat (needs online spikes; memory heavy)
 %IncludeUnsorted = false;       % default false: drop unit 0 (unsorted) + 255 (noise)
                                % spikes; set true to keep them
-%AnalogIdentifier    = '*.ns2'; %default ns2
-SpikePrefix         = 'HUB';   % default HUB-*.nev: online spike timing
+%EyeIdentifier    = '*.ns2'; %default ns2
+%SpikePrefix         = 'HUB';   % default HUB-*.nev: online spike timing
+
+% LFP lives in Hub-*.ns2 (same extension as the eye file, different
+% prefix); gated + soft failure just like eye/spikes above.
+LoadLFPData         = true;   % default off
+%LFPPrefix           = 'Hub';   % default Hub-*.ns2
+%LFPIdentifier       = '*.ns2'; %default ns2
+
+% Photodiode: by default it rides in the eye NSP-*.ns2 stream on channels 4/5/6,
+% with the eye signal on channels 1-3. That file is read and segmented ONCE and
+% the per-trial result is split by row, so the photodiode costs no extra read
+% and no extra segmentation pass. Falls back to a dedicated NSP-*.ns4 file if
+% the eye stream doesn't have that many channels, or goes straight to it if
+% PhotodiodeUseSeparateFile is set.
+LoadPhotodiodeData        = true;   % default off
+%EyeChannels               = [1 2 3];   % eye rows in the eye ns2
+%PhotodiodeChannels        = [4 5 6];     % photodiode rows in the eye ns2
+%PhotodiodeUseSeparateFile = false;     % true = load the separate file directly
+%PhotodiodePrefix          = 'NSP';     % fallback/forced separate-file prefix
+%PhotodiodeIdentifier      = '*.ns4';   % fallback/forced separate-file extension
+
+% Runtime behaviour (all optional; defaults shown)
+%Verbose           = false;  % print per-event parsing chatter from parseEvents.
+                             % Off by default -- unmatched events are reported as
+                             % a single summary warning instead.
+%FreeRawAfterParse = true;   % release each raw continuous stream as soon as its
+                             % per-trial product exists. Set false to keep
+                             % loader.Loaded fully inspectable for debugging.
+%CompressExport    = true;   % gzip the .mat exports. On by default: the per-trial
+                             % arrays are mostly NaN padding and compress ~6x
+                             % (9.0 GB -> 1.45 GB for one session) for ~60 s of
+                             % single-threaded gzip. Set false to spend the disk
+                             % and save the time on a quick turnaround.
 
 % Trial-segmentation buffers (ms). Window per trial = [Start - Pre, End + Post].
 % Defaults are 500 ms; edit here to change how much is kept around each trial.
@@ -95,15 +133,26 @@ Segment_BinWidth   = 1;     % spike raster bin width (ms)
 % new comment-string event, add a key in BlackrockLoader.defaultEventMaps() and
 % a matching field in defaultTrialTemplate()/defaultExpTemplate().
 loader = BlackrockLoader( ...
-    'LoadAnalogData',      LoadAnalogData, ...
+    'LoadEyeData',      LoadEyeData, ...
+    'LoadLFPData',         LoadLFPData, ...
+    'LoadPhotodiodeData',  LoadPhotodiodeData, ...
     'LoadOnlineSpikeData', LoadOnlineSpikeData, ...
     'LoadOnlineSpikeWaveform',   LoadOnlineSpikeWaveform, ...
-    'SpikePrefix',         SpikePrefix, ...
     'Segment_PreBuffer',   Segment_PreBuffer, ...
     'Segment_PostBuffer',  Segment_PostBuffer, ...
     'Segment_BinWidth',    Segment_BinWidth);
-
-    %'AnalogIdentifier',    AnalogIdentifier);
+    %'SpikePrefix',         SpikePrefix, ...
+    %'EyeIdentifier',    EyeIdentifier);
+    %'LFPPrefix',           LFPPrefix, ...
+    %'LFPIdentifier',       LFPIdentifier, ...
+    %'Verbose',                   Verbose, ...
+    %'FreeRawAfterParse',         FreeRawAfterParse, ...
+    %'CompressExport',            CompressExport, ...
+    %'EyeChannels',               EyeChannels, ...
+    %'PhotodiodeChannels',        PhotodiodeChannels, ...
+    %'PhotodiodeUseSeparateFile', PhotodiodeUseSeparateFile, ...
+    %'PhotodiodePrefix',          PhotodiodePrefix, ...
+    %'PhotodiodeIdentifier',      PhotodiodeIdentifier, ...
 
 %% Batch process each date folder
 % load -> parse -> export, once per folder in FolderList. A failure in one folder
@@ -134,10 +183,11 @@ for fi = 1:numel(FolderList)
     %}
 
     % --- Run the whole pipeline for this folder ---
-    % load -> parseEvents -> parseAnalog -> parseSpikes -> prepareExport -> export.
-    % All loading/parsing/preparation/writing lives in the class; each step's
-    % result is stored on the loader (loader.Loaded/Trials/Experiment/Analog/
-    % Spike/SpikeWaveformData/Export) if you want to inspect it afterwards.
+    % load -> parseEvents -> parseEye -> parseLFP -> parsePhotodiode ->
+    % parseSpikes -> prepareExport -> export. All loading/parsing/preparation/
+    % writing lives in the class; each step's result is stored on the loader
+    % (loader.Loaded/Trials/Experiment/Eye/LFP/Photodiode/Spike/
+    % SpikeWaveformData/Export) if you want to inspect it afterwards.
 
 
     loader.processFolder(DataFolder, OutputPath, BaseName);
@@ -146,10 +196,12 @@ for fi = 1:numel(FolderList)
    
     %{
      C = loader.loadComments(DataFolder); %loaded raw comments
-     A = loader.loadAnalog(DataFolder); %loaded raw analog
+     A = loader.loadContinuous(DataFolder); %loaded the raw eye stream
    % channels,Optional1, "*.ns2" or "*.ns4","*.ns6",Optional2, preFix:
    % "HUB",'NSP',etc
-   % A = loader.loadAnalog(DataFolder,'*.ns4'); 
+   % A = loader.loadContinuous(DataFolder,'*.ns4');
+   % LFP  = loader.loadContinuous(DataFolder, '*.ns2', 'Hub');   % raw LFP
+   % PD   = loader.loadContinuous(DataFolder, '*.ns4', 'NSP');   % raw dedicated photodiode file
     S = loader.loadSpikes(DataFolder);%load raw online spikes
     %}
 
@@ -157,7 +209,9 @@ for fi = 1:numel(FolderList)
     %{
     loader.load(DataFolder);
     loader.parseEvents();
-    loader.parseAnalog();
+    loader.parseEye();
+    loader.parseLFP();
+    loader.parsePhotodiode();
     loader.parseSpikes();
     loader.prepareExport();
     loader.export(OutputPath, BaseName);

@@ -87,8 +87,16 @@ all_files = {all_files(~[all_files.isdir]).name};
 %Search for comments file
 comments_path = findExportFile(all_files, main_path, 'trials_matlab');
 
-%Search for the Eye data/analog file
-analog_path   = findExportFile(all_files, main_path, 'analog_matlab');
+%Search for the Eye data file. Exports before the eye/photodiode channel split
+%named this '<stem>_analog_matlab.mat' (all channels of the ns2); it is now
+%'<stem>_eye_matlab.mat' (EyeChannels only). Fall back to the old name so
+%already-exported sessions keep working without re-running the loader.
+eye_path      = findExportFile(all_files, main_path, 'eye_matlab');
+if isempty(eye_path)
+    eye_path  = findExportFile(all_files, main_path, 'analog_matlab');
+end
+
+%Search for photodiod file
 
 %Search for online spike file. 'spikes' alone would also catch the waveform
 %file, so it has to be excluded explicitly.
@@ -96,6 +104,8 @@ spike_path    = findExportFile(all_files, main_path, 'spikes', 'spikes_waveform'
 
 %Search for spike waveform file
 waveform_path = findExportFile(all_files, main_path, 'spikes_waveform');
+
+
 
 
 
@@ -110,9 +120,14 @@ else
 end
 
 
-if ~isempty(analog_path)
-    tmp = load(analog_path);
-    eye_data = tmp.analog;
+if ~isempty(eye_path)
+    tmp = load(eye_path);
+    % new exports store 'eye'; older ones stored 'analog' (see above)
+    if isfield(tmp, 'eye')
+        eye_data = tmp.eye;
+    else
+        eye_data = tmp.analog;
+    end
 
     %Eye calibration 
     disp('Start eye calibration');
