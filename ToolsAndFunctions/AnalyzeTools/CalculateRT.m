@@ -40,10 +40,14 @@ function RT = CalculateRT(caled_eyes, comments_data, plotFlag, plotN, errorCheck
 %                                       velocity per target as a griddata surface
 %                                       or discrete colored markers.
 %
-% Returns RT, an nTrials x 9 table of per-trial saccade metrics (one row per trial
+% Returns RT, an nTrials x 10 table of per-trial saccade metrics (one row per trial
 % in comments_data, in order):
-%   Trial, RTtime (s from go cue), SaccadeAmplitude, PeakVelocity,
+%   Session, Trial_number, RTtime (s from go cue), SaccadeAmplitude, PeakVelocity,
 %   StartX, StartY, EndX, EndY, SaccadeDuration.
+% Session/Trial_number are copied from comments_data, matching the key
+% GetPhotodiodeTiming returns and SpikeTrialAlignmentCheck matches on, so every
+% analyze-stage product joins on the same two columns. Trial_number restarts at 0
+% each session, so the PAIR is the identifier -- Trial_number alone is not unique.
 % Every RT comes from the eye trace; trials that were invalid or where no saccade
 % was detected are NaN rows.
 % Note: The detector is not optimized for uncalibrated eye data.
@@ -215,7 +219,7 @@ function payload = computeRTPayload(caled_eyes, comments_data)
     fprintf('%d real RT detected from the eye trace (of %d valid trials).\n', ...
         sum(~isnan(RTtime)), sum(isValid));
 
-    RTtable = buildTable(nTrials, RTtime, ampl, peakVel, ...
+    RTtable = buildTable(comments_data, RTtime, ampl, peakVel, ...
                          startX, startY, endX, endY, durSac);
 
     % Trials rejected because tracker noise landed inside the detected saccade
@@ -636,12 +640,25 @@ function [iOff, ok] = findSaccadeEnd(speed, iCross, iMax, thr, nContig)
 end
 
 
-function tbl = buildTable(nTrials, RTtime, ampl, peakVel, startX, startY, endX, endY, durSac)
+function tbl = buildTable(comments_data, RTtime, ampl, peakVel, startX, startY, endX, endY, durSac)
 % Assemble the per-trial saccade-detail table.
-    Trial = (0:nTrials-1).';
-    tbl = table(Trial, RTtime, ampl, peakVel, startX, startY, endX, endY, durSac, ...
-        'VariableNames', {'Trial', 'RTtime', 'SaccadeAmplitude', 'PeakVelocity', ...
-                          'StartX', 'StartY', 'EndX', 'EndY', 'SaccadeDuration'});
+%
+% Keyed on (Session, Trial_number) copied straight from comments_data -- the
+% same key GetPhotodiodeTiming's buildPDTable emits and SpikeTrialAlignmentCheck
+% matches on, so the analyze-stage products all join to each other and to the
+% comments table on identical columns.
+%
+% This replaces an earlier synthesized `Trial = (0:nTrials-1)'` column. That was
+% a GLOBAL 0-based row index, not a trial number: Trial_number restarts at 0
+% every session (on a real 3-session recording: 0..1805, 0..2473, 0..294), so the
+% row index agreed with it only inside the first session and differed on 2769 of
+% 4575 rows. Trial_number alone is not unique either -- only the (Session,
+% Trial_number) pair is -- which is why both columns are carried.
+    tbl = table(comments_data.Session, comments_data.Trial_number, ...
+        RTtime, ampl, peakVel, startX, startY, endX, endY, durSac, ...
+        'VariableNames', {'Session', 'Trial_number', 'RTtime', 'SaccadeAmplitude', ...
+                          'PeakVelocity', 'StartX', 'StartY', 'EndX', 'EndY', ...
+                          'SaccadeDuration'});
 end
 
 

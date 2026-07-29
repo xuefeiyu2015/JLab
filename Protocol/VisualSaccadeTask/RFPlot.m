@@ -1,6 +1,14 @@
 function rfsummary = RFPlot(data, cfg, plotFlag, savePath)
-% Receptive-field analysis for the visual saccade task: an interactive per-unit
+% Receptive-field analysis for the saccade tasks: an interactive per-unit
 % browser (RF heatmap + 16 spatial PSTHs), built from the OFFLINE spike raster.
+%
+% Task-agnostic. The same RF analysis applies to the visual and the memory
+% saccade task, and the router dispatches this function for both; which one a
+% given call is analyzing is DERIVED from data.comments.Task (resolveActiveTask
+% at the bottom of this file), never hardwired. That label is what tags the
+% per-unit rows in the master analysis summary, and it also scopes the per-task
+% cache file, so the two tasks' results coexist for one session instead of
+% overwriting each other.
 %
 % Ported from the online reference OnlinePlotBlackRock/jivesLink/
 % plotJivesReceptiveField.m (RF grid, spatial PSTHs, 2-D Gaussian fit), but driven
@@ -8,11 +16,12 @@ function rfsummary = RFPlot(data, cfg, plotFlag, savePath)
 % (data.comments) instead of the online `trials` global. The GUI, per-unit navigator,
 % note field, per-unit caching, and cross-task summary CSV mirror spikeCheck.m.
 %
-%   data     - struct from BlackRockFileAnalyzer, already scoped to this task by
+%   data     - struct from BlackRockFileAnalyzer, already scoped to ONE task by
 %              SetupDataForTask: .spike (online_spike raster) and .comments
-%              (trials table, cd) hold only visual-saccade trials, with the raster
+%              (trials table, cd) hold only that task's trials, with the raster
 %              trial dimension 1:1 co-ordered with the comments rows (spike trial j
-%              <-> cd row j). Other fields (.RT/.eyes) are unused here.
+%              <-> cd row j). Other fields (.RT/.eyes) are unused here. Data
+%              spanning more than one task is rejected (see resolveActiveTask).
 %   cfg   - not implemented yet.
 %   plotFlag - (optional, default true) draw the GUI. false runs headless: no
 %              figure; with a savePath every unit's RF is computed, cached, and
@@ -41,7 +50,8 @@ reCompute = true;%Temporarily hardwired here.
     rfsummary = table();
 
     % ── Constants (from the reference) ────────────────────────────────────
-    ACTIVE_TASK  = 'visual_saccades_experiment';  % this folder = this protocol
+    % (the analyzed task is NOT a constant -- it is read from the trials table
+    %  further down, see resolveActiveTask)
     RF_WIN_MS    = [50, 200];
     VIS_WIN_MS   = [-200, 600];
     BIN_MS       = 10;
@@ -76,6 +86,13 @@ reCompute = true;%Temporarily hardwired here.
 
     
     cd_ori    = data.comments;
+
+    % Which task this call is analyzing, taken from the trials table rather than
+    % hardwired -- the same RF analysis serves both saccade tasks. Read from
+    % cd_ori, not the correct-only cd below, so a session with no correct trials
+    % still reports the task it ran.
+    ACTIVE_TASK = resolveActiveTask(cd_ori);
+
     useTrial = strcmp(string(cd_ori.Trialoutcome), 'correct');
     cd = cd_ori(useTrial,:);
 
@@ -106,7 +123,13 @@ reCompute = true;%Temporarily hardwired here.
         cacheFile = '';
     else
         noteFile  = fullfile(savePath, 'AnalysisCache', 'unit_rf_notes.csv');
-        cacheFile = fullfile(savePath, 'AnalysisCache', 'RFSummary.mat');
+        % Cache is per TASK: now that one session can run RFPlot for both the
+        % visual and the memory saccade task, a single RFSummary.mat would have
+        % the second run seed its units from the first task's fits. The note
+        % file stays shared on purpose -- a note is an observation about the
+        % unit, not about one task's fit.
+        cacheFile = fullfile(savePath, 'AnalysisCache', ...
+            sprintf('RFSummary_%s.mat', ACTIVE_TASK));
     end
     notes = loadNotes(noteFile, chan, unit);
     for k = 1:nRow
@@ -249,7 +272,7 @@ reCompute = true;%Temporarily hardwired here.
     selectRow(1);
 
     disp('Waiting for RF screening, will continue after close the RF gui...')
-    uiwait(fig);
+   % uiwait(fig);
 
     % On close: fill + persist so a later reCompute=false run loads it. The figure
     % is already deleted here, so use the params cached by the last redraw rather
@@ -408,7 +431,14 @@ reCompute = true;%Temporarily hardwired here.
         xk = cd.Target_1_position_x;
         yk = cd.Target_1_position_y;
         if visual
-            mk = cd.Target_1_presented;
+           % mk = cd.Target_1_presented;
+           if ismember('Target1OnsetPD', cd.Properties.VariableNames)
+               mk = cd.Target1OnsetPD;
+               disp('Use photodiode timestamp.');
+           else
+               disp('Cannot find the photodiode timing, use timestamp instead.')
+               mk = cd.Target_1_presented;
+           end
         else
             if ismember('RTtime', cd.Properties.VariableNames)
                 mk = cd.RTtime + cd.Fixation_point_off;
@@ -630,6 +660,45 @@ reCompute = true;%Temporarily hardwired here.
         end
     end
 
+end
+
+
+function task = resolveActiveTask(cd)
+% The task this call is analyzing, read from the (already task-scoped) trials
+% table instead of being a constant of this file.
+%
+% RFPlot serves every task that shares this RF analysis -- the router dispatches
+% it for both 'visual_saccades_experiment' and 'memory_saccades_experiment' --
+% so the task name cannot be hardwired. It is not a filter: the data arrives
+% pre-scoped by SetupDataForTask, and this is purely the LABEL written into the
+% per-unit summary's Task column. That column is part of
+% ExportTaskAnalysisSummary's (Monkey, Date, Task, Channel, Unit) upsert key,
+% and re-exporting a (Monkey, Date, Task) block REPLACES it -- so a hardwired
+% label did more than mis-name rows: a memory-saccade run would overwrite the
+% visual-saccade block for the same session's units, and vice versa.
+%
+% Pure: reads the table, returns a char row vector.
+    if ~ismember('Task', cd.Properties.VariableNames)
+        error('RFPlot:NoTaskColumn', ...
+            'data.comments has no Task column, so the analyzed task cannot be identified.');
+    end
+
+    tasks = unique(cellstr(string(cd.Task)));      % handles cellstr or string
+    if isempty(tasks)
+        error('RFPlot:NoTrials', ...
+            'data.comments is empty; nothing to identify the analyzed task from.');
+    end
+    if numel(tasks) > 1
+        % Fatal rather than picking one: this value keys the master-summary
+        % upsert, so guessing here would silently overwrite another task's
+        % stored results instead of producing an obviously wrong figure.
+        error('RFPlot:MixedTasks', ...
+            ['data.comments spans %d tasks (%s). RFPlot expects data already ' ...
+             'scoped to a single task by SetupDataForTask.'], ...
+            numel(tasks), strjoin(tasks', ', '));
+    end
+
+    task = tasks{1};
 end
 
 

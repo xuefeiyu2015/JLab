@@ -44,16 +44,18 @@ Folder = '2026-07-24';
 
 
 %Toddles to turn quality check plots on
-%{
+%
 PlotBehaviorCheck= true; % for visualizing behavior summary
 PlotCalibratedEyes = true;% for plotting eye trace after calibration
-PlotSpikeCheck = true; %turn on the spike navigator interface
+PlotPhotodiodeTiming = true; % for plotting photodiode timing QC
+PlotSpikeCheck = false; %turn on the spike navigator interface
 PlotSaccadeCheck = true; %turn on the plots for saccade detection and saccade related visualizations
 TaskRouter = true; %turn on the task rounter for individual task based analysis
 %}
-%
+%{
 PlotBehaviorCheck= false; % for visualizing behavior summary
 PlotCalibratedEyes = false;% for plotting eye trace after calibration
+PlotPhotodiodeTiming = true; % for plotting photodiode timing QC
 PlotSpikeCheck = false; %turn on the spike navigator interface
 PlotSaccadeCheck = false; %turn on the plots for saccade detection and saccade related visualizations
 TaskRouter = true; %turn on the task rounter for individual task based analysis
@@ -65,14 +67,16 @@ TaskRouter = true; %turn on the task rounter for individual task based analysis
 
 %
 ReComputeBehavior = false;
-ReComputeCal      = false;
+ReComputeCal      = true;
+ReComputePhotodiode = true;
 ReComputeSpike    = false;
-ReComputeRT       = false;
+ReComputeRT       = true;
 ReComputeRF       = false;
 %}
 %{
 ReComputeBehavior = true;
 ReComputeCal      = true;
+ReComputePhotodiode = true;
 ReComputeSpike    = true;
 ReComputeRT       = true;
 ReComputeRF       = true;
@@ -96,7 +100,8 @@ if isempty(eye_path)
     eye_path  = findExportFile(all_files, main_path, 'analog_matlab');
 end
 
-%Search for photodiod file
+%Search for photodiode file
+photodiode_path = findExportFile(all_files, main_path, 'photodiode_matlab');
 
 %Search for online spike file. 'spikes' alone would also catch the waveform
 %file, so it has to be excluded explicitly.
@@ -150,6 +155,19 @@ if ~isempty(eye_path)
 else
     disp('No parsed eye data found');
     caled_eyes.cal.applied = false;
+end
+
+if ~isempty(photodiode_path)
+    tmp = load(photodiode_path);
+    photodiode_data = tmp.photodiode;
+
+    disp('Start processing photodiode timing');
+    PDTiming = GetPhotodiodeTiming(photodiode_data, comments_data, PlotPhotodiodeTiming, [], main_path, ReComputePhotodiode);
+    disp('Photodiode timing processing completed.');
+else
+    disp('No parsed photodiode data found');
+    photodiode_data = [];
+    PDTiming = [];
 end
 
 if ~isempty(spike_path)
@@ -212,7 +230,7 @@ end
 % Field names must match the protocol contract: the per-task analyzers
 % (RFPlot, TimeDiscriminationBehavior, ...) read the trials table as data.comments.
 % extend the comments table by adding RT table.
-extended_comments = extendComments(comments_data,RT);
+extended_comments = extendComments(comments_data,RT,PDTiming);
 data_ana = struct('comments',extended_comments,'eyes',[],'spike',filtered_spike_data);
 
 
@@ -229,10 +247,10 @@ for i = 1:length(tasklist)
     data_task = SetupDataForTask(data_ana, task);
     switch task
         case 'visual_saccades_experiment'
-            %vse_result = RFPlot(data_task,data_extra,plotFlag,main_path,ReComputeRF);
+            vse_result = RFPlot(data_task,data_extra,plotFlag,main_path,ReComputeRF);
         case 'memory_saccades_experiment'
            % mse_result = FunctionSubtypeIdentify(data_task,cfg,plotFlag);
-            vse_result = RFPlot(data_task,cfg,plotFlag,main_path);
+            mse_result = RFPlot(data_task,cfg,plotFlag,main_path);
         case 'time_delay_experiment'
             tde_result = TimeDiscriminationBehavior(data_task,cfg,plotFlag);
         otherwise

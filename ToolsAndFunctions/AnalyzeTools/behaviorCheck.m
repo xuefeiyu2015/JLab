@@ -531,10 +531,11 @@ function drawSuccessRate(ax, B)
             'FontSize', 8, 'Color', colors(ci,:)*0.6);
     end
 
-    x = (1:SR.n).';
+    x   = (1:SR.n).';
+    col = outcomeColors();           % same green the saccade-condition bars use
     plot(ax, SR.curveX, SR.curveY, '-k', 'LineWidth', 1.5);
-    plot(ax, x(SR.success), 1.005*ones(sum(SR.success),1), '|', 'Color', [0 .6 0], 'MarkerSize', 3);
-    plot(ax, x(~SR.success), -0.005*ones(sum(~SR.success),1), '|', 'Color', [.8 0 0], 'MarkerSize', 3);
+    plot(ax, x(SR.success), 1.005*ones(sum(SR.success),1), '|', 'Color', col.success, 'MarkerSize', 3);
+    plot(ax, x(~SR.success), -0.005*ones(sum(~SR.success),1), '|', 'Color', col.fail, 'MarkerSize', 3);
 
     ylim(ax, [-0.02 1.35]);          % headroom for the per-block labels
     xlim(ax, [0.5 SR.n+0.5]);
@@ -667,7 +668,10 @@ function drawSaccadeConditions(tl, tile, SC)
     col = outcomeColors();
     for i = 1:numel(SC.rows)
         ax = nexttile(inner);
-        bar(ax, 1:nAng, SC.rows(i).nCor, 'FaceColor', col.correct);
+        % Green, matching the running-success panel: these bars are SUCCESSFUL
+        % trials (a saccade task has no wrong trials), so they sit on the
+        % completion axis, not the choice-accuracy axis the panel below uses.
+        bar(ax, 1:nAng, SC.rows(i).nCor, 'FaceColor', col.success);
         xlim(ax, [0.5 nAng+0.5]);
         ylabel(ax, sprintf('%.3g\\circ', SC.rows(i).ecc));
         set(ax, 'LineWidth', 1, 'FontSize', 9, 'XTick', 1:nAng);
@@ -737,7 +741,29 @@ end
 
 
 function col = outcomeColors()
-% Colours for the successful-trial categories, shared by both condition panels
-% so a stack means the same thing in each.
-    col = struct('correct', [0.2 0.6 0.3], 'wrong', [0.8 0.4 0.4]);
+% Shared palette for the outcome panels. TWO orthogonal axes live in this
+% figure, and they deliberately do NOT share colours:
+%
+%   completion      - did the trial finish? success = correct|wrong.
+%                     .success (green) / .fail (red). Owned by the running-
+%                     success panel, and reused by the saccade-condition panel
+%                     because its bars are successful trials (a saccade task
+%                     has no wrong trials, so correct == successful there).
+%   choice accuracy - WITHIN completed trials, was the choice right?
+%                     .correct (blue) / .wrong (amber). Choice-condition panel
+%                     only.
+%
+% Keeping the two axes disjoint is the whole point: success INCLUDES wrong, so
+% a wrong trial is green on the completion axis. Painting it red on the accuracy
+% axis made one trial read as a failure in one panel and a success in another.
+% Blue/amber is also the standard colourblind-safe categorical pair and, unlike
+% green/red, stays separable in greyscale.
+%
+% The completion pair is defined here rather than inline in drawSuccessRate so
+% the green the saccade panel uses is literally the same value, not a second
+% copy that can drift out of step.
+    col = struct('success', [0   0.6 0  ], ...      % green - trial completed
+                 'fail',    [0.8 0   0  ], ...      % red   - broke / timeout
+                 'correct', [0.20 0.40 0.70], ...   % blue  - right choice
+                 'wrong',   [0.90 0.60 0.20]);      % amber - wrong choice
 end
