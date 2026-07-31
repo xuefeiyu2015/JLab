@@ -1,4 +1,4 @@
-function rfsummary = RFPlot(data, cfg, plotFlag, savePath)
+function rfsummary = RFPlot(data, cfg, plotFlag, savePath, reCompute)
 % Receptive-field analysis for the saccade tasks: an interactive per-unit
 % browser (RF heatmap + 16 spatial PSTHs), built from the OFFLINE spike raster.
 %
@@ -29,6 +29,11 @@ function rfsummary = RFPlot(data, cfg, plotFlag, savePath)
 %   savePath - (optional) export folder (.../Monkey <name>/.../<date>). '' turns
 %              persistence/export off. Used by the Export button, the headless path,
 %              and the on-close cache write.
+%   reCompute- (optional, default true) when true, recompute every unit's RF and
+%              refresh the cache. When false, the per-unit results are loaded from
+%              <savePath>/AnalysisCache/RFSummary_<task>.mat instead. The cache is
+%              scoped per task, so the visual and memory saccade runs of one
+%              session do not overwrite each other.
 
 %
 % Returns rfsummary, a per-unit table (Channel, Unit, RF fit params, peak FR, trial
@@ -41,11 +46,9 @@ function rfsummary = RFPlot(data, cfg, plotFlag, savePath)
 %
 % Xuefei Yu Jul 2026
 
-reCompute = true;%Temporarily hardwired here.
-
     if nargin < 3 || isempty(plotFlag);   plotFlag  = true;  end
     if nargin < 4;                        savePath  = '';    end
-   % if nargin < 5 || isempty(reCompute);  reCompute = true;  end
+    if nargin < 5 || isempty(reCompute);  reCompute = true;  end
 
     rfsummary = table();
 

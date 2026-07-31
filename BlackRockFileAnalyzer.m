@@ -43,47 +43,93 @@ DataType = 'export_data';     % editable constant
 Folder = '2026-07-24';
 
 
-%Toddles to turn quality check plots on
+%% -------------------------------------------------------------------------
+%% 3. PREPROCESSING CONFIGURATION -- one struct per block
+%% -------------------------------------------------------------------------
+% Every preprocessing block has .Plot and .ReCompute; the blocks that read an
+% exported file also have .KeepFullFile. The remaining fields are that block's own
+% parameters. Omit a field (or set it []) and the wrapped function's own
+% documented default applies -- no default is invented here or in the wrappers.
+% NOTE: a cell value needs DOUBLE braces inside struct(), e.g.
+% 'TaskCal', {{'fixation'}} -- a single brace builds a struct ARRAY.
 %
-PlotBehaviorCheck= true; % for visualizing behavior summary
-PlotCalibratedEyes = true;% for plotting eye trace after calibration
-PlotPhotodiodeTiming = true; % for plotting photodiode timing QC
-PlotSpikeCheck = false; %turn on the spike navigator interface
-PlotSaccadeCheck = true; %turn on the plots for saccade detection and saccade related visualizations
-TaskRouter = true; %turn on the task rounter for individual task based analysis
-%}
-%{
-PlotBehaviorCheck= false; % for visualizing behavior summary
-PlotCalibratedEyes = false;% for plotting eye trace after calibration
-PlotPhotodiodeTiming = true; % for plotting photodiode timing QC
-PlotSpikeCheck = false; %turn on the spike navigator interface
-PlotSaccadeCheck = false; %turn on the plots for saccade detection and saccade related visualizations
-TaskRouter = true; %turn on the task rounter for individual task based analysis
-%}
-% ReCompute flags: default true recomputes and refreshes the AnalysisCache
-% (<main_path>/AnalysisCache). Set one false to load that product from cache
-% instead of recomputing (the plots still redraw from the cached data). The eye
-% calibration is cached as a readable text file; the others as .mat.
+% .ReCompute = false loads that product from <main_path>/AnalysisCache instead of
+% recomputing it (the plots still redraw from the cached data), and -- the point
+% of the cascade -- also stops the exported file behind it being read at all.
+% .KeepFullFile = true forces the export to be read regardless and returns it in
+% the block's second output, for further analysis afterwards; false frees it as
+% soon as the block returns. The one rule lives in needFullFile.m.
+% The eye calibration is cached as a readable text file; the others as .mat/.csv.
 
-%
-ReComputeBehavior = false;
-ReComputeCal      = true;
-ReComputePhotodiode = true;
-ReComputeSpike    = false;
-ReComputeRT       = true;
-ReComputeRF       = false;
-%}
-%{
-ReComputeBehavior = true;
-ReComputeCal      = true;
-ReComputePhotodiode = true;
-ReComputeSpike    = true;
-ReComputeRT       = true;
-ReComputeRF       = true;
-%}
+cfg = struct();
 
-%Check all the exported files in the folder
+cfg.Behavior = struct( ...      % reads no export of its own -- comments only
+    'Plot',         true, ...   % visualize the behavior summary
+    'ReCompute',    false);
 
+% Calibration candidates in priority order: a session with a dedicated fixation
+% block calibrates off it, otherwise off whichever saccade task it ran.
+cfg.Eye = struct( ...
+    'Plot',         true, ...   % plot eye traces after calibration
+    'ReCompute',    false, ...
+    'KeepFullFile', false, ...  % true also returns the uncalibrated uV traces
+    'TaskCal',      {{'fixation', 'visual_saccade', 'memory_saccade'}}, ...
+    'HoldWinMs',    [100 300], ...
+    'EyeChans',     [1 2], ...
+    'CalSessions',  [], ...
+    'NCalTrials',   []);
+
+cfg.Photodiode = struct( ...
+    'Plot',             true, ...   % photodiode timing QC figures
+    'PlotN',            50, ...
+    'ReCompute',        false, ...
+    'KeepFullFile',     false, ...  % true also returns the photodiode traces
+    'BaselineWindow',   [-0.2 -0.02], ...
+    'SearchWindow',     [-0.05 0.3], ...
+    'OffsetSearchSpan', 2, ...
+    'PlotWindow',       [-0.3 0.5], ...
+    'OffsetPlotWindow', [-0.5 0.3], ...
+    'NWorst',           20, ...
+    'NSD',              3, ...
+    'NContig',          5, ...
+    'ChannelMap',       [1 2 3], ...
+    'Polarity',         'auto', ...
+    'SuccessOutcomes',  {{'correct', 'wrong'}});
+
+% Plot is the one flag here that also drives loading: the navigator's waveform
+% and PCA panels draw individual waveforms, and the cache keeps only each unit's
+% per-task mean waveform and PCA result, so an open GUI reads the waveform export
+% even on a cached run. NSample bounds what that costs to draw -- it is purely a
+% drawing cap: the rates, SNR, width, P2V, the mean traces and the PCA all run on
+% every spike, so no reported number moves with it.
+cfg.Spike = struct( ...
+    'Plot',         true, ...  % turn on the spike navigator interface
+    'ReCompute',    false, ...
+    'NSample',      1000, ...  % waveforms/task/unit drawn in the panel; NaN = all
+    'KeepFullFile', false);     % true also returns the spike waveforms (the
+                                % largest export); the raster always comes back
+
+cfg.RT = struct( ...            % reads no export -- consumes the calibrated eyes
+    'Plot',          true, ...  % saccade detection + saccade-map figures
+    'PlotN',         50, ...
+    'ErrorCheck',    true, ...
+    'ReCompute',     false, ...
+    'EndpointStyle', 'kde', ...
+    'PeakVelStyle',  'surface');
+
+cfg.Screen = struct( ...        % were hardcoded inside ScreenSession
+    'RemoveTaskLessThanTrials', 3, ...   % drop tasks with fewer successful trials
+    'RemoveAvgFRLessThan',      1);      % Hz; drop units firing slower than this
+
+% The task router is analysis, not preprocessing, so its flags stay standalone.
+TaskRouter  = true;   % turn on the task router for individual task based analysis
+plotFlag    = 1;      % turn the per-protocol plots on
+ReComputeRF = false;  % RFPlot's per-task cache
+
+
+%% -------------------------------------------------------------------------
+%% 4. RESOLVE THE EXPORTED FILES  (paths only -- nothing is read yet)
+%% -------------------------------------------------------------------------
 main_path = fullfile(Basic_Path, sprintf('Monkey %s', Monkey), Location, DataType, Folder);
 all_files = dir(main_path);
 all_files = {all_files(~[all_files.isdir]).name};
@@ -112,108 +158,48 @@ waveform_path = findExportFile(all_files, main_path, 'spikes_waveform');
 
 
 
+%% -------------------------------------------------------------------------
+%% 5. PREPROCESSING -- each block reads only the file it needs
+%% -------------------------------------------------------------------------
+% Every block below gets a PATH plus its config struct and decides for itself
+% whether the exported file has to be read: only when KeepFullFile asked for it,
+% when that block recomputes, or when the cached product it would otherwise
+% reuse is missing. Otherwise it hands [] to the analyze function, which takes
+% its own cache branch and never looks at it, so the export stays unread. The
+% trials CSV is the one eager load -- every block needs it.
+%
+% The trailing output of each block is the exported file it read, or [] when
+% KeepFullFile is false, so those arrays only stay in memory when asked for.
 
-
-if ~isempty(comments_path)
-    comments_data = readtable(comments_path);
-    BehaviorSummary = behaviorCheck(comments_data, PlotBehaviorCheck, main_path, ReComputeBehavior);
-   
-else
-    
+if isempty(comments_path)
     error('No parsed trials data found. Please parse the data using the loader first.');
-    
 end
+comments_data = readtable(comments_path);
 
+BehaviorSummary = PrepareBehavior(comments_data, cfg.Behavior, main_path);
 
-if ~isempty(eye_path)
-    tmp = load(eye_path);
-    % new exports store 'eye'; older ones stored 'analog' (see above)
-    if isfield(tmp, 'eye')
-        eye_data = tmp.eye;
-    else
-        eye_data = tmp.analog;
-    end
+% Eye calibration and RT are one dependency chain, so they sit together: RT is
+% the only consumer of calibrated traces, and EyeCalibration has to touch the
+% whole array even when its coefficients come from cache. Asking up front
+% whether RT is going to recompute is what lets the eye export go unread
+% otherwise. Running RT here rather than at the end also means the calibrated
+% copy is finished with before the photodiode and waveform loads below, instead
+% of staying resident across them.
+rtWillCompute = needFullFile(cfg.RT, main_path, 'RT', {'.mat', '.csv'});
+[caled_eyes, eye_data] = PrepareEyes(eye_path, comments_data, cfg.Eye, ...
+                                     main_path, rtWillCompute);
 
-    %Eye calibration 
-    disp('Start eye calibration');
+%Add RT to saccade tasks.
+RT = PrepareRT(caled_eyes, comments_data, cfg.RT, main_path);
 
-    % Candidates in priority order: a session with a dedicated fixation block
-    % calibrates off it, otherwise off whichever saccade task it ran.
-    task_cal  = {'fixation', 'visual_saccade', 'memory_saccade'};
-    
-    caled_eyes = EyeCalibration(comments_data,eye_data,task_cal,[],[], PlotCalibratedEyes,[],[], main_path, ReComputeCal);
+[PDTiming, photodiode_data] = PreparePhotodiode(photodiode_path, comments_data, ...
+                                                cfg.Photodiode, main_path);
 
-    if caled_eyes.cal.applied == false
-        disp('Eye calibration failed!');
-        
-    else
-        disp('Eye calibration completed.');
-        
-    end
-
-
-else
-    disp('No parsed eye data found');
-    caled_eyes.cal.applied = false;
-end
-
-if ~isempty(photodiode_path)
-    tmp = load(photodiode_path);
-    photodiode_data = tmp.photodiode;
-
-    disp('Start processing photodiode timing');
-    PDTiming = GetPhotodiodeTiming(photodiode_data, comments_data, PlotPhotodiodeTiming, [], main_path, ReComputePhotodiode);
-    disp('Photodiode timing processing completed.');
-else
-    disp('No parsed photodiode data found');
-    photodiode_data = [];
-    PDTiming = [];
-end
-
-if ~isempty(spike_path)
-    tmp = load(spike_path);
-    spike_data = tmp.online_spike;
-
-    if ~isempty(waveform_path)
-        tmp = load(waveform_path);
-        spikewaveform_data = tmp.online_spike_waveform;
-    else
-        disp('No spike waveform found');
-        spikewaveform_data = [];
-    end
-
-    
-    SpikeSummary = spikeCheck(spike_data, spikewaveform_data, ...
-                                   comments_data, main_path, PlotSpikeCheck, ReComputeSpike );
-
-    % Surface the loader's precomputed per-unit average waveform (uV). Rows of
-    % SpikeSummary align 1:1 with spike_data.info (one row per unit, same order).
-    if ~isempty(SpikeSummary) && isfield(spike_data.info, 'MeanWaveform') ...
-            && ~isempty(spike_data.info.MeanWaveform)
-        SpikeSummary.AverageWaveform = spike_data.info.MeanWaveform;  % nRow x nSamp (uV)
-    end
-    if PlotSpikeCheck
-        disp('Completed spikecheck!')
-    end
-   
-    
-else
-    disp('No spike data found');
-    spike_data = [];
-    SpikeSummary = []; 
-end
-
+[SpikeSummary, spike_data, spikewaveform_data] = PrepareSpikes(spike_path, ...
+                              waveform_path, comments_data, cfg.Spike, main_path);
 
 %Screen the tasks and spikes according to the behavior and spike check.
-[excludeTasks, excludeSpikes] = ScreenSession(BehaviorSummary, SpikeSummary);
-
-%comments_data
-%caled_eyes
-%spike_data
-%spike_waveform_data
-
-%% Preprossing: Add RT to saccade tasks.
-RT = CalculateRT(caled_eyes, comments_data, PlotSaccadeCheck, [], [], main_path, ReComputeRT);
+[excludeTasks, excludeSpikes] = ScreenSession(BehaviorSummary, SpikeSummary, cfg.Screen);
 
 if TaskRouter
 %% Auto-rounting to it's respective analyze protocol
@@ -235,9 +221,10 @@ data_ana = struct('comments',extended_comments,'eyes',[],'spike',filtered_spike_
 
 
 data_extra =[]; %returned data from another task
-plotFlag = 1; %Flag of whether to turn the plot on;
 %No need the raw waveform for now, may be extend later
-cfg = [];%Reserved for future, for configuration for batch analysis
+%Reserved for future, for configuration for batch analysis. Named protocol_cfg
+%so it does not collide with the preprocessing config struct above.
+protocol_cfg = [];
 
 %Now loop over tasks to rount data into their task-related protocols
 for i = 1:length(tasklist)
@@ -249,10 +236,10 @@ for i = 1:length(tasklist)
         case 'visual_saccades_experiment'
             vse_result = RFPlot(data_task,data_extra,plotFlag,main_path,ReComputeRF);
         case 'memory_saccades_experiment'
-           % mse_result = FunctionSubtypeIdentify(data_task,cfg,plotFlag);
-            mse_result = RFPlot(data_task,cfg,plotFlag,main_path);
+           % mse_result = FunctionSubtypeIdentify(data_task,protocol_cfg,plotFlag);
+            mse_result = RFPlot(data_task,protocol_cfg,plotFlag,main_path,ReComputeRF);
         case 'time_delay_experiment'
-            tde_result = TimeDiscriminationBehavior(data_task,cfg,plotFlag);
+            tde_result = TimeDiscriminationBehavior(data_task,protocol_cfg,plotFlag);
         otherwise
             fprintf('No analyze protocol for %s yet\n',task);
      
@@ -288,32 +275,9 @@ keyboard
 
 %% -------------------------------------------------------------------------
 %% -------------------------------------------------------------------------
-function p = findExportFile(all_files, main_path, pattern, exclude)
-% Resolve one exported product in main_path by a rough name match.
-%
-%   all_files - cellstr of file names in main_path.
-%   pattern   - substring the name must contain (e.g. 'analog').
-%   exclude   - (optional) substring that disqualifies a match. Needed for
-%               'spikes', which would otherwise also catch 'spikes_waveform'.
-%
-% Returns '' when nothing matches, so callers can guard with exist().
-
-    hit = all_files(contains(all_files, pattern));
-    if nargin > 3 && ~isempty(exclude)
-        hit = hit(~contains(hit, exclude));
-    end
-
-    if isempty(hit)
-        p = '';
-        return
-    end
-    if numel(hit) > 1
-        error('findExportFile:Ambiguous', ...
-            'Multiple files match "%s" in %s:\n  %s', ...
-            pattern, main_path, strjoin(hit, '\n  '));
-    end
-    p = fullfile(main_path, hit{1});
-end
+% findExportFile now lives in ToolsAndFunctions/AnalyzeTools/findExportFile.m (on
+% the path via genpath), so the path resolution above resolves to that file and a
+% batch driver can use the same resolver.
 
 function filtered = ScreenSpikeData(spike, exclude);
 

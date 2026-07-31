@@ -16,6 +16,12 @@ function ex = extendComments(comments, varargin)
     % were switched to the real key.
     keyCols = { 'Session', 'Trial_number'};
 
+    % A product this session does not have comes in as [] (no photodiode file ->
+    % PDTiming = []). Drop those rather than failing the row-count check below
+    % with "Table 2 has 0 rows, expected N": the caller can then always write
+    % extendComments(comments, RT, PDTiming) without guarding each product.
+    varargin = varargin(~cellfun(@isempty, varargin));
+
     nRows = cellfun(@height, varargin);
     bad   = find(nRows ~= height(comments), 1);
     if ~isempty(bad)

@@ -26,13 +26,12 @@ function payload = getCachedPayload(savePath, name, reCompute, computeFcn)
 %
 % Xuefei Yu Jul 2026
 
-    cacheFile = '';
-    if ~isempty(savePath)
-        cacheFile = fullfile(char(savePath), 'AnalysisCache', [name '.mat']);
-    end
+    % hasCachedProduct owns the cache-path convention, so the Prepare* blocks
+    % (through needFullFile) test for exactly the file this function would read.
+    [cacheExists, cacheFile] = hasCachedProduct(savePath, name, '.mat');
 
     % Cache hit: only when the caller opted out of recompute and the file is there.
-    if ~reCompute && ~isempty(cacheFile) && exist(cacheFile, 'file')
+    if ~reCompute && cacheExists
         L = load(cacheFile);
         payload = L.payload;
         return
