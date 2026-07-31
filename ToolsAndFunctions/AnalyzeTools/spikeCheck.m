@@ -1,4 +1,4 @@
-function spikesummary = spikeCheck(spike, waveform, cd, savePath, plotFlag, reCompute)
+function spikesummary = spikeCheck(spike, waveform, cd, savePath, plotFlag, reCompute, nSample)
 % Spike quality check: an interactive per-unit browser, standalone and callable
 % right after loading the spike raster (and optionally the waveform product).
 %
@@ -20,13 +20,25 @@ function spikesummary = spikeCheck(spike, waveform, cd, savePath, plotFlag, reCo
 %              button.
 %   reCompute- (optional, default true) when true, compute the per-unit metrics
 %              and refresh the AnalysisCache. When false and savePath is set, the
-%              per-unit scalar metrics are seeded from
+%              per-unit scalar metrics and cached panel data are seeded from
 %              <savePath>/AnalysisCache/SpikeSummary.mat, so a headless call
 %              skips the expensive waveform/PCA fill. Exclusions always come from
 %              unit_qc_exclusions.csv; GUI edits re-save the cache on close.
+%   nSample  - (optional, default 1000) how many waveforms per task per unit are
+%              drawn in the waveform panel, picked at random on every call.
+%              NaN / Inf draws every waveform. This is a drawing cap and nothing
+%              else: SNR / width / peak-to-valley, the per-task mean waveform and
+%              the PCA all run on every spike, so no reported number moves with
+%              nSample.
 %
 % Returns spikesummary, a table of per-unit column vectors: Channel, Unit, AvgFR
 % (overall firing rate, Hz), ViolationRate (overall ISI-violation rate).
+%
+% The AnalysisCache payload holds, per unit, the scalar QC metrics plus a compact
+% panel record: the per-task mean waveform and the PCA axes/scores/centroids. The
+% individual waveforms are NOT cached (that is what keeps the cache ~1 MB rather
+% than a copy of the export), so an open GUI still needs the waveform product --
+% PrepareSpikes reads it whenever Plot is true for exactly that reason.
 %
 % Computation is separated from visualization: the per-unit numbers are assembled
 % by computeUnit (pure, no graphics) from the reusable spike-computation functions
@@ -42,6 +54,8 @@ function spikesummary = spikeCheck(spike, waveform, cd, savePath, plotFlag, reCo
     if nargin < 4;  savePath = '';  end
     if nargin < 5 || isempty(plotFlag);  plotFlag = true;  end
     if nargin < 6 || isempty(reCompute);  reCompute = true;  end
+    if nargin < 7 || isempty(nSample);  nSample = 1000;  end
+    if ~isfinite(nSample);  nSample = NaN;  end   % NaN / Inf both mean "all"
     RATE_THRESH = 5;      % Hz; baseline / overall firing below this is flagged
     WAVE_FS     = 30000;  % Hz; Blackrock NEV online waveform sample rate
     REASONS     = {'ISI violation', 'Unit Loss', 'Bad Isolation', 'Noise', 'Other'};
@@ -108,6 +122,10 @@ function spikesummary = spikeCheck(spike, waveform, cd, savePath, plotFlag, reCo
     % fillAllMetrics), switching back to it re-renders from the cached struct
     % instead of recomputing ISI/waveform/PCA from scratch.
     computedCache = cell(nRow, 1);
+    % What gets written to the AnalysisCache: the compact per-unit panel record
+    % (per-task mean waveform + PCA axes/results, no individual waveforms).
+    % Seeded from the previous cache below, refreshed by storeMetrics.
+    panelCache    = cell(nRow, 1);
     excl = loadExclusions(exclFile, chan, unit);
     for k = 1:nRow
         S(k).Channel  = chan(k);
@@ -117,18 +135,18 @@ function spikesummary = spikeCheck(spike, waveform, cd, savePath, plotFlag, reCo
         S(k).Note     = excl(k).note;
     end
 
-    % --- AnalysisCache: seed the per-unit metrics so a cached run skips the
-    % expensive waveform / PCA fill. Exclusions still come from the CSV above
-    % (authoritative); only the computed scalar metrics are overlaid from cache.
-    % metricsFilled tracks which units already hold real metrics (from the cache
-    % or, later, from computeUnit), so nothing is recomputed needlessly.
-    if isempty(savePath)
-        cacheFile = '';
-    else
-        cacheFile = fullfile(savePath, 'AnalysisCache', 'SpikeSummary.mat');
-    end
+    % --- AnalysisCache: seed the per-unit metrics and panel records so a cached
+    % run skips the expensive waveform / PCA fill. Exclusions still come from the
+    % CSV above (authoritative); only the computed scalar metrics and the panel
+    % record are overlaid from cache. metricsFilled tracks which units already
+    % hold real metrics (from the cache or, later, from computeUnit), so nothing
+    % is recomputed needlessly.
+    % hasCachedProduct owns the <savePath>/AnalysisCache/<name><ext> convention and
+    % is what needFullFile tests against, so the path is taken from it rather than
+    % rebuilt here (an empty savePath returns '' / false, i.e. caching off).
+    [haveCache, cacheFile] = hasCachedProduct(savePath, 'SpikeSummary', '.mat');
     metricsFilled = false(nRow, 1);
-    if ~reCompute && ~isempty(cacheFile) && exist(cacheFile, 'file')
+    if ~reCompute && haveCache
         metricsFilled = seedMetricsFromCache(cacheFile);
     end
 
@@ -400,18 +418,23 @@ function spikesummary = spikeCheck(spike, waveform, cd, savePath, plotFlag, reCo
         end
     end
 
-    % Write the per-unit metrics + summary table to the AnalysisCache. Small: the
-    % scalar metrics and exclusions only, not the raster / waveform panel data.
+    % Write the per-unit metrics + summary table + panel records to the
+    % AnalysisCache. Still small: the scalar metrics, the exclusions, and per unit
+    % only the per-task mean waveform and the PCA axes / scores -- never the
+    % raster or the individual waveforms.
     function saveSpikeCache()
         if isempty(cacheFile);  return;  end
         cacheDir = fileparts(cacheFile);
         if ~exist(cacheDir, 'dir');  mkdir(cacheDir);  end
-        payload = struct('spikesummary', spikesummary, 'S', S);
+        payload = struct('spikesummary', spikesummary, 'S', S, ...
+            'panels', {panelCache}, 'NSample', nSample);
         save(cacheFile, 'payload');
     end
 
-    % Overlay cached per-unit scalar metrics onto S, matched by Channel/Unit.
-    % Returns a logical mask of the units that were found in the cache.
+    % Overlay cached per-unit scalar metrics and panel records onto S /
+    % panelCache, matched by Channel/Unit. Returns a logical mask of the units
+    % that were found in the cache. Payloads written before panels existed are
+    % read for their scalars alone.
     function filled = seedMetricsFromCache(cf)
         filled = false(nRow, 1);
         L = load(cf);
@@ -421,6 +444,7 @@ function spikesummary = spikeCheck(spike, waveform, cd, savePath, plotFlag, reCo
         Sc   = L.payload.S;
         cChan = [Sc.Channel].';
         cUnit = [Sc.Unit].';
+        if isfield(L.payload, 'panels');  Pc = L.payload.panels;  else;  Pc = {};  end
         for r = 1:nRow
             j = find(cChan == chan(r) & cUnit == unit(r), 1);
             if isempty(j);  continue;  end
@@ -431,6 +455,7 @@ function spikesummary = spikeCheck(spike, waveform, cd, savePath, plotFlag, reCo
             S(r).widthMs          = Sc(j).widthMs;
             S(r).peakToValley     = Sc(j).peakToValley;
             S(r).pcaRatio         = Sc(j).pcaRatio;
+            if j <= numel(Pc);  panelCache{r} = Pc{j};  end
             filled(r) = true;
         end
     end
@@ -542,14 +567,20 @@ function spikesummary = spikeCheck(spike, waveform, cd, savePath, plotFlag, reCo
     end
 
     function [wf, pca] = waveformStats(r)
+        % Every waveform of the unit is gathered, and everything that produces a
+        % number -- SNR, width, peak-to-valley, the per-task mean trace that goes
+        % into the cache, and the PCA -- is computed from that full set. nSample
+        % only caps the copy handed to the panel for drawing.
         wf = struct('hasFile', haveWave, 'tms', [], ...
             'byTask', struct('task', {}, 'ci', {}, 'W', {}, 'meanW', {}, ...
-                             'snr', {}, 'widthMs', {}, 'peakToValley', {}, 'nSpikes', {}), ...
-            'overall', struct('snr', NaN, 'widthMs', NaN, 'peakToValley', NaN));
+                             'snr', {}, 'widthMs', {}, 'peakToValley', {}, ...
+                             'nSpikes', {}, 'nSampled', {}), ...
+            'overall', struct('snr', NaN, 'widthMs', NaN, 'peakToValley', NaN, 'meanW', []));
 
         if ~haveWave
             pca = struct('status', 'nowave', 'score', zeros(0,3), ...
-                'labels', zeros(0,1), 'centroids', [], 'ratio', NaN);
+                'labels', zeros(0,1), 'centroids', [], 'ratio', NaN, ...
+                'coeff', [], 'mu', [], 'explained', nan(3,1));
             return
         end
 
@@ -559,50 +590,90 @@ function spikesummary = spikeCheck(spike, waveform, cd, savePath, plotFlag, reCo
 
         % Gather each task's waveforms into a cell (one slot per task, no
         % growing concatenation), and preallocate wf.byTask + filter at the
-        % end instead of appending with (end+1).
-        Wcell     = cell(1, nTasks);
+        % end instead of appending with (end+1). fullCell holds every waveform:
+        % the features AND the PCA are computed from it, and the nSample draw is
+        % taken separately for the panel alone.
+        fullCell  = cell(1, nTasks);
         labCell   = cell(1, nTasks);
         byTaskBuf = repmat(struct('task', '', 'ci', [], 'W', [], 'meanW', [], ...
-            'snr', NaN, 'widthMs', NaN, 'peakToValley', NaN, 'nSpikes', 0), 1, nTasks);
+            'snr', NaN, 'widthMs', NaN, 'peakToValley', NaN, 'nSpikes', 0, ...
+            'nSampled', 0), 1, nTasks);
         byTaskKeep = false(1, nTasks);
 
         for t = 1:nTasks
             Wt = gatherUnitWaveforms(waveform, T, r, strcmp(T.task, utasks{t}));
-            Wcell{t}   = Wt;
-            labCell{t} = t * ones(size(Wt,1), 1);
+            Ws = sampleWaveformRows(Wt, nSample);   % panel only
+            fullCell{t} = Wt;
+            labCell{t}  = t * ones(size(Wt,1), 1);
             if isempty(Wt);  continue;  end
             f = extractWaveformFeatures(Wt, WAVE_FS);
-            byTaskBuf(t) = struct('task', utasks{t}, 'ci', t, 'W', Wt, ...
-                'meanW', mean(Wt, 1, 'omitnan'), 'snr', f.snr, 'widthMs', f.widthMs, ...
-                'peakToValley', f.peakToValley, 'nSpikes', f.nSpikes);
+            byTaskBuf(t) = struct('task', utasks{t}, 'ci', t, 'W', Ws, ...
+                'meanW', f.meanWave, 'snr', f.snr, 'widthMs', f.widthMs, ...
+                'peakToValley', f.peakToValley, 'nSpikes', f.nSpikes, ...
+                'nSampled', size(Ws,1));
             byTaskKeep(t) = true;
         end
         wf.byTask = byTaskBuf(byTaskKeep);
 
         if nTasks == 0
-            Wall   = zeros(0, nSamp);
+            Wfull  = zeros(0, nSamp);
             labAll = zeros(0, 1);
         else
-            Wall   = cat(1, Wcell{:});
+            Wfull  = cat(1, fullCell{:});
             labAll = cat(1, labCell{:});
         end
-        if ~isempty(Wall)
-            fAll = extractWaveformFeatures(Wall, WAVE_FS);
+        if ~isempty(Wfull)
+            fAll = extractWaveformFeatures(Wfull, WAVE_FS);
             wf.overall = struct('snr', fAll.snr, 'widthMs', fAll.widthMs, ...
-                                'peakToValley', fAll.peakToValley);
+                                'peakToValley', fAll.peakToValley, 'meanW', fAll.meanWave);
         end
-        pca = spikeWaveformPCA(Wall, labAll, nTasks);
+        % Every waveform, not the per-task draw: the PCA (and the cluster ratio
+        % it reports) must not depend on nSample, and it keeps its own MAXPTS
+        % backstop for units with more spikes than pca() wants to chew on.
+        pca = spikeWaveformPCA(Wfull, labAll, nTasks);
     end
 
     function storeMetrics(r, st)
         S(r).overallRate      = st.firing.overall;
         S(r).baselineMeanRate = st.firing.meanRateAll;
         S(r).violationRate    = st.isi.violationRate;
+        metricsFilled(r)      = true;
+
+        % The waveform-dependent metrics and the panel record only exist when the
+        % waveform product was supplied. Without it computeUnit yields NaNs, which
+        % must not overwrite values seeded from the cache -- a waveform-less run
+        % would otherwise erase the session's SNR / width / P2V / PCA on close.
+        if ~haveWave
+            return
+        end
         S(r).snr              = st.waveform.overall.snr;
         S(r).widthMs          = st.waveform.overall.widthMs;
         S(r).peakToValley     = st.waveform.overall.peakToValley;
         S(r).pcaRatio         = st.pca.ratio;
-        metricsFilled(r)      = true;
+        panelCache{r}         = panelEntry(st);
+    end
+
+    % The cached panel record: everything needed to describe a unit's waveform
+    % and PCA panels without the waveforms themselves. Individual traces (.W,
+    % tens of MB per session) are dropped; the scores are the PCA result and are
+    % stored narrow (single / uint8) since they are only ever plotted.
+    function p = panelEntry(st)
+        wf = st.waveform;
+        bt = repmat(struct('task', '', 'ci', [], 'meanW', [], 'snr', NaN, ...
+            'widthMs', NaN, 'peakToValley', NaN, 'nSpikes', 0, 'nSampled', 0), ...
+            1, numel(wf.byTask));
+        for bi = 1:numel(wf.byTask)
+            bt(bi) = struct('task', wf.byTask(bi).task, 'ci', wf.byTask(bi).ci, ...
+                'meanW', wf.byTask(bi).meanW, 'snr', wf.byTask(bi).snr, ...
+                'widthMs', wf.byTask(bi).widthMs, ...
+                'peakToValley', wf.byTask(bi).peakToValley, ...
+                'nSpikes', wf.byTask(bi).nSpikes, 'nSampled', wf.byTask(bi).nSampled);
+        end
+        p = struct('tms', wf.tms, 'byTask', bt, 'overall', wf.overall, ...
+            'pca', struct('status', st.pca.status, 'coeff', st.pca.coeff, ...
+                'mu', st.pca.mu, 'explained', st.pca.explained, ...
+                'score', single(st.pca.score), 'labels', uint8(st.pca.labels), ...
+                'centroids', st.pca.centroids, 'ratio', st.pca.ratio));
     end
 
 end
@@ -695,7 +766,8 @@ end
 
 function plotWaveformPanel(ax, wf, cmap)
 % Waveforms by task: pale translucent individuals behind, task means thick on top.
-% "No waveform file" when the waveform product was not supplied.
+% Every waveform the compute layer kept is drawn -- how many that is, is nSample's
+% job, not this panel's. "No waveform file" when the product was not supplied.
     cla(ax, 'reset');  hold(ax, 'on');
     if ~wf.hasFile
         blankPanel(ax, 'No waveform file');
@@ -705,22 +777,67 @@ function plotWaveformPanel(ax, wf, cmap)
         blankPanel(ax, 'No waveforms for this unit');
         return
     end
-    MAXDRAW = 200;
-    for t = 1:numel(wf.byTask)
-        W   = wf.byTask(t).W;
-        idx = 1:size(W,1);
-        if numel(idx) > MAXDRAW;  idx = idx(round(linspace(1, numel(idx), MAXDRAW)));  end
+    nPanelTasks = numel(wf.byTask);
+    hCloud = gobjects(1, nPanelTasks);
+    aCloud = zeros(1, nPanelTasks);
+    for t = 1:nPanelTasks
+        W = wf.byTask(t).W;
+        n = size(W, 1);
+        if n == 0;  continue;  end
+        % One line object per task instead of one per waveform: the traces are
+        % strung into a single polyline separated by NaN, so a 1000-waveform
+        % cloud costs the axes one handle rather than 1000. (A patch would carry
+        % EdgeAlpha directly, but a single face of that many vertices sends the
+        % tessellator away for minutes -- do not swap this for one.)
         pale = cmap(wf.byTask(t).ci,:)*0.45 + 0.55;
-        plot(ax, wf.tms, W(idx,:).', 'Color', [pale 0.06]);
+        X = [repmat(wf.tms, n, 1), nan(n,1)].';
+        Y = [W,                    nan(n,1)].';
+        hCloud(t) = plot(ax, X(:), Y(:), 'Color', pale);
+        % Fainter the more traces overlap, so the cloud reads the same density
+        % at any nSample.
+        aCloud(t) = max(0.03, min(0.25, 20/n));
     end
+    setLineAlpha(hCloud, aCloud);
     for t = 1:numel(wf.byTask)
         plot(ax, wf.tms, wf.byTask(t).meanW, 'Color', cmap(wf.byTask(t).ci,:), 'LineWidth', 2);
     end
+    nShown = sum([wf.byTask.nSampled]);
+    nTotal = sum([wf.byTask.nSpikes]);
     xlabel(ax, 'Time (ms)');
     ylabel(ax, '\muV');
-    title(ax, 'Waveforms by task');
+    if nShown < nTotal
+        title(ax, sprintf('Waveforms by task (%d of %d shown)', nShown, nTotal));
+    else
+        title(ax, sprintf('Waveforms by task (all %d)', nTotal));
+    end
     set(ax, 'LineWidth', 1, 'FontSize', 10);
     box(ax, 'off');
+end
+
+
+function setLineAlpha(hs, as)
+% Make plotted lines translucent.
+%
+% A Line's Color property is an RGB triplet: a fourth alpha element passed to
+% plot() is silently dropped (verified on R2025b), so the transparency has to be
+% written onto the line's underlying Edge primitive, which only exists once the
+% line has been drawn -- hence the single drawnow before the loop. Edge is
+% undocumented, so a release that drops it just leaves the lines opaque, which is
+% what they already were.
+    valid = isgraphics(hs);
+    if ~any(valid)
+        return
+    end
+    try
+        drawnow limitrate
+        for k = find(valid)
+            hs(k).Edge.ColorBinding = 'object';
+            hs(k).Edge.ColorData    = uint8([round(hs(k).Color(:) * 255); ...
+                                             round(as(k) * 255)]);
+        end
+    catch
+        % No Edge primitive on this release: the cloud stays opaque.
+    end
 end
 
 
@@ -757,6 +874,8 @@ end
 function fillSummaryTable(featTable, utasks, st)
 % Per-task summary table (one row per task + 'All'): counts / rate /
 % violation from the raster group, SNR / width / P2V from the waveform group.
+% Every column counts all spikes -- nSpk is the raster's, and the waveform
+% features are computed pre-sampling -- so nSample changes nothing here.
     tbl   = cell(0, 6);
     rowNm = {};
     for t = 1:numel(utasks)
