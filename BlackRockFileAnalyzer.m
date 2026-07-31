@@ -176,6 +176,13 @@ if isempty(comments_path)
 end
 comments_data = readtable(comments_path);
 
+% Each stage below announces itself: the banner (position in the cascade) comes
+% from here, the indented status line under it from the block itself, since only
+% the block knows whether its exported file ended up being read.
+reportPreprocessHeader(main_path);
+NPrepSteps = 5;
+
+reportPreprocessStage(1, NPrepSteps, 'Behavior');
 BehaviorSummary = PrepareBehavior(comments_data, cfg.Behavior, main_path);
 
 % Eye calibration and RT are one dependency chain, so they sit together: RT is
@@ -186,20 +193,28 @@ BehaviorSummary = PrepareBehavior(comments_data, cfg.Behavior, main_path);
 % copy is finished with before the photodiode and waveform loads below, instead
 % of staying resident across them.
 rtWillCompute = needFullFile(cfg.RT, main_path, 'RT', {'.mat', '.csv'});
+reportPreprocessStage(2, NPrepSteps, 'Eye calibration');
 [caled_eyes, eye_data] = PrepareEyes(eye_path, comments_data, cfg.Eye, ...
                                      main_path, rtWillCompute);
 
 %Add RT to saccade tasks.
+reportPreprocessStage(3, NPrepSteps, 'RT');
 RT = PrepareRT(caled_eyes, comments_data, cfg.RT, main_path);
 
+reportPreprocessStage(4, NPrepSteps, 'Photodiode');
 [PDTiming, photodiode_data] = PreparePhotodiode(photodiode_path, comments_data, ...
                                                 cfg.Photodiode, main_path);
 
+reportPreprocessStage(5, NPrepSteps, 'Spikes');
 [SpikeSummary, spike_data, spikewaveform_data] = PrepareSpikes(spike_path, ...
                               waveform_path, comments_data, cfg.Spike, main_path);
 
 %Screen the tasks and spikes according to the behavior and spike check.
 [excludeTasks, excludeSpikes] = ScreenSession(BehaviorSummary, SpikeSummary, cfg.Screen);
+% excludeSpikes is a per-unit logical mask, not a list, so count it with sum.
+fprintf('\nScreening kept %d of %d task(s); excluded %d of %d unit(s).\n', ...
+    height(BehaviorSummary) - numel(excludeTasks), height(BehaviorSummary), ...
+    sum(excludeSpikes), numel(excludeSpikes));
 
 if TaskRouter
 %% Auto-rounting to it's respective analyze protocol
@@ -229,6 +244,7 @@ protocol_cfg = [];
 %Now loop over tasks to rount data into their task-related protocols
 for i = 1:length(tasklist)
     task = tasklist(i);
+    fprintf('\n===== Task %d/%d: %s =====\n', i, numel(tasklist), task);
     % Screen the recording down to this task's trials before dispatch, so each
     % protocol receives data already scoped to its task.
     data_task = SetupDataForTask(data_ana, task);

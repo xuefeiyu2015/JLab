@@ -71,6 +71,14 @@ function [caled_eyes, eye_data] = PrepareEyes(eye_path, comments_data, cfgEye, s
              'in priority order, e.g. {''fixation'',''visual_saccade'',''memory_saccade''}.']);
     end
 
+    % Reported after the two guards above, so a block that returns early keeps its
+    % own message instead of announcing a plan it will not run. The cache here is
+    % the readable coefficient file, and a hit does NOT save the load: the fit is
+    % still applied to every trial of the whole array, so say that too.
+    fprintf('  %s\n', describeBlockPlan(cfgEye, savePath, 'EyeCalibration', '.txt', ...
+        struct('PlotDefault', false, ...
+               'Notes', {{'eye export read (the fit is applied to every trial)'}})));
+
     disp('Start eye calibration');
     eye_data = loadExportProduct(eye_path, {'eye', 'analog'});
 
