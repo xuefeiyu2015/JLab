@@ -56,12 +56,23 @@ function [SpikeSummary, spike_data, waveform_data] = PrepareSpikes(spike_path, w
     % shape as PrepareEyes' forceLoad, not a re-derivation of needFullFile): the
     % navigator's waveform and PCA panels draw individual waveforms, which the
     % cache deliberately does not keep, so an open GUI always needs the export.
+    % The load decision is taken once here, and the branch it took is what the
+    % report below states -- not a second guess at it.
     if isempty(waveform_path)
         disp('No spike waveform found');
+        waveNote = 'no waveform export';
     elseif cfgField(cfgSpike, 'Plot', true) || ...
             needFullFile(cfgSpike, savePath, 'SpikeSummary', '.mat')
         waveform_data = loadExportProduct(waveform_path, {'online_spike_waveform'});
+        waveNote = 'waveform export read';
+    else
+        waveNote = 'waveform export not read';
     end
+
+    % spikeCheck defaults plotFlag to true, and what .Plot opens here is the
+    % navigator GUI rather than a figure, so the wording follows that.
+    fprintf('  %s\n', describeBlockPlan(cfgSpike, savePath, 'SpikeSummary', '.mat', ...
+        struct('PlotDefault', true, 'PlotLabel', 'navigator', 'Notes', {{waveNote}})));
 
     SpikeSummary = spikeCheck(spike_data, waveform_data, comments_data, savePath, ...
         cfgField(cfgSpike, 'Plot',      []), ...

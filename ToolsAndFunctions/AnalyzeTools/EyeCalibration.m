@@ -163,8 +163,15 @@ function caled_eyes = EyeCalibration(comments_data, eye_data, task_cal, holdWinM
         writeCalibration(cal, calFile);
     end
 
-    fprintf('Eye calibration: using "%s" (R^2 x=%.3f y=%.3f).\n', ...
-        strjoin(cal.task_cal, ', '), cal.R2_x, cal.R2_y);
+    % Say where the coefficients came from: the fit is silent either way, so
+    % without this a cached run and a fresh one print the same line.
+    if fromCache
+        fitSource = 'from cache';
+    else
+        fitSource = 'from a fresh fit';
+    end
+    fprintf('Eye calibration: using "%s" %s (R^2 x=%.3f y=%.3f).\n', ...
+        strjoin(cal.task_cal, ', '), fitSource, cal.R2_x, cal.R2_y);
 
     % ---------------------------------------------------------------------
     % 2. Apply to every trial (all tasks, all sessions)

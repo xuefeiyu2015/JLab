@@ -26,6 +26,24 @@ function summary = behaviorCheck(cd, plotFlag, savePath, reCompute)
     if nargin < 3;                        savePath  = '';    end
     if nargin < 4 || isempty(reCompute);  reCompute = true;  end
 
+    % An incomplete trial can reach the export with no task label at all (a
+    % timeout that aborted before the task marker was parsed). It carries no
+    % analyzable information, but left in it becomes a phantom per-task row in
+    % the summary -- which ScreenSession then only drops by accident, via the
+    % successful-trial threshold, and which writeBehaviorSummary pivots into a
+    % nameless 'x' column group in the shared per-monkey QC summary. Drop those
+    % trials up front so no per-task product downstream (the summary, the
+    % screening, the task router) ever sees them.
+    % Reported rather than warned: an aborted trial or two is normal, so this is
+    % a routine note in the same shape as the preprocessing status lines, not an
+    % anomaly worth a stack trace on every run.
+    blank = blankTaskMask(cd.Task);
+    if any(blank)
+        fprintf(['  dropped %d trial(s) with no task label ' ...
+                 '(incomplete; excluded from the summary, screening and routing)\n'], sum(blank));
+        cd(blank, :) = [];
+    end
+
     % Cache the full stats struct B (its .conditions is what we return), so a
     % cached run can both return the summary and redraw the panels via
     % plotBehaviorStats without recomputing.
@@ -34,6 +52,12 @@ function summary = behaviorCheck(cd, plotFlag, savePath, reCompute)
         plotBehaviorStats(B);
     end
     summary = B.conditions;
+
+    % Caches written before the filter above still carry the blank-task row, so
+    % drop it on the way out too rather than making every old session recompute.
+    if istable(summary) && ~isempty(summary)
+        summary(blankTaskMask(summary.Task), :) = [];
+    end
     if ~isempty(savePath)
         writeBehaviorSummary(summary, savePath);
     end

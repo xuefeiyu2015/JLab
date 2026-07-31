@@ -32,6 +32,12 @@ function RT = PrepareRT(caled_eyes, comments_data, cfgRT, savePath)
     cfgWarnUnknown(cfgRT, {'Plot', 'PlotN', 'ErrorCheck', 'ReCompute', ...
         'EndpointStyle', 'PeakVelStyle'}, 'cfg.RT');
 
+    % CalculateRT caches the heavy payload as RT.mat on the plot path and reuses
+    % the small RT.csv on the return-only path, hence the two extensions. Its own
+    % plotFlag default is false.
+    fprintf('  %s\n', describeBlockPlan(cfgRT, savePath, 'RT', {'.mat', '.csv'}, ...
+        struct('PlotDefault', false)));
+
     % The two style options only affect the saccade-map QC figure, and passing an
     % empty one would fail CalculateRT's inputParser validator, so drop the ones
     % the config leaves out and let that function's defaults stand.

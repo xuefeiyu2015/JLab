@@ -45,9 +45,18 @@ function [PDTiming, photodiode_data] = PreparePhotodiode(photodiode_path, commen
         return
     end
 
+    % The load decision is taken once here, and the branch it took is what the
+    % report below states -- not a second guess at it.
     if needFullFile(cfgPhotodiode, savePath, 'PhotodiodeTiming', {'.mat', '.csv'})
         photodiode_data = loadExportProduct(photodiode_path, {'photodiode'});
+        exportNote = 'photodiode export read';
+    else
+        exportNote = 'photodiode export not read';
     end
+
+    % GetPhotodiodeTiming defaults plotFlag to true.
+    fprintf('  %s\n', describeBlockPlan(cfgPhotodiode, savePath, 'PhotodiodeTiming', ...
+        {'.mat', '.csv'}, struct('PlotDefault', true, 'Notes', {{exportNote}})));
 
     % Build the name/value tail from whatever else the config carries. Fields
     % left empty are dropped so GetPhotodiodeTiming's own inputParser default

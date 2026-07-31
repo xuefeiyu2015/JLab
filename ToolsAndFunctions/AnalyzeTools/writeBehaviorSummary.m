@@ -51,6 +51,15 @@ function T = behaviorWide(C)
     if ~istable(C) || isempty(C)
         return
     end
+    % A blank task name would come out of makeValidName as a nameless 'x' column
+    % group, and the master QC summary unions columns across sessions, so that
+    % phantom would then be permanent for this monkey. behaviorCheck already
+    % drops these trials; this is the guard on the file that actually writes.
+    C(blankTaskMask(C.Task), :) = [];
+    if isempty(C)
+        return
+    end
+
     vals  = {};
     names = {};
     for i = 1:height(C)

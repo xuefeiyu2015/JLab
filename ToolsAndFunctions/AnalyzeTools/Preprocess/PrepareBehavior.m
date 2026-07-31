@@ -25,6 +25,10 @@ function BehaviorSummary = PrepareBehavior(comments_data, cfgBehavior, savePath)
 
     cfgWarnUnknown(cfgBehavior, {'Plot', 'ReCompute'}, 'cfg.Behavior');
 
+    % behaviorCheck defaults plotFlag to true, so say so when the field is absent.
+    fprintf('  %s\n', describeBlockPlan(cfgBehavior, savePath, 'BehaviorSummary', ...
+        '.mat', struct('PlotDefault', true)));
+
     BehaviorSummary = behaviorCheck(comments_data, ...
         cfgField(cfgBehavior, 'Plot',      []), savePath, ...
         cfgField(cfgBehavior, 'ReCompute', []));
