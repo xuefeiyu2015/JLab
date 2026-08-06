@@ -125,6 +125,12 @@ classdef BlackrockLoader < handle
                           % measured from Start exactly (see segmentSpikeWaveforms);
                           % 0 where no Start was seen, [] when the comment source
                           % carried no ticks.
+        TrialEndTicks     % uint64, one per trial: the End marker's raw clock tick.
+                          % With TrialStartTicks this lets segmentContinuous and
+                          % segmentSpikes compute the whole trial window in exact
+                          % integers instead of on absolute epoch doubles, where
+                          % the resolution is only ~238 ns. Same conventions as
+                          % TrialStartTicks: 0 = not seen, [] = no ticks.
         Eye               % per-trial eye slices: segmentContinuous output restricted to
                           % EyeChannels ([] when the eye stream was not loaded).
                           % Named for its contents, not its source file -- the
@@ -219,6 +225,9 @@ classdef BlackrockLoader < handle
             S.uv_per_digit     = [];
             S.nsx_samplingrate = [];
             S.nsx_abs_time     = [];
+            S.nsx_start_tick        = uint64(0);
+            S.lfp_start_tick        = uint64(0);
+            S.photodiode_start_tick = uint64(0);
             S.eye_status    = 'not requested';
             S.lfp_nsxdata          = [];
             S.lfp_uv_per_digit     = [];
@@ -293,6 +302,7 @@ classdef BlackrockLoader < handle
                     S.nsx_samplingrate = A.nsx_samplingrate;
                     S.nsx_abs_time     = A.nsx_abs_time;
                     S.timeresolution   = A.timeresolution;
+                    S.nsx_start_tick   = A.nsx_start_tick;
                     S.eye_status    = A.status;
                 catch ME_ana
                     S.LoadEyeData = false;
@@ -311,6 +321,7 @@ classdef BlackrockLoader < handle
                     S.lfp_samplingrate   = A.nsx_samplingrate;
                     S.lfp_abs_time       = A.nsx_abs_time;
                     S.lfp_timeresolution = A.timeresolution;
+                    S.lfp_start_tick     = A.nsx_start_tick;
                     S.lfp_status         = A.status;
                 catch ME_lfp
                     S.LoadLFPData = false;
@@ -335,12 +346,14 @@ classdef BlackrockLoader < handle
                         S.photodiode_samplingrate   = A.nsx_samplingrate;
                         S.photodiode_abs_time       = A.nsx_abs_time;
                         S.photodiode_timeresolution = A.timeresolution;
+                        S.photodiode_start_tick     = A.nsx_start_tick;
                         S.photodiode_status         = A.status;
                     elseif S.LoadEyeData && size(S.nsxdata, 1) >= max(obj.PhotodiodeChannels)
                         S.photodiode_from_eye       = true;
                         S.photodiode_samplingrate   = S.nsx_samplingrate;
                         S.photodiode_abs_time       = S.nsx_abs_time;
                         S.photodiode_timeresolution = S.timeresolution;
+                        S.photodiode_start_tick     = S.nsx_start_tick;
                         S.photodiode_status = sprintf('ok (channels %s of the eye ns2)', ...
                             mat2str(obj.PhotodiodeChannels));
                     else
@@ -350,6 +363,7 @@ classdef BlackrockLoader < handle
                         S.photodiode_samplingrate   = A.nsx_samplingrate;
                         S.photodiode_abs_time       = A.nsx_abs_time;
                         S.photodiode_timeresolution = A.timeresolution;
+                        S.photodiode_start_tick     = A.nsx_start_tick;
                         S.photodiode_status         = A.status;
                     end
                 catch ME_pd
@@ -464,6 +478,8 @@ classdef BlackrockLoader < handle
             A.nsx_samplingrate = [];
             A.nsx_abs_time     = [];
             A.timeresolution   = [];
+            A.nsx_start_tick   = uint64(0);   % raw tick of sample 1, for the
+                                              % exact window arithmetic
             A.status    = '';
 
             % No prefix -> take every match; filterByPrefix cannot express
@@ -514,6 +530,7 @@ classdef BlackrockLoader < handle
             nsx_rel_time       = (0:N-1) / A.nsx_samplingrate;            % from start time
             A.nsx_abs_time     = nsx_starttimeSec + nsx_rel_time;
             A.timeresolution   = nsx_timeresolution;
+            A.nsx_start_tick   = uint64(nsx_starttime);
             A.status    = sprintf('ok (%s)', Filename_ns);
         end
 
@@ -614,7 +631,7 @@ classdef BlackrockLoader < handle
         end
 
 
-        function [trials, experiment, startTicks] = parseEvents(obj, Events, EventTime, EventTick)
+        function [trials, experiment, startTicks, endTicks] = parseEvents(obj, Events, EventTime, EventTick)
         % Parse the .nev comment strings into one experiment entry per session
         % and one trials entry per (position-keyed) trial. A single .nev can
         % hold several sessions (task started/stopped), so experiment is a
@@ -642,20 +659,21 @@ classdef BlackrockLoader < handle
                 end
             end
     
-            [trials, experiment, startTicks] = ...
+            [trials, experiment, startTicks, endTicks] = ...
                 obj.parseEventsFast(Events, EventTime, EventTick);
     
             %{
           disp('Use legacy parser');
-             [trials, experiment, startTicks] = ...
+             [trials, experiment, startTicks, endTicks] = ...
                 obj.parseEventsLegacy(Events, EventTime, EventTick);
             %}
             obj.Trials          = trials;
             obj.Experiment      = experiment;
             obj.TrialStartTicks = startTicks;
+            obj.TrialEndTicks   = endTicks;
         end
 
-        function [trials, experiment, startTicks] = parseEventsFast(obj, Events, EventTime, EventTick)
+        function [trials, experiment, startTicks, endTicks] = parseEventsFast(obj, Events, EventTime, EventTick)
         % Set-oriented parse: tokenize every comment at once, index trials by
         % cumsum, classify each DISTINCT event body once, then scatter the
         % values one pass per field.
@@ -677,7 +695,7 @@ classdef BlackrockLoader < handle
             [ub, ~, ic] = unique(K.body(K.isTrialLine));
             spec = BlackrockLoader.classifyEventBodies(ub, obj.EventMaps, obj.TrialTemplate);
 
-            [cols, dupCells, undCells, startTicks, nUndef] = BlackrockLoader.scatterEventWrites( ...
+            [cols, dupCells, undCells, startTicks, endTicks, nUndef] = BlackrockLoader.scatterEventWrites( ...
                 spec, ic, K, Session, EventTime, EventTick, has_ticks, obj.TrialTemplate);
 
             trials     = BlackrockLoader.assembleTrialStruct(cols, dupCells, undCells, obj.TrialTemplate);
@@ -718,7 +736,7 @@ classdef BlackrockLoader < handle
             trials = BlackrockLoader.addDerivedTrialFeatures(trials);
         end
 
-        function [trials, experiment, startTicks] = parseEventsLegacy(obj, Events, EventTime, EventTick)
+        function [trials, experiment, startTicks, endTicks] = parseEventsLegacy(obj, Events, EventTime, EventTick)
         % TEMPORARY reference implementation, kept only to A/B against the
         % vectorised parser. Comment-major: one loop iteration per comment
         % string, which is ~1.4e5 iterations for a 5000-trial session.
@@ -773,6 +791,7 @@ classdef BlackrockLoader < handle
             % would either break that or be silently demoted back to a double
             % (losing the exactness this exists for). 0 = not seen.
             startTicks    = zeros(1024, 1, 'uint64');
+            endTicks      = zeros(1024, 1, 'uint64');
             session_index = 0;
             trial_index   = 0;
             prev_trial_number = NaN;
@@ -879,6 +898,7 @@ classdef BlackrockLoader < handle
                                 % doubling, not per-iteration growth: amortised O(1)
                                 trials = [trials; repmat(trial, numel(trials), 1)]; %#ok<AGROW>
                                 startTicks = [startTicks; zeros(numel(startTicks), 1, 'uint64')]; %#ok<AGROW>
+                                endTicks   = [endTicks;   zeros(numel(endTicks),   1, 'uint64')]; %#ok<AGROW>
                             end
                             currTrial = trial;
                             currTrial.Trial_number = TrialNum_curr;
@@ -1028,6 +1048,10 @@ classdef BlackrockLoader < handle
 
                            if isnan(trials(trial_index).End)
                                trials(trial_index).End = curr_eventtime;
+                               if has_ticks
+                                   % exact End tick, for the same reason as Start
+                                   endTicks(trial_index) = EventTick(i);
+                               end
                            else
                                trials(trial_index).duplicates(end+1,1) = event;
                                 if verbose; disp('Duplicate End  found for dash event:'); end
@@ -1121,6 +1145,7 @@ classdef BlackrockLoader < handle
             trials     = trials(1:trial_index);
             experiment = experiment(1:session_index);
             startTicks = startTicks(1:trial_index);
+            endTicks   = endTicks(1:trial_index);
 
             % One summary instead of three lines per unmatched event: a task
             % software change can send every event down the undefined path, and
@@ -1152,7 +1177,9 @@ classdef BlackrockLoader < handle
                 S = obj.Loaded;
                 obj.LFP = BlackrockLoader.segmentContinuous(obj.Trials, S.lfp_nsxdata, ...
                     S.lfp_abs_time, S.lfp_samplingrate, ...
-                    obj.Segment_PreBuffer, obj.Segment_PostBuffer, S.lfp_uv_per_digit);
+                    obj.Segment_PreBuffer, obj.Segment_PostBuffer, S.lfp_uv_per_digit, ...
+                    obj.TrialStartTicks, obj.TrialEndTicks, S.lfp_start_tick, ...
+                    BlackrockLoader.sharedTimeRes(S.EventTimeRes, S.lfp_timeresolution));
                 obj.freeRaw({'lfp_nsxdata', 'lfp_abs_time'});
             end
             A = obj.LFP;
@@ -1175,7 +1202,9 @@ classdef BlackrockLoader < handle
                 S = obj.Loaded;
                 obj.Photodiode = BlackrockLoader.segmentContinuous(obj.Trials, S.photodiode_nsxdata, ...
                     S.photodiode_abs_time, S.photodiode_samplingrate, ...
-                    obj.Segment_PreBuffer, obj.Segment_PostBuffer, S.photodiode_uv_per_digit);
+                    obj.Segment_PreBuffer, obj.Segment_PostBuffer, S.photodiode_uv_per_digit, ...
+                    obj.TrialStartTicks, obj.TrialEndTicks, S.photodiode_start_tick, ...
+                    BlackrockLoader.sharedTimeRes(S.EventTimeRes, S.photodiode_timeresolution));
                 obj.freeRaw({'photodiode_nsxdata', 'photodiode_abs_time'});
             end
             A = obj.Photodiode;
@@ -1208,7 +1237,9 @@ classdef BlackrockLoader < handle
 
             full = BlackrockLoader.segmentContinuous(obj.Trials, S.nsxdata, ...
                 S.nsx_abs_time, S.nsx_samplingrate, ...
-                obj.Segment_PreBuffer, obj.Segment_PostBuffer, S.uv_per_digit);
+                obj.Segment_PreBuffer, obj.Segment_PostBuffer, S.uv_per_digit, ...
+                obj.TrialStartTicks, obj.TrialEndTicks, S.nsx_start_tick, ...
+                BlackrockLoader.sharedTimeRes(S.EventTimeRes, S.timeresolution));
 
             nChan = size(full.data, 1);
             obj.Eye = BlackrockLoader.subsetChannels(full, ...
@@ -1256,7 +1287,9 @@ classdef BlackrockLoader < handle
                 obj.Spike = BlackrockLoader.segmentSpikes(obj.Trials, S.TimeSec, ...
                     S.Channel, S.Unit, ...
                     obj.Segment_PreBuffer, obj.Segment_PostBuffer, obj.Segment_BinWidth, ...
-                    obj.Spike_ISIViolationMs, wfForMean, S.WaveformScale);
+                    obj.Spike_ISIViolationMs, wfForMean, S.WaveformScale, ...
+                    S.TimeTick, obj.TrialStartTicks, obj.TrialEndTicks, ...
+                    BlackrockLoader.sharedTimeRes(L.EventTimeRes, S.TimeRes));
             end
             if L.LoadOnlineSpikeWaveform && ~isempty(S.Waveform)
                 obj.SpikeWaveformData = BlackrockLoader.segmentSpikeWaveforms(obj.Trials, ...
@@ -1433,6 +1466,7 @@ classdef BlackrockLoader < handle
             obj.Trials            = [];
             obj.Experiment        = [];
             obj.TrialStartTicks   = [];
+            obj.TrialEndTicks     = [];
             obj.Eye            = [];
             obj.LFP               = [];
             obj.Photodiode        = [];
@@ -1683,7 +1717,42 @@ classdef BlackrockLoader < handle
             end
         end
 
-        function A = segmentContinuous(trials, nsxdata, nsx_abs_time, nsx_samplingrate, preMs, postMs, uvScale)
+        function res = sharedTimeRes(a, b)
+        % The common tick rate of two files, or [] when they do not share one.
+        %
+        % Trial Start/End ticks come from the comment .nev; the samples they are
+        % matched against come from an .nsx, and the spikes from another .nev.
+        % Doing the window arithmetic in integer ticks is only valid when those
+        % clocks tick at the same rate (they do on PTP rigs -- 1e9 everywhere).
+        % Returning [] makes the caller fall back to the double path rather than
+        % silently mix two clocks.
+            res = [];
+            if isempty(a) || isempty(b) || a <= 0 || b <= 0 || double(a) ~= double(b)
+                return
+            end
+            res = double(a);
+        end
+
+        function [ok, perUnit, preTicks, postTicks] = exactTickGrid(timeRes, rate, preMs, postMs)
+        % Ticks per sample/bin and per buffer, and whether they are all integral.
+        %
+        % The exact-integer window arithmetic in segmentContinuous/segmentSpikes
+        % only works when the clock divides evenly into samples (or bins) and
+        % into each ms buffer -- true for the usual 1e9 tick / 1 kHz / 500 ms
+        % combination (1e6 ticks per sample, 5e8 per buffer), not for an
+        % arbitrary rate. ok = false tells the caller to use the double path.
+            ok = false; perUnit = 0; preTicks = 0; postTicks = 0;
+            if isempty(timeRes) || isempty(rate) || timeRes <= 0 || rate <= 0
+                return
+            end
+            perUnit   = double(timeRes) / double(rate);
+            preTicks  = double(preMs)  * double(timeRes) / 1000;
+            postTicks = double(postMs) * double(timeRes) / 1000;
+            v = [perUnit, preTicks, postTicks];
+            ok = all(v == floor(v)) && all(isfinite(v));
+        end
+
+        function A = segmentContinuous(trials, nsxdata, nsx_abs_time, nsx_samplingrate, preMs, postMs, uvScale, startTicks, endTicks, refTick, timeRes)
         % Cut a continuous stream into one slice per trial.
         % For each trial the window is [Start - preMs, End + postMs] (ms buffers),
         % matched against nsx_abs_time (seconds, same NSP clock as the event
@@ -1707,6 +1776,10 @@ classdef BlackrockLoader < handle
             if nargin < 5 || isempty(preMs);  preMs  = 500; end   % default buffer (ms)
             if nargin < 6 || isempty(postMs); postMs = 500; end
             if nargin < 7; uvScale = []; end                      % [] -> data already in uV
+            if nargin < 8;  startTicks = uint64([]); end
+            if nargin < 9;  endTicks   = uint64([]); end
+            if nargin < 10; refTick    = []; end
+            if nargin < 11; timeRes    = []; end
 
             pre  = preMs  / 1000;   % seconds
             post = postMs / 1000;
@@ -1739,6 +1812,32 @@ classdef BlackrockLoader < handle
             t0     = starts - pre;
             t1     = ends   + post;
 
+            % Exact path: when the raw ticks are available and the clock divides
+            % evenly into samples and buffers, the whole window is integer
+            % arithmetic. The sample grid is uniform by construction (index k
+            % sits at refTick + k*ticksPerSample exactly), so solving for the
+            % first index at or after t0 and the last at or before t1 is just
+            % integer division -- no rounding, and the snap below is unnecessary.
+            % This is what stops a trial whose edge lands within ~238 ns of a
+            % sample boundary from going either way.
+            [grid_ok, tps, preTicks, postTicks] = BlackrockLoader.exactTickGrid( ...
+                timeRes, nsx_samplingrate, preMs, postMs);
+            useTicks = grid_ok && ~isempty(refTick) && ...
+                       numel(startTicks) == nTrials && numel(endTicks) == nTrials;
+
+            if useTicks
+                st = int64(startTicks(:));
+                en = int64(endTicks(:));
+                have = ok & st ~= 0 & en ~= 0;
+                i0 = zeros(nTrials, 1);
+                i1 = -ones(nTrials, 1);
+                num0 = (st(have) - int64(preTicks))  - int64(refTick);
+                num1 = (en(have) + int64(postTicks)) - int64(refTick);
+                % ceil / floor division on signed integers, then back to 1-based
+                i0(have) = double(-idivide(-num0, int64(tps), 'floor')) + 1;
+                i1(have) = double( idivide( num1, int64(tps), 'floor')) + 1;
+                ok = have;
+            else
             i0 = ceil ((t0 - tRef) * nsx_samplingrate) + 1;   % may fall outside 1..nSample
             i1 = floor((t1 - tRef) * nsx_samplingrate) + 1;
 
@@ -1761,6 +1860,7 @@ classdef BlackrockLoader < handle
             adj = false(nTrials, 1);
             adj(sel) = reshape(nsx_abs_time(i1(sel) + 1), [], 1) <= t1(sel);
             i1(adj) = i1(adj) + 1;
+            end
 
             % Clamp on one side each, so a window lying entirely outside the
             % recording ends up with i1 < i0 and is dropped rather than
@@ -1801,7 +1901,7 @@ classdef BlackrockLoader < handle
             A.info.Trial_number = [trials.Trial_number]';   % nTrials x 1
         end
 
-        function R = segmentSpikes(trials, spikeTimes, spikeElectrode, spikeUnit, preMs, postMs, binMs, violMs, spikeWaveform, waveformScale)
+        function R = segmentSpikes(trials, spikeTimes, spikeElectrode, spikeUnit, preMs, postMs, binMs, violMs, spikeWaveform, waveformScale, spikeTicks, startTicks, endTicks, timeRes)
         % Rasterize online spikes into one binary slice per trial.
         % For each trial the window is [Start - preMs, End + postMs] (ms buffers),
         % matched against spikeTimes (seconds, NSP/HUB clock). Time is binned at
@@ -1829,6 +1929,10 @@ classdef BlackrockLoader < handle
             if nargin < 8 || isempty(violMs); violMs = 1;   end   % ISI-violation window (ms)
             if nargin < 9  || isempty(spikeWaveform); spikeWaveform = []; end  % [nSamp x nSpikes], or []
             if nargin < 10; waveformScale = []; end                            % [] -> already uV
+            if nargin < 11; spikeTicks = uint64([]); end
+            if nargin < 12; startTicks = uint64([]); end
+            if nargin < 13; endTicks   = uint64([]); end
+            if nargin < 14; timeRes    = [];         end
 
             pre    = preMs  / 1000;   % seconds
             post   = postMs / 1000;
@@ -1917,11 +2021,51 @@ classdef BlackrockLoader < handle
             % Every (trial, in-window spike) pair at once, then a single indexed
             % write -- rather than rescanning all spikes, and read-modify-writing
             % a slice, once per trial.
-            [sortedTimes, sortIdx] = sort(spikeTimes);
-            [spkIdx, trialOf] = BlackrockLoader.trialSpikeIndex(sortedTimes, t_start, t_end);
+            % Membership and bin index in exact integer ticks when they are
+            % available: in seconds these are absolute epoch values (~1.5e9 s)
+            % where a double resolves only ~238 ns, so a spike within that band
+            % of a bin edge would land on either side depending on the last bit.
+            [grid_ok, binTicks, preTicks, postTicks] = BlackrockLoader.exactTickGrid( ...
+                timeRes, 1/binSec, preMs, postMs);
+            useTicks = grid_ok && numel(spikeTicks) == numel(spikeTimes) && ...
+                       numel(startTicks) == nTrials && numel(endTicks) == nTrials;
+
+            if useTicks
+                st = int64(startTicks(:));  en = int64(endTicks(:));
+                haveT = ok & st ~= 0 & en ~= 0;
+                lo = zeros(nTrials, 1, 'int64');  hi = zeros(nTrials, 1, 'int64');
+                lo(haveT) = st(haveT) - int64(preTicks);
+                hi(haveT) = en(haveT) + int64(postTicks);
+                [sortedTicks, sortIdx] = sort(int64(spikeTicks(:)));
+
+                % Rebase before handing the bounds to trialSpikeIndex, which
+                % bins with histcounts and therefore works in double: an
+                % absolute PTP tick (~1.5e18) is far past 2^53, where doubles
+                % stop representing every integer, but a session-relative tick
+                % (< ~2e13 for a 5.5 h recording) sits comfortably inside it and
+                % so stays exact. NaN marks trials with no window, which is what
+                % trialSpikeIndex already expects.
+                base  = sortedTicks(1);
+                relT  = double(sortedTicks - base);
+                relLo = nan(nTrials, 1);  relHi = nan(nTrials, 1);
+                relLo(haveT) = double(lo(haveT) - base);
+                relHi(haveT) = double(hi(haveT) - base);
+                [spkIdx, trialOf] = BlackrockLoader.trialSpikeIndex(relT, relLo, relHi);
+                if ~isempty(spkIdx)
+                    % The bin index itself stays in int64 -- exact, no rebasing.
+                    bins = double(idivide(sortedTicks(spkIdx) - lo(trialOf), ...
+                                          int64(binTicks), 'floor')) + 1;
+                end
+            else
+                [sortedTimes, sortIdx] = sort(spikeTimes);
+                [spkIdx, trialOf] = BlackrockLoader.trialSpikeIndex(sortedTimes, t_start, t_end);
+                if ~isempty(spkIdx)
+                    bins = floor((sortedTimes(spkIdx) - t_start(trialOf)) / binSec) + 1;
+                end
+            end
             if ~isempty(spkIdx)
-                bins = floor((sortedTimes(spkIdx) - t_start(trialOf)) / binSec) + 1;
                 bins = min(bins, nBins(trialOf));        % guard the right edge
+                bins = max(bins, 1);
                 rows = spikeRow(sortIdx(spkIdx));
                 raster(sub2ind([nChan, nTrials, maxBins], rows, trialOf, bins)) = 1;
             end
@@ -2474,7 +2618,7 @@ classdef BlackrockLoader < handle
             spec.isUndef(kind == 0) = true;
         end
 
-        function [cols, dupCells, undCells, startTicks, nUndef] = scatterEventWrites( ...
+        function [cols, dupCells, undCells, startTicks, endTicks, nUndef] = scatterEventWrites( ...
                 spec, ic, K, Session, EventTime, EventTick, has_ticks, trialTemplate)
         % Fill one column per trial field, one pass per FIELD rather than one
         % per comment.
@@ -2516,6 +2660,7 @@ classdef BlackrockLoader < handle
             end
 
             startTicks = zeros(nTrials, 1, 'uint64');
+            endTicks   = zeros(nTrials, 1, 'uint64');
             dupCells   = repmat({strings(0,1)}, nTrials, 1);
             undCells   = repmat({strings(0,1)}, nTrials, 1);
 
@@ -2575,11 +2720,15 @@ classdef BlackrockLoader < handle
                     m1 = md == 1;  v(m1) = timeOfTC(flatCmt(sub(m1)));
                     m2 = md == 2;  v(m2) = spec.num(lin(sub(m2)));
                     cols{f}(rw) = v;
+                    % Keep the Start and End markers' exact ticks: the trial
+                    % window and every per-spike time are measured from them, and
+                    % doing those subtractions in seconds would inherit ~238 ns
+                    % of rounding from each operand (see segmentContinuous /
+                    % segmentSpikes / segmentSpikeWaveforms).
                     if has_ticks && f == BlackrockLoader.fieldIndex("Start", fn)
-                        % Keep the Start marker's exact tick: per-spike times are
-                        % measured from it, and doing that subtraction in seconds
-                        % would inherit ~238 ns of rounding.
                         startTicks(rw(m1)) = EventTick(cmtIdx(flatCmt(sub(m1))));
+                    elseif has_ticks && f == BlackrockLoader.fieldIndex("End", fn)
+                        endTicks(rw(m1))   = EventTick(cmtIdx(flatCmt(sub(m1))));
                     end
                 end
 
