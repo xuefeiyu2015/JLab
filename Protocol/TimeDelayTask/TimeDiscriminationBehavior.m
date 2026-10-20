@@ -355,67 +355,6 @@ end
 % =========================================================================
 % Computation helpers (pure: no plotting, no side effects)
 % =========================================================================
-function D = prepTDData(d)
-% Filter the events table to valid trials and index them by session. The events
-% table arrives pre-scoped to the time-delay task (SetupDataForTask), so only the
-% analysis-specific validity screening is applied here.
-    ev = d.comments;
-    saved       = ev.Save_complete == 1;
-    validChoice = ~isnan(ev.Choose_target);
-    validMask   = saved & validChoice;
-
-    %D.totalTrials = max(ev.Trial_number);         % clamp upper bound (whole recording)
-    %D.minTrial    = min(ev.Trial_number);         % clamp lower bound (may be 0-indexed)
-    D.totalTrials = sum(validMask);         % clamp upper bound (whole recording)
-    D.minTrial    = 1;         % clamp lower bound 
-
-    %Screen out valid trials
-    ev = ev(validMask,:);
-
-    D.trialNum    = [1:sum(validMask)]';
-    D.stimulus    = ev.Requested_target_2_time_offset;
-    D.direction   = ev.Stimulus_direction;
-    D.choiceLR    = ev.Choose_leftright;          % -1 = left, 1 = right
-
-    % Per-trial correctness (repo-wide convention: the Trialoutcome string). After
-    % the Save_complete/valid-choice screen above, trials are correct or wrong only.
-    if ismember('Trialoutcome', ev.Properties.VariableNames)
-        D.correct = strcmp(string(ev.Trialoutcome), 'correct');   % normalizes cell/char/categorical
-    else
-        D.correct = D.choiceLR == D.direction;                    % geometric fallback
-    end
-
-
-    if ismember('RTtime', ev.Properties.VariableNames)
-        disp('Use real RT estimated by eyemovement.');
-        D.saccade = ev.RTtime;
-    else
-        disp('Use approximate RT by the comments marker.');
-        hasRT = ismember('Choicetime', ev.Properties.VariableNames) && ...
-            ismember('Fixation_point_off', ev.Properties.VariableNames);
-        if hasRT
-            D.saccade = ev.Choicetime - ev.Fixation_point_off;   % seconds
-        else
-            D.saccade = nan(height(ev), 1);
-        end
-        
-
-    end
-
- 
-    sessIds_raw = unique(ev.Session);
-    sessIds = [1:length(sessIds_raw)]';
-    S = struct('id', {}, 'rows', {}, 'first', {}, 'last', {}, 'endTrial', {});
-    for k = 1:numel(sessIds)
-        sid  = sessIds_raw(k);
-        rows = find(ev.Session == sid);
-        tn   = D.trialNum(rows);
-        S(k) = struct('id', k, 'rows', rows, 'first', min(tn), ...
-                      'last', max(tn), 'endTrial', max(tn));
-    end
-    D.S = S;
-end
-
 function sel = defaultSelection(D)
 % First up to 3 sessions, each over its full valid-trial range.
     sel = struct('S', {}, 'lo', {}, 'hi', {}, 'slot', {});
@@ -442,42 +381,6 @@ function res = computeAll(D, sel, win, step)
             computeSlidingBTFull(D, s.rows, win, step), sel(k).lo, sel(k).hi);
         res.sessions(k).rtLeft    = computeRTByLevel(D, rows, -1);
         res.sessions(k).rtRight   = computeRTByLevel(D, rows, +1);
-    end
-end
-
-function [pse, thr, psy, n] = computeSessionPsy(D, rows)
-% Logistic psychometric fit over the given rows via VisPsychometricFunction.
-    n = numel(rows);
-    pse = NaN;  thr = NaN;  psy = [];
-    if n < 2;  return;  end
-    sd = D.stimulus(rows) .* D.direction(rows);
-    if numel(unique(sd)) < 2;  return;  end     % need >=2 signed levels to fit
-    psymat = [D.stimulus(rows), D.direction(rows), double(D.choiceLR(rows) == 1)];
-
-    % Small/short windows are often perfectly separable, which makes fitglm warn
-    % about non-finite estimates and hit its iteration limit. That case is
-    % expected (and flagged below via psy.separable), so mute those two warnings.
-    ws = warning;                                       %#ok<WNTAG> full state
-    cleanup = onCleanup(@() warning(ws));
-    warning('off', 'stats:glmfit:PerfectSeparation');
-    warning('off', 'stats:glmfit:IterationLimit');
-    try
-        [pse, thr, psy] = VisPsychometricFunction(psymat, 0);
-        if ~isempty(psy) && psy.separable
-            thr = NaN;                           % slope unconstrained -> unreliable
-        end
-    catch
-        pse = NaN;  thr = NaN;  psy = [];
-    end
-    if abs(pse) >1000
-       % Hard up level
-       % the pse is meaningless if above this value
-       pse = NaN;
-    end
-    if thr >1000 
-       % Hard up level
-       % the thr is meaningless if above this value
-       thr = NaN;
     end
 end
 
