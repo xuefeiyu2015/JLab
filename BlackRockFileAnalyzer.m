@@ -277,6 +277,7 @@ for i = 1:length(tasklist)
             mse_result = RFPlot(data_task,protocol_cfg,plotFlag,main_path,ReComputeRF);
         case 'time_delay_experiment'
             tde_result = TimeDiscriminationBehavior(data_task,protocol_cfg,plotFlag);
+            tde_ecc_result = TimeDiscriminationEccentricity(data_task,protocol_cfg,plotFlag);
         otherwise
             fprintf('No analyze protocol for %s yet\n',task);
      

@@ -436,6 +436,7 @@ classdef BlackrockLoader < handle
                 primary_data = BlackrockLoader.openNevCached(fullfile(DataFolder, primary_nev), nevCache);
                 if BlackrockLoader.hasComments(primary_data)
                     C = BlackrockLoader.commentFields(primary_data, primary_nev);
+                    
                 end
             end
             if isempty(C.comments_source) && ~isempty(fallback_nev)
