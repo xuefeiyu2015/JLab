@@ -436,7 +436,26 @@ classdef BlackrockLoader < handle
                 primary_data = BlackrockLoader.openNevCached(fullfile(DataFolder, primary_nev), nevCache);
                 if BlackrockLoader.hasComments(primary_data)
                     C = BlackrockLoader.commentFields(primary_data, primary_nev);
-                    
+                    % Special case, BR system error, producing few
+                    % time-misaligned files. Try to rescue them from a
+                    % corrected file provided by BR.
+                    if primary_nev == 'Hub1-Porthos_20260910_t1113_dxxxx_xxx_timedelay.nev'
+                        rescue_time_file = 'Porthos_1113_corrected_comment_timestamps.mat';
+                        data_temp = load(fullfile(DataFolder, rescue_time_file));
+                        corrected_time = data_temp.CorrectedComments.CorrectedNSPTimeSec';
+                        %corrected_comments = data_temp.CorrectedComments.Comment;
+                        if length(C.EventTime) == length(corrected_time)
+                            disp('Rescue misaligned time by correcting comments time...');
+                            C.EventTime = corrected_time;
+                            C.EventTick = uint64(corrected_time * C.TimeRes);
+                            %C.EventTick=[];
+                            %keyboard
+                        else
+                            disp('Rescue failed. Timestamp length does not match!!');
+                        end
+
+                        %keyboard
+                    end
                 end
             end
             if isempty(C.comments_source) && ~isempty(fallback_nev)
