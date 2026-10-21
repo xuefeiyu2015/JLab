@@ -607,7 +607,7 @@ function det = detectSaccade(t, x, y, cfg, mk, useDegThr)
         try
         max_dev = max(dev(iCross: min(iCross+500,length(dev))));%Only select the maximum in 500ms after iCross
         
-        while iBase > 1 && speed(iBase - 1) > thr3sd || dev(iBase - 1) > max_dev/2
+        while iBase > 1 && (speed(iBase - 1) > thr3sd || dev(iBase - 1) > max_dev/2)
             iBase = iBase - 1;
         end
         catch
